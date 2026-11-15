@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Комната DeepSeek Pocket</title>
+<style>
+  :root { --bg:#111; --panel:#1c1c1c; --line:#333; --text:#eee; --dim:#999; --me:#ffe680; --other:#5fd7ff; --ok:#4ade80; --bad:#f87171; --btn:#2563eb; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 16px/1.4 system-ui, sans-serif; display: flex; flex-direction: column; }
+  header { padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  header b { margin-right: auto; }
+  header input { width: 9em; }
+  input, button { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: #222; color: var(--text); min-width: 0; }
+  button { background: var(--btn); border: 0; cursor: pointer; }
+  #state { font-size: 14px; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  .msg { margin: 0 0 10px; overflow-wrap: anywhere; display: flex; gap: 8px; align-items: flex-start; }
+  .msg canvas, .ava { width: 32px; height: 32px; flex: none; border-radius: 6px; image-rendering: pixelated; }
+  .ava { display: flex; align-items: center; justify-content: center; border-radius: 50%; font-weight: 700; color: #fff; }
+  .msg time { color: var(--dim); font-size: 12px; margin-left: 6px; }
+  #avaBtn { background: #333; }
+  .msg .nick { color: var(--other); font-weight: 600; }
+  .msg.me .nick { color: var(--me); }
+  .msg.me .text { color: var(--me); }
+  .note { color: var(--dim); font-size: 14px; margin: 0 0 10px; }
+  form { display: flex; gap: 8px; padding: 10px 16px; background: var(--panel); border-top: 1px solid var(--line); }
+  form input { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <b>Комната</b>
+  <input id="nick" maxlength="12" placeholder="Ваше имя" aria-label="Ваше имя">
+  <input id="room" maxlength="40" placeholder="Комната" aria-label="Комната">
+  <button id="join" type="button">Войти</button>
+  <button id="avaBtn" type="button">Аватарка</button>
+  <input id="avaFile" type="file" accept="image/*" hidden>
+  <span id="state">не подключено</span>
+</header>
+<div id="log">
+  <p class="note">Это та же комната, что и на гаджете. Сообщения не шифруются и не хранятся: их видят все, кто сейчас в комнате. Не пишите сюда пароли и личные данные.</p>
+</div>
+<form id="send">
+  <input id="text" maxlength="150" placeholder="Сообщение" autocomplete="off" aria-label="Сообщение">
+  <button type="submit">Отправить</button>
+</form>
+<script>
+// Тот же протокол, что в прошивке: MQTT 3.1.1, тема dspocket/v1/<комната>, сообщение «метка<TAB>имя<TAB>текст».
+// Здесь MQTT идёт поверх WebSocket (браузеры иначе не умеют).
+const HOST = "wss://broker.emqx.io:8084/mqtt";
+const enc = new TextEncoder(), dec = new TextDecoder();
+const $ = id => document.getElementById(id);
+let ws = null, rx = new Uint8Array(0), pingTimer = null, wantOpen = false;
+const users = {};          // id -> { nick, seen, ava (Uint8Array 576) }
+let myAva = null, hereTimer = null;
+let myId = "";
+try { myId = localStorage.getItem("dsp_id") || ""; } catch (e) {}
+if (!myId) { myId = "w" + Math.random().toString(16).slice(2, 7); try { localStorage.setItem("dsp_id", myId); } catch (e) {} }
+try { $("nick").value = localStorage.getItem("dsp_nick") || ""; $("room").value = localStorage.getItem("dsp_room") || "lobby"; } catch (e) { $("room").value = "lobby"; }
+
+function cat(...parts) { let n = 0; for (const p of parts) n += p.length; const o = new Uint8Array(n); let i = 0; for (const p of parts) { o.set(p, i); i += p.length; } return o; }
+function str(s) { const b = enc.encode(s); return cat(Uint8Array.of(b.length >> 8, b.length & 255), b); }
+function lenBytes(n) { const o = []; do { let b = n & 127; n >>= 7; if (n) b |= 128; o.push(b); } while (n); return Uint8Array.from(o); }
+function packet(header, body) { return cat(Uint8Array.of(header), lenBytes(body.length), body); }
+function pktConnect(id) { return packet(0x10, cat(str("MQTT"), Uint8Array.of(4, 2, 0, 60), str(id))); }
+function pktSubscribe(topic) { return packet(0x82, cat(Uint8Array.of(0, 1), str(topic), Uint8Array.of(0))); }
+function pktPublish(topic, payload) { return packet(0x30, cat(str(topic), enc.encode(payload))); }
+function cleanRoom(s) { return s.replace(/[#+\/]/g, "").replace(/[\u0000-\u001f]/g, "").trim(); }
+function topicOf() { return "dspocket/v1/" + cleanRoom($("room").value || "lobby"); }
+function pktRetained(topic, bytes) { return packet(0x31, cat(str(topic), bytes)); }
+const PAL = ["#e05545", "#2c90ff", "#1bb94a", "#ff8c00", "#9a4fff", "#00cfcf", "#e81c24", "#8c8f8c"];
+function idColor(id) { let h = 2166136261; for (const c of enc.encode(id)) h = Math.imul(h ^ c, 16777619) >>> 0; return PAL[h & 7]; }
+function avaCanvas(bytes) {              // 576 байт: 3 бита красный, 3 зелёный, 2 синий
+  const c = document.createElement("canvas"); c.width = c.height = 24;
+  const g = c.getContext("2d"), im = g.createImageData(24, 24);
+  for (let i = 0; i < 576; i++) { const v = bytes[i]; im.data[i * 4] = ((v >> 5) & 7) * 255 / 7; im.data[i * 4 + 1] = ((v >> 2) & 7) * 255 / 7; im.data[i * 4 + 2] = (v & 3) * 85; im.data[i * 4 + 3] = 255; }
+  g.putImageData(im, 0, 0); return c;
+}
+function avaNode(id, nick) {
+  const a = id === myId ? myAva : (users[id] && users[id].ava);
+  if (a) return avaCanvas(a);
+  const d = document.createElement("div"); d.className = "ava"; d.style.background = idColor(id); d.textContent = (nick || "?").slice(0, 1).toUpperCase(); return d;
+}
+function sendHere(here) { if (ws && ws.readyState === 1) ws.send(pktPublish(topicOf() + "/p", myId + "\t" + $("nick").value.trim() + "\t" + (here ? "1" : "0"))); }
+function sendAvatar() { if (ws && ws.readyState === 1) ws.send(pktRetained(topicOf() + "/a/" + myId, myAva || new Uint8Array(0))); }
+function onlineCount() { const now = Date.now(); let n = 1; for (const id in users) if (now - users[id].seen < 150000) n++; return n; }
+function showState() { if (ws && ws.readyState === 1) setState("в сети: " + onlineCount() + " · #" + cleanRoom($("room").value || "lobby"), true); }
+
+// Достать один пакет из начала буфера (или null, если данных пока мало).
+function take() {
+  if (rx.length < 2) return null;
+  let len = 0, shift = 0, i = 1;
+  for (;;) {
+    if (i >= rx.length) return null;
+    const b = rx[i++]; len |= (b & 127) << shift;
+    if (!(b & 128)) break;
+    shift += 7; if (shift > 21) { rx = new Uint8Array(0); return null; }
+  }
+  if (rx.length < i + len) return null;
+  const p = { type: rx[0] >> 4, flags: rx[0] & 15, body: rx.slice(i, i + len) };
+  rx = rx.slice(i + len);
+  return p;
+}
+
+function addLine(id, nick, text, mine) {
+  const p = document.createElement("div"); p.className = "msg" + (mine ? " me" : ""); p.dataset.id = id;
+  const body = document.createElement("div");
+  const n = document.createElement("span"); n.className = "nick"; n.textContent = nick;
+  const tm = document.createElement("time"); const d = new Date(); tm.textContent = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  const t = document.createElement("div"); t.className = "text"; t.textContent = text;
+  body.append(n, tm, t); p.append(avaNode(id, nick), body); $("log").append(p); $("log").scrollTop = $("log").scrollHeight;
+}
+function refreshAvatars(id) {            // пришла аватарка - обновить её в уже показанных сообщениях
+  for (const m of document.querySelectorAll(".msg")) if (m.dataset.id === id) m.replaceChild(avaNode(id, m.querySelector(".nick").textContent), m.firstChild);
+}
+function note(text) { const p = document.createElement("p"); p.className = "note"; p.textContent = text; $("log").append(p); $("log").scrollTop = $("log").scrollHeight; }
+function setState(text, ok) { $("state").textContent = text; $("state").style.color = ok ? "var(--ok)" : "var(--bad)"; }
+
+function onPacket(p) {
+  if (p.type === 2) {                                  // CONNACK
+    if (p.body[1] !== 0) { setState("сервер отказал", false); return; }
+    ws.send(pktSubscribe(topicOf() + "/#"));         // чат, присутствие и аватарки комнаты
+    sendHere(true); sendAvatar(); showState();
+  } else if (p.type === 3) {                           // PUBLISH
+    const tl = (p.body[0] << 8) | p.body[1];
+    const topic = dec.decode(p.body.slice(2, 2 + tl)), base = topicOf();
+    let pos = 2 + tl; if ((p.flags >> 1) & 3) pos += 2;
+    const data = p.body.slice(pos);
+    if (topic.startsWith(base + "/a/")) {              // аватарка участника
+      const id = topic.slice(base.length + 3); if (!id || id.length > 16 || id === myId) return;
+      users[id] = users[id] || { nick: "", seen: 0 };
+      users[id].ava = data.length === 576 ? data : null; refreshAvatars(id); return;
+    }
+    const parts = dec.decode(data).split("\t");
+    if (parts.length < 3 || !parts[0] || !parts[1] || parts[0].length > 16) return;   // чужой формат
+    const id = parts[0], nick = parts[1].slice(0, 24);
+    if (topic === base + "/p") {                       // «я здесь» / «я ушёл»
+      if (id === myId) return;
+      if (parts[2] === "0") { delete users[id]; showState(); return; }
+      const isNew = !users[id] || !users[id].nick;
+      users[id] = users[id] || {}; users[id].nick = nick; users[id].seen = Date.now(); showState();
+      if (isNew && myAva) setTimeout(sendAvatar, 1500 + Math.random() * 2000);
+      return;
+    }
+    if (topic !== base) return;
+    const text = parts.slice(2).join(" ").slice(0, 400);
+    if (!text) return;
+    if (id !== myId && !id.endsWith("-ai")) { users[id] = users[id] || {}; users[id].nick = nick; users[id].seen = Date.now(); showState(); }
+    addLine(id, nick, text, id === myId);
+  }
+}
+
+function connect() {
+  wantOpen = true;
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+  clearInterval(pingTimer); clearInterval(hereTimer);
+  rx = new Uint8Array(0);
+  setState("подключаюсь...", false);
+  try { ws = new WebSocket(HOST, "mqtt"); } catch (e) { setState("ошибка: " + e.message, false); return; }
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    ws.send(pktConnect("dspweb-" + myId + "-" + Math.random().toString(16).slice(2, 6)));
+    pingTimer = setInterval(() => { if (ws && ws.readyState === 1) ws.send(Uint8Array.of(0xC0, 0)); }, 30000);
+    hereTimer = setInterval(() => { sendHere(true); showState(); }, 60000);
+  };
+  ws.onmessage = ev => { rx = cat(rx, new Uint8Array(ev.data)); let p; while ((p = take())) onPacket(p); };
+  ws.onerror = () => setState("нет связи с сервером", false);
+  ws.onclose = () => { clearInterval(pingTimer); clearInterval(hereTimer); setState("нет связи", false); if (wantOpen) setTimeout(connect, 5000); };
+}
+
+$("join").onclick = () => {
+  const nick = $("nick").value.trim();
+  if (!nick) { $("nick").focus(); note("Сначала введите имя."); return; }
+  try { localStorage.setItem("dsp_nick", nick); localStorage.setItem("dsp_room", $("room").value.trim() || "lobby"); } catch (e) {}
+  note("Вход в комнату «" + cleanRoom($("room").value || "lobby") + "»...");
+  connect();
+};
+// Аватарка: фото уменьшается до 24x24 (середина кадра) и отправляется в комнату.
+$("avaBtn").onclick = () => $("avaFile").click();
+$("avaFile").onchange = function () {
+  const f = this.files[0]; if (!f) return;
+  const im = new Image();
+  im.onload = () => {
+    const s = Math.min(im.width, im.height), c = document.createElement("canvas"); c.width = c.height = 24;
+    const g = c.getContext("2d"); g.drawImage(im, (im.width - s) / 2, (im.height - s) / 2, s, s, 0, 0, 24, 24);
+    const d = g.getImageData(0, 0, 24, 24).data, out = new Uint8Array(576);
+    for (let i = 0; i < 576; i++) out[i] = ((d[i * 4] >> 5) << 5) | ((d[i * 4 + 1] >> 5) << 2) | (d[i * 4 + 2] >> 6);
+    myAva = out; try { localStorage.setItem("dsp_ava", Array.from(out).join(",")); } catch (e) {}
+    sendAvatar(); refreshAvatars(myId); note("Аватарка установлена.");
+  };
+  im.onerror = () => note("Эту картинку открыть не удалось.");
+  im.src = URL.createObjectURL(f); this.value = "";
+};
+try { const a = localStorage.getItem("dsp_ava"); if (a) { const v = Uint8Array.from(a.split(",").map(Number)); if (v.length === 576) myAva = v; } } catch (e) {}
+window.addEventListener("pagehide", () => sendHere(false));
+$("send").onsubmit = ev => {
+  ev.preventDefault();
+  const text = $("text").value.replace(/\s+/g, " ").trim(), nick = $("nick").value.trim();
+  if (!text) return;
+  if (!nick) { note("Сначала введите имя и нажмите «Войти»."); return; }
+  if (!ws || ws.readyState !== 1) { note("Нет связи: нажмите «Войти». Сообщение не отправлено."); return; }
+  ws.send(pktPublish(topicOf(), myId + "\t" + nick + "\t" + text));
+  $("text").value = "";
+};
+</script>
+</body>
+</html>

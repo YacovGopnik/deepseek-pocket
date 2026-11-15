@@ -1,0 +1,7160 @@
+// DeepSeek на ESP32-C3 mini + дисплей ST7789 240x240 (без CS) + энкодер.
+// Экранная клавиатура, ответ с прокруткой, языки: русский, English, 中文.
+// Настройка Wi-Fi и API-ключа с телефона (точка доступа DeepSeek-Setup).
+//
+// Библиотеки (Менеджер библиотек): "Adafruit ST7735 and ST7789 Library"
+// (вместе с Adafruit GFX и BusIO) и "ArduinoJson" версии 7.x.
+// Плата: ESP32C3 Dev Module, USB CDC On Boot: Enabled,
+// Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)  <- обязательно, из-за шрифта с иероглифами.
+//
+// Управление аналоговым джойстиком (модуль KY-023): наклон - перемещение,
+// нажатие - ввод, долгое нажатие (больше 0,7 с) на клавиатуре - меню.
+// Над клавиатурой строка подсказок: джойстик вверх, нажатие - вставить слово.
+// Подсказки учатся на ваших вопросах и ответах DeepSeek (сохраняются во флеш-память).
+//
+// Подключение джойстика: GND - GND, +5V - 3V3 (обязательно 3,3 В, не 5 В!),
+// VRx - GPIO0, VRy - GPIO1, SW - GPIO7.
+// Экран: RES подключить к 3V3 (сброс программный), GPIO3 занят измерением батареи.
+// Батарея: плюс (после выключателя) - 100 кОм - GPIO3 - 100 кОм - GND.
+//
+// Чат помнит последние сообщения (DeepSeek видит переписку). Меню - «Новый чат».
+// Меню «Игры»: Блоки, 2048, Змейка, Падающие блоки, Лабиринт, Память, Пинг-понг, Летящая птичка
+// псевдо-3D Гонка и игры с DeepSeek: Викторина, Приключение, «Угадай, кто я». Рекорды сохраняются,
+// партии Блоков и 2048 продолжаются даже после выключения.
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <vector>
+#include <functional>
+#include <LittleFS.h>
+
+#include "font8x16.h"
+#include "font_cjk.h"
+#include "font12x24.h"
+#include "font_cjk24.h"
+#include "textutil.h"
+#include "suggest.h"
+#include "dict_words.h"
+#include "blocks_game.h"
+#include "game2048.h"
+#include "snake_game.h"
+#include "falling_game.h"
+#include "arcade_games.h"
+#include "ai_games.h"
+#include "race_game.h"
+#include "pixabay.h"
+#include "calc.h"
+#include "tools.h"
+#include "games2.h"
+#include "chess.h"
+#include "chess_pieces.h"
+#include "reference.h"
+#include "mqtt_lite.h"
+#include "rider_game.h"
+#include <time.h>
+
+// Поиск картинок (Wikimedia Commons). Нужна библиотека TJpg_Decoder (Менеджер библиотек, автор Bodmer).
+// Если не хотите её ставить - поставьте 0: всё остальное соберётся и будет работать.
+#define ENABLE_IMAGES 1
+#if ENABLE_IMAGES
+#include <TJpg_Decoder.h>
+#endif
+
+// ========================= НАСТРОЙКИ =========================
+// Можно оставить пустыми и настроить всё с телефона.
+// То, что сохранено через телефон, важнее того, что вписано здесь.
+const char* DEFAULT_SSID    = "";   // имя сети Wi-Fi (только 2,4 ГГц)
+const char* DEFAULT_PASS    = "";   // пароль Wi-Fi
+const char* DEFAULT_API_KEY = "";   // ключ с platform.deepseek.com (sk-...)
+
+const char* AP_NAME = "DeepSeek-Setup";              // сеть для настройки с телефона
+const char* API_URL = "https://api.deepseek.com/chat/completions";
+const int MAX_TOKENS = 400;                          // длина ответа
+const int HTTP_TIMEOUT_MS = 30000;                   // сколько ждать ответ
+
+// Джойстик. Если направления перепутаны - поменяйте эти три настройки.
+const bool JOY_SWAP_XY = false;   // true, если вверх/вниз и влево/вправо поменялись местами
+const bool JOY_INVERT_X = true;   // true, если влево и вправо перепутаны
+const bool JOY_INVERT_Y = false;   // true, если вверх и вниз перепутаны
+const int JOY_THRESHOLD = 1100;   // насколько отклонить ручку (из 2048), чтобы сработало
+const uint32_t REPEAT_DELAY_MS = 400;  // удержание: через сколько начинается автоповтор
+const uint32_t REPEAT_RATE_MS = 110;   // удержание: шаг автоповтора
+const int TFT_ROTATION = 2;     // 0..3; для 240x240 обычно 2
+const uint32_t TFT_SPI_HZ = 40000000;   // скорость шины экрана; если появились полосы/мусор - поставьте 20000000
+const uint32_t LONG_PRESS_MS = 700;
+// «Комната» - общий чат таких гаджетов. Все, у кого здесь одинаковые сервер и комната, видят друг друга.
+#define MQTT_HOST "broker.emqx.io"   // открытый сервер сообщений (MQTT, порт 1883, без шифрования)
+#define MQTT_PORT 1883
+#define ROOM_DEFAULT "lobby"         // общая комната для всех гаджетов с этой прошивкой
+
+#define LOW_TX_POWER 1          // 1 = занизить мощность Wi-Fi (помогает платам Super Mini)
+
+// Пины
+// Индикатор батареи. Включайте (true) ТОЛЬКО после перепайки:
+// RES экрана перенести с GPIO3 на GPIO21 (на плате подписан 21 или TX), а на GPIO3 повесить делитель 100к/100к
+// от вывода 5V. Оставлять RES на 3V3 нельзя: экрану без вывода CS нужен настоящий сброс, иначе он не запускается.
+// false - старая схема: RES экрана на GPIO3, процентов батареи нет.
+const bool BATTERY_ENABLED = true;
+
+// Пищалка (необязательно): «+» на GPIO20 (на плате подписан 20 или RX), «-» на GND.
+// Пассивная (пьезо, умеет разные ноты) - false; активная (со своим генератором, только «бип») - true.
+// Если пищалки нет - ничего менять не нужно: звук просто не будет слышен.
+const int PIN_BUZ = 20;
+const bool BUZZER_ACTIVE = false;
+
+const int PIN_SCK = 4, PIN_MOSI = 6, PIN_DC = 5, PIN_BLK = 10;
+const int PIN_RST = BATTERY_ENABLED ? 21 : 3;   // сброс экрана: GPIO21 (после перепайки под батарею) или GPIO3
+const int PIN_BAT = 3;                          // середина делителя напряжения батареи
+
+// Батарея
+const float BAT_DIVIDER = 2.0;       // 100 кОм + 100 кОм = делит пополам
+const float BAT_CALIBRATION = 1.0;   // поправка: (напряжение по тестеру) / (показания платы)
+
+// Память чата: сколько последних сообщений (ваших и ответов) отправлять DeepSeek
+const int MAX_HISTORY_MSGS = 10;          // 5 вопросов и 5 ответов
+const unsigned MAX_HISTORY_CHARS = 5000;  // и не больше этого объёма текста
+const int PIN_JOY_X = 0, PIN_JOY_Y = 1, PIN_SW = 7;
+
+// Имена моделей пробуются по очереди, рабочее запоминается.
+struct Attempt { const char* model; bool noThink; };
+const Attempt ATTEMPTS[] = {
+  {"deepseek-flash", true},
+  {"deepseek-flash", false},
+  {"deepseek-v4-flash", false},
+  {"deepseek-chat", false},
+};
+const int N_ATTEMPTS = sizeof(ATTEMPTS) / sizeof(ATTEMPTS[0]);
+int bestAttempt = 0;
+
+// Клавиша экранной клавиатуры.
+enum KeyKind : uint8_t { K_CHAR, K_DEL, K_LAYER, K_SEND };
+struct Key {
+  uint16_t cp;
+  KeyKind kind;
+  const char* label;   // nullptr = рисуем сам символ
+};
+
+// Событие кнопки.
+enum BtnEvent : uint8_t { EV_NONE, EV_CLICK, EV_LONG };
+
+// Сообщение переписки с DeepSeek (вы или ответ).
+struct ChatMsg {
+  bool user;
+  String text;
+};
+
+// Направление джойстика. Функции принимают и возвращают uint8_t, а не свой тип:
+// так Arduino IDE 1.8 не спотыкается при автоматическом объявлении функций.
+const uint8_t J_NONE = 0, J_UP = 1, J_DOWN = 2, J_LEFT = 3, J_RIGHT = 4;
+
+// ========================= ТЕКСТЫ НА ТРЁХ ЯЗЫКАХ =========================
+enum Lang : uint8_t { LANG_RU = 0, LANG_EN = 1, LANG_ZH = 2 };
+const int N_LANGS = 3;
+
+struct Texts {
+  const char* langName;
+  const char* starting;
+  const char* wifiTry;        // %d
+  const char* wifiFail;
+  const char* noSettings;
+  const char* thinking;
+  const char* errPrefix;
+  const char* err401;
+  const char* err402;
+  const char* err429;
+  const char* errConn;
+  const char* errMem;
+  const char* errTimeout;     // %d
+  const char* errNet;
+  const char* errBadReply;
+  const char* errEmpty;
+  const char* errNoKey;
+  const char* menuTitle;
+  const char* menuLang;
+  const char* menuWifi;
+  const char* menuBack;
+  const char* wifiNone;
+  const char* portal;         // %s = имя сети
+  const char* portalSaved;
+  const char* webTitle;
+  const char* webNetwork;
+  const char* webOther;
+  const char* webManual;
+  const char* webPass;
+  const char* webKey;
+  const char* webKeyHint;
+  const char* webSave;
+  const char* webDone;
+  const char* webNoSsid;
+  const char* systemPrompt;
+  const char* menuForget;
+  const char* forgetDone;
+  const char* menuNewChat;
+  const char* chatCleared;
+  const char* youLabel;
+  const char* botLabel;
+  const char* chatCount;      // %d
+  const char* menuGame;
+  const char* gameScore;      // %u
+  const char* gameBest;       // %u
+  const char* gameHintPick;
+  const char* gameHintPlace;
+  const char* gameOver;
+  const char* gameAgain;
+  const char* menuGames;
+  const char* gBlocks;
+  const char* gSnake;
+  const char* gFall;
+  const char* hint2048;
+  const char* hintSnake;
+  const char* paused;
+  const char* nextLabel;
+  const char* linesFmt;       // %u
+  const char* levelFmt;       // %u
+  const char* fallRotate;
+  const char* fallDrop;
+  const char* fallExit;
+  const char* won2048;
+  const char* promptLang;     // язык для DeepSeek (по-английски)
+  const char* gMaze;
+  const char* gMemory;
+  const char* gPong;
+  const char* gFlappy;
+  const char* gQuiz;
+  const char* gStory;
+  const char* gGuess;
+  const char* mazeDone;       // %u %u
+  const char* timeFmt;        // %u
+  const char* movesFmt;       // %u
+  const char* memDone;        // %u
+  const char* pongYou;
+  const char* pongCpu;
+  const char* pongWin;
+  const char* pongLose;
+  const char* flapHint;
+  const char* topicTitle;
+  const char* quizTopics;     // через |, последний - «своя тема»
+  const char* genreTitle;
+  const char* storyGenres;
+  const char* guessTitle;
+  const char* guessCats;
+  const char* typeTopic;
+  const char* quizNum;        // %d
+  const char* right;
+  const char* wrongIs;
+  const char* quizResult;     // %d
+  const char* storyWhat;
+  const char* storyEnd;
+  const char* guessRound;     // %d
+  const char* guessMore;
+  const char* guessRight;     // %d
+  const char* guessTotal;     // %d
+  const char* aiBadFormat;
+  const char* clickNext;
+  const char* wifiWait;
+  const char* wifiNoConn;
+  const char* wifiRetry;
+  const char* gRace;
+  const char* raceKmh;        // %u
+  const char* raceMeters;     // %u
+  const char* raceCheck;      // %u
+  const char* raceOver;
+  const char* raceDist;       // %u
+  const char* raceStart;
+  const char* menuImages;
+  const char* webPxKey;
+  const char* imgNoKey;
+  const char* imgPrompt;
+  const char* imgNone;
+  const char* imgLoading;
+  const char* imgError;
+  const char* imgHelp;
+  const char* imgBy;          // %s
+  const char* imgSearching;
+  const char* imgByWiki;      // %s
+};
+
+const Texts TEXTS[N_LANGS] = {
+  {  // ---------- Русский ----------
+    "Русский",
+    "Запуск...",
+    "Wi-Fi: попытка %d из 3...",
+    "Не удалось подключиться к Wi-Fi.\n\nНажмите кнопку, чтобы попробовать ещё раз.\nДолгое нажатие - настроить Wi-Fi.",
+    "Wi-Fi ещё не настроен.",
+    "Думаю...",
+    "Ошибка: ",
+    "Неверный API-ключ (401). Укажите ключ в настройке Wi-Fi.",
+    "Нет денег на балансе DeepSeek (402). Пополните счёт.",
+    "Слишком много запросов (429). Подождите минуту.",
+    "Нет соединения с сервером.",
+    "Не хватает памяти.",
+    "Таймаут: сервер не ответил за %d с.",
+    "Сетевая ошибка ",
+    "Неожиданный ответ сервера.",
+    "Пустой ответ. Увеличьте MAX_TOKENS.",
+    "Не задан API-ключ. Долгое нажатие - меню - Настроить Wi-Fi.",
+    "Меню",
+    "Язык: ",
+    "Wi-Fi и ключ",
+    "Назад",
+    "Wi-Fi: нет связи",
+    "Настройка Wi-Fi\n\n1. На телефоне подключитесь к сети:\n%s\n\n2. Откройте страницу 192.168.4.1 (обычно она откроется сама).\n\n3. Выберите сеть и введите пароль.\n\nКнопка - отмена.",
+    "Сохранено. Перезапуск...",
+    "Настройка DeepSeek",
+    "Сеть Wi-Fi",
+    "Другая сеть (ввести вручную)",
+    "Имя сети, если её нет в списке",
+    "Пароль Wi-Fi",
+    "API-ключ DeepSeek",
+    "оставьте пустым, чтобы не менять",
+    "Сохранить",
+    "Сохранено! Устройство перезапускается и подключается к сети.",
+    "Не выбрана сеть. Вернитесь назад.",
+    "Отвечай по-русски, кратко (до 400 символов), простым текстом: "
+    "без markdown и эмодзи. Формулы пиши обычными символами (x², √, π, ·, ≤), без LaTeX.",
+    "Забыть слова",
+    "Выученные слова удалены.",
+    "Новый чат",
+    "Начат новый чат. DeepSeek забыл прошлую переписку.",
+    "Вы:",
+    "DeepSeek:",
+    "Чат: %d",
+    "Игра «Блоки»",
+    "Счёт: %u",
+    "Рекорд: %u",
+    "Нажать-взять, держать-выход",
+    "Нажать-ставить, держать-отмена",
+    "Игра окончена",
+    "Нажать-заново, держать-выход",
+    "Игры",
+    "Блоки",
+    "Змейка",
+    "Падающие блоки",
+    "Наклон-сдвиг, держать-выход",
+    "Нажать-старт, держать-выход",
+    "Пауза",
+    "Далее",
+    "Линии: %u",
+    "Уровень: %u",
+    "Вверх-поворот",
+    "Нажать-сброс",
+    "Держать-выход",
+    "2048! Играем дальше",
+    "Russian",
+    "Лабиринт",
+    "Память",
+    "Пинг-понг",
+    "Летящая птичка",
+    "Викторина",
+    "Приключение",
+    "Угадай, кто я",
+    "Уровень %u пройден за %u с!",
+    "%u с",
+    "Ходы: %u",
+    "Все пары найдены! Ходов: %u",
+    "Вы",
+    "Плата",
+    "Победа!",
+    "Поражение",
+    "Нажать-взмах, держать-выход",
+    "Тема викторины",
+    "Любая тема|Наука|История|География|Кино и книги|Спорт|Животные|Своя тема...",
+    "Жанр истории",
+    "Фэнтези|Космос|Детектив|Ужасы|Пираты|Своя тема...",
+    "Что загадать?",
+    "Животное|Персонаж кино и книг|Страна|Историческая личность|Предмет|Своя тема...",
+    "Наберите тему и нажмите OK",
+    "Вопрос %d из 10",
+    "Верно!",
+    "Неверно. Правильно: ",
+    "Результат: %d из 10",
+    "Что делать?",
+    "Конец истории",
+    "Раунд %d из 5",
+    "Ещё подсказка",
+    "Верно! +%d",
+    "Итого очков: %d",
+    "DeepSeek ответил не по формату. Попробуйте ещё раз.",
+    "Нажать - дальше",
+    "Подключаюсь к Wi-Fi...\n\nНажать - отмена\nДержать - поиграть, пока ждём",
+    "Нет связи",
+    "Повторить",
+    "Гонка",
+    "%u км/ч",
+    "%u м",
+    "Чекпойнт! +%u с",
+    "Время вышло",
+    "Дистанция: %u м",
+    "Нажать-старт, вниз-тормоз",
+    "Картинки",
+    "Ключ Pixabay (необязательно, из России не работает без VPN)",
+    "Для картинок нужен ключ Pixabay. Получите его бесплатно на pixabay.com/api/docs и введите в Меню - Wi-Fi и ключ.",
+    "Что найти? Наберите запрос и нажмите OK.",
+    "Ничего не нашлось. Попробуйте другой запрос.",
+    "Загружаю картинку...",
+    "Не удалось загрузить: ",
+    "Влево/вправо - листать, нажать - новый поиск, держать - выход",
+    "Pixabay, автор: %s",
+    "Ищу картинки...",
+    "Wikimedia, автор: %s",
+  },
+  {  // ---------- English ----------
+    "English",
+    "Starting...",
+    "Wi-Fi: attempt %d of 3...",
+    "Could not connect to Wi-Fi.\n\nPress the button to try again.\nLong press - set up Wi-Fi.",
+    "Wi-Fi is not set up yet.",
+    "Thinking...",
+    "Error: ",
+    "Wrong API key (401). Enter the key in Wi-Fi setup.",
+    "No money on the DeepSeek balance (402). Top it up.",
+    "Too many requests (429). Wait a minute.",
+    "No connection to the server.",
+    "Out of memory.",
+    "Timeout: no reply in %d s.",
+    "Network error ",
+    "Unexpected server reply.",
+    "Empty reply. Increase MAX_TOKENS.",
+    "No API key. Long press - menu - Set up Wi-Fi.",
+    "Menu",
+    "Language: ",
+    "Wi-Fi and key",
+    "Back",
+    "Wi-Fi: not connected",
+    "Wi-Fi setup\n\n1. On your phone, connect to the network:\n%s\n\n2. Open 192.168.4.1 (it usually opens by itself).\n\n3. Choose your network and enter the password.\n\nButton - cancel.",
+    "Saved. Restarting...",
+    "DeepSeek setup",
+    "Wi-Fi network",
+    "Other network (type it)",
+    "Network name, if it is not listed",
+    "Wi-Fi password",
+    "DeepSeek API key",
+    "leave empty to keep the current one",
+    "Save",
+    "Saved! The device restarts and connects to the network.",
+    "No network chosen. Go back.",
+    "Answer in English, briefly (up to 400 characters), in plain text: "
+    "no markdown or emoji. Write formulas with plain symbols (x², √, π, ·, ≤), no LaTeX.",
+    "Forget words",
+    "Learned words deleted.",
+    "New chat",
+    "New chat started. DeepSeek forgot the previous conversation.",
+    "You:",
+    "DeepSeek:",
+    "Chat: %d",
+    "Blocks game",
+    "Score: %u",
+    "Best: %u",
+    "Click-take, hold-exit",
+    "Click-place, hold-cancel",
+    "Game over",
+    "Click-again, hold-exit",
+    "Games",
+    "Blocks",
+    "Snake",
+    "Falling blocks",
+    "Tilt-move, hold-exit",
+    "Click-start, hold-exit",
+    "Pause",
+    "Next",
+    "Lines: %u",
+    "Level: %u",
+    "Up-rotate",
+    "Click-drop",
+    "Hold-exit",
+    "2048! Keep going",
+    "English",
+    "Maze",
+    "Memory",
+    "Ping-pong",
+    "Flying bird",
+    "Quiz",
+    "Adventure",
+    "Guess who",
+    "Level %u done in %u s!",
+    "%u s",
+    "Moves: %u",
+    "All pairs found! Moves: %u",
+    "You",
+    "Board",
+    "You win!",
+    "You lose",
+    "Click-flap, hold-exit",
+    "Quiz topic",
+    "Any topic|Science|History|Geography|Movies and books|Sports|Animals|Own topic...",
+    "Story genre",
+    "Fantasy|Space|Detective|Horror|Pirates|Own topic...",
+    "What to guess?",
+    "Animal|Movie or book character|Country|Historical figure|Object|Own topic...",
+    "Type a topic and press OK",
+    "Question %d of 10",
+    "Correct!",
+    "Wrong. Answer: ",
+    "Result: %d of 10",
+    "What will you do?",
+    "The end",
+    "Round %d of 5",
+    "Another hint",
+    "Correct! +%d",
+    "Total score: %d",
+    "DeepSeek replied in a wrong format. Try again.",
+    "Click - next",
+    "Connecting to Wi-Fi...\n\nClick - cancel\nHold - play while waiting",
+    "No connection",
+    "Retry",
+    "Race",
+    "%u km/h",
+    "%u m",
+    "Checkpoint! +%u s",
+    "Time is up",
+    "Distance: %u m",
+    "Click-start, down-brake",
+    "Images",
+    "Pixabay key (optional)",
+    "Image search needs a Pixabay key. Get one for free at pixabay.com/api/docs and enter it in Menu - Wi-Fi and key.",
+    "What to find? Type a query and press OK.",
+    "Nothing found. Try another query.",
+    "Loading image...",
+    "Could not load: ",
+    "Left/right - browse, click - new search, hold - exit",
+    "Pixabay, by %s",
+    "Searching images...",
+    "Wikimedia, by %s",
+  },
+  {  // ---------- 中文 ----------
+    "中文",
+    "启动中……",
+    "Wi-Fi：第%d次尝试（共3次）……",
+    "无法连接Wi-Fi。\n\n按下按钮重试。\n长按：设置Wi-Fi。",
+    "尚未设置Wi-Fi。",
+    "思考中……",
+    "错误：",
+    "API密钥错误（401）。请在Wi-Fi设置中填写密钥。",
+    "DeepSeek余额不足（402）。请充值。",
+    "请求过多（429）。请稍等一分钟。",
+    "无法连接服务器。",
+    "内存不足。",
+    "超时：服务器%d秒内未响应。",
+    "网络错误 ",
+    "服务器响应异常。",
+    "回复为空。请增大MAX_TOKENS。",
+    "未设置API密钥。长按进入菜单，选择设置Wi-Fi。",
+    "菜单",
+    "语言：",
+    "设置Wi-Fi和密钥",
+    "返回",
+    "Wi-Fi：未连接",
+    "Wi-Fi设置\n\n1. 用手机连接网络：\n%s\n\n2. 打开192.168.4.1（通常会自动打开）。\n\n3. 选择网络并输入密码。\n\n按钮：取消。",
+    "已保存。正在重启……",
+    "DeepSeek设置",
+    "Wi-Fi网络",
+    "其他网络（手动输入）",
+    "网络名称（如果不在列表中）",
+    "Wi-Fi密码",
+    "DeepSeek API密钥",
+    "留空则保持不变",
+    "保存",
+    "已保存！设备正在重启并连接网络。",
+    "未选择网络。请返回。",
+    "请用简体中文简短回答（不超过150字），使用纯文本，"
+    "不要使用markdown和表情符号。公式用普通符号（x²、√、π、·、≤），不要用LaTeX。",
+    "清除学习的词语",
+    "已删除学习的词语。",
+    "新对话",
+    "已开始新对话。DeepSeek已忘记之前的聊天内容。",
+    "你：",
+    "DeepSeek：",
+    "对话：%d",
+    "方块游戏",
+    "得分：%u",
+    "最高：%u",
+    "按下：选取，长按：退出",
+    "按下：放置，长按：取消",
+    "游戏结束",
+    "按下：重来，长按：退出",
+    "游戏",
+    "方块",
+    "贪吃蛇",
+    "落块",
+    "倾斜：移动，长按：退出",
+    "按下：开始，长按：退出",
+    "暂停",
+    "下一个",
+    "行数：%u",
+    "等级：%u",
+    "上：旋转",
+    "按下：落下",
+    "长按：退出",
+    "2048！继续游戏",
+    "Simplified Chinese",
+    "迷宫",
+    "记忆",
+    "乒乓球",
+    "飞鸟",
+    "问答",
+    "冒险",
+    "猜猜我是谁",
+    "第%u关完成，用时%u秒！",
+    "%u秒",
+    "步数：%u",
+    "全部配对！步数：%u",
+    "你",
+    "电脑",
+    "你赢了！",
+    "你输了",
+    "按下：拍翅，长按：退出",
+    "问答主题",
+    "任意主题|科学|历史|地理|电影和书|体育|动物|自定义...",
+    "故事类型",
+    "奇幻|太空|侦探|恐怖|海盗|自定义...",
+    "猜什么？",
+    "动物|影视或书中角色|国家|历史人物|物品|自定义...",
+    "输入主题后按OK",
+    "第%d题，共10题",
+    "正确！",
+    "错误。正确答案：",
+    "结果：%d/10",
+    "你要怎么做？",
+    "故事结束",
+    "第%d轮，共5轮",
+    "再给提示",
+    "正确！+%d",
+    "总分：%d",
+    "DeepSeek的回答格式不对，请重试。",
+    "按下：继续",
+    "正在连接Wi-Fi……\n\n按下：取消\n长按：等待时玩游戏",
+    "无网络",
+    "重试",
+    "赛车",
+    "%u公里/时",
+    "%u米",
+    "检查点！+%u秒",
+    "时间到",
+    "距离：%u米",
+    "按下：开始，下：刹车",
+    "图片",
+    "Pixabay密钥（可选）",
+    "搜索图片需要Pixabay密钥。请在pixabay.com/api/docs免费获取，并在菜单-Wi-Fi和密钥中填写。",
+    "要找什么？输入关键词后按OK。",
+    "没有找到。请换个关键词。",
+    "正在加载图片……",
+    "加载失败：",
+    "左右：翻看，按下：重新搜索，长按：退出",
+    "Pixabay，作者：%s",
+    "正在搜索图片……",
+    "Wikimedia，作者：%s",
+  },
+};
+
+// ========================= СОХРАНЁННЫЕ НАСТРОЙКИ =========================
+Preferences prefs;
+String cfgSsid, cfgPass, cfgKey;                    // cfgSsid/cfgPass - сеть, к которой подключаемся сейчас
+// Запомненные сети (до 5): дом, телефон, школа... Плата по очереди пробует их, пока не подключится.
+const size_t MAX_NETS = 5;
+std::vector<String> netSsid, netPass;
+int netIdx = 0;                                      // какую сеть пробуем сейчас
+int cfgSaver = 1;                                    // заставка с часами на экране ввода: 1 - да, 0 - нет
+extern String cfgNick, cfgRoom, roomId;              // «Комната»: имя, название комнаты, метка гаджета
+extern int cfgRoomBg, roomUnread;
+extern bool hsDirty;                                 // рекорд обновился - отправить в общую таблицу
+bool timeNow(struct tm& t);
+extern bool roomUnreadDirty;
+void roomTick();
+void loadAvatar();
+void (*g_bgTick)() = nullptr;                        // фоновая работа, пока человек набирает текст (приём сообщений комнаты)
+uint8_t cfgLang = LANG_RU;
+
+const Texts& T() { return TEXTS[cfgLang]; }
+
+// Короткая надпись на текущем языке (для новых экранов).
+const char* L3(const char* ru, const char* en, const char* zh) {
+  return cfgLang == LANG_RU ? ru : cfgLang == LANG_ZH ? zh : en;
+}
+
+const char* APP_UA = "DeepSeekPocket/1.0 (ESP32-C3 hobby device)";   // так устройство представляется сайтам
+int cfgBright = 4;        // яркость: 0..4 (8, 25, 50, 75, 100 %)
+int cfgSound = 1;         // звук: 0 - нет, 1 - только сигналы, 2 - сигналы и щелчки клавиш
+int cfgIdle = 2;          // гасить экран: 0 - нет, 1 - 30 с, 2 - 1 мин, 3 - 2 мин, 4 - 5 мин
+int cfgTz = 3;            // часовой пояс, часов от UTC (Москва +3)
+String cfgCity;           // город для погоды
+float cfgLat = 0, cfgLon = 0;
+
+void loadSettings() {
+  prefs.begin("dsk", true);
+  cfgSsid = prefs.getString("ssid", DEFAULT_SSID);
+  cfgPass = prefs.getString("pass", DEFAULT_PASS);
+  cfgSaver = (int)prefs.getUChar("saver", 1);
+  cfgNick = prefs.getString("nick", "");
+  cfgRoom = prefs.getString("room", ROOM_DEFAULT);
+  cfgRoomBg = (int)prefs.getUChar("roombg", 1);
+  if (!cfgRoom.length()) cfgRoom = ROOM_DEFAULT;
+  {
+    char b[12];
+    snprintf(b, sizeof(b), "%06x", (unsigned)((ESP.getEfuseMac() >> 24) & 0xFFFFFF));   // метка этого гаджета
+    roomId = b;
+  }
+  {                                                  // список сетей: имя \x1F пароль \x1E ...
+    std::string d = prefs.getString("nets", "").c_str();
+    netSsid.clear();
+    netPass.clear();
+    size_t p = 0;
+    while (p < d.size() && netSsid.size() < MAX_NETS) {
+      size_t e = d.find('\x1E', p);
+      if (e == std::string::npos) e = d.size();
+      std::string rec = d.substr(p, e - p);
+      size_t m = rec.find('\x1F');
+      if (m != std::string::npos && m > 0) {
+        netSsid.push_back(String(rec.substr(0, m).c_str()));
+        netPass.push_back(String(rec.substr(m + 1).c_str()));
+      }
+      p = e + 1;
+    }
+    if (netSsid.empty() && cfgSsid.length()) {       // сеть из прошлой версии прошивки (или из настроек скетча)
+      netSsid.push_back(cfgSsid);
+      netPass.push_back(cfgPass);
+    }
+    netIdx = 0;
+    cfgSsid = netSsid.empty() ? String("") : netSsid[0];
+    cfgPass = netSsid.empty() ? String("") : netPass[0];
+  }
+  cfgKey = prefs.getString("key", DEFAULT_API_KEY);
+  cfgLang = prefs.getUChar("lang", LANG_RU);
+  cfgBright = (int)prefs.getUChar("bri", 4);
+  cfgSound = (int)prefs.getUChar("snd", 1);
+  if (cfgSound < 0 || cfgSound > 2) cfgSound = 1;
+  cfgIdle = (int)prefs.getUChar("idle", 2);
+  cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
+  cfgCity = prefs.getString("city", "");
+  cfgLat = prefs.getString("lat", "0").toFloat();
+  cfgLon = prefs.getString("lon", "0").toFloat();
+  prefs.end();
+  if (cfgLang >= N_LANGS) cfgLang = LANG_RU;
+  if (cfgBright < 0 || cfgBright > 4) cfgBright = 4;
+  if (cfgIdle < 0 || cfgIdle > 4) cfgIdle = 2;
+  if (cfgTz < -12 || cfgTz > 14) cfgTz = 3;
+}
+
+void saveScreenSettings() {
+  prefs.begin("dsk", false);
+  prefs.putUChar("saver", (uint8_t)cfgSaver);
+  prefs.putUChar("snd", (uint8_t)cfgSound);
+  prefs.putUChar("bri", (uint8_t)cfgBright);
+  prefs.putUChar("idle", (uint8_t)cfgIdle);
+  prefs.putUChar("tz", (uint8_t)(cfgTz + 12));
+  prefs.end();
+}
+
+void saveLang() {
+  prefs.begin("dsk", false);
+  prefs.putUChar("lang", cfgLang);
+  prefs.end();
+}
+
+void storeNets() {
+  std::string d;
+  for (size_t i = 0; i < netSsid.size(); i++) d += std::string(netSsid[i].c_str()) + '\x1F' + netPass[i].c_str() + '\x1E';
+  prefs.begin("dsk", false);
+  prefs.putString("nets", String(d.c_str()));
+  prefs.putString("ssid", netSsid.empty() ? String("") : netSsid[0]);
+  prefs.putString("pass", netSsid.empty() ? String("") : netPass[0]);
+  prefs.end();
+}
+
+// Запомнить сеть (или обновить пароль). Новая становится первой; лишняя (самая давняя) забывается.
+void addNet(const String& ssid, const String& pass) {
+  for (size_t i = 0; i < netSsid.size(); i++)
+    if (netSsid[i] == ssid) {
+      netSsid.erase(netSsid.begin() + i);
+      netPass.erase(netPass.begin() + i);
+      break;
+    }
+  netSsid.insert(netSsid.begin(), ssid);
+  netPass.insert(netPass.begin(), pass);
+  while (netSsid.size() > MAX_NETS) {
+    netSsid.pop_back();
+    netPass.pop_back();
+  }
+  storeNets();
+}
+
+void removeNet(size_t i) {
+  if (i >= netSsid.size()) return;
+  netSsid.erase(netSsid.begin() + i);
+  netPass.erase(netPass.begin() + i);
+  storeNets();
+}
+
+void saveKey(const String& key) {
+  prefs.begin("dsk", false);
+  prefs.putString("key", key);
+  prefs.end();
+}
+
+String fmt(const char* f, int v) {
+  char b[160];
+  snprintf(b, sizeof(b), f, v);
+  return String(b);
+}
+
+String fmt(const char* f, const char* v) {
+  char b[800];
+  snprintf(b, sizeof(b), f, v);
+  return String(b);
+}
+
+std::string toStd(const String& s) { return std::string(s.c_str()); }
+String fromStd(const std::string& s) { return String(s.c_str()); }
+
+// ========================= ДИСПЛЕЙ =========================
+const uint16_t C_BLACK = 0x0000, C_WHITE = 0xFFFF, C_BLUE = 0x001F;
+const uint16_t C_RED = 0xF800, C_YELLOW = 0xFFE0, C_GRAY = 0x4228, C_GREEN = 0x07E0;
+const uint16_t C_LIGHT = 0xAD55;
+
+// Два шрифта: крупный 12x24 (основной) и мелкий 8x16 (служебные строки).
+// GW/GH/COLS/ROWS - размеры текущего шрифта; переключать через SmallFont.
+bool g_big = true;
+#define GW (g_big ? BIG_W : GLYPH_W)
+#define GH (g_big ? BIG_H : GLYPH_H)
+#define COLS (240 / GW)      // крупный: 20 позиций (10 иероглифов), мелкий: 30
+#define ROWS (240 / GH)      // крупный: 10 строк, мелкий: 15
+
+// Пока объект жив - рисуем мелким шрифтом.
+struct SmallFont {
+  bool prev;
+  SmallFont() : prev(g_big) { g_big = false; }
+  ~SmallFont() { g_big = prev; }
+};
+
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, -1, PIN_DC, PIN_RST);  // -1 = без CS
+static uint16_t cbuf[24 * 24];
+
+// Номер иероглифа в font_cjk.h (двоичный поиск) или -1.
+int cjkIndex(uint16_t cp) {
+  int lo = 0, hi = CJK_COUNT - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    uint16_t v = pgm_read_word(&CJK_CODES[mid]);
+    if (v == cp) return mid;
+    if (v < cp) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+void blit(int x, int y, int w, int h) {
+  tft.startWrite();
+  tft.setAddrWindow(x, y, w, h);
+  tft.writePixels(cbuf, (uint32_t)(w * h));
+  tft.endWrite();
+}
+
+// Рисует символ текущим шрифтом, возвращает его ширину в пикселях.
+int drawCp(uint16_t cp, int x, int y, uint16_t fg, uint16_t bg) {
+  if (isWide(cp)) {
+    int idx = cjkIndex(cp);
+    if (idx >= 0) {
+      if (g_big) {                            // иероглиф 24x24: 3 байта на строку
+        const uint8_t* g = &CJK24_BITMAPS[idx * 72];
+        for (int r = 0; r < 24; r++) {
+          uint32_t bits = ((uint32_t)pgm_read_byte(g + r * 3) << 16) |
+                          ((uint32_t)pgm_read_byte(g + r * 3 + 1) << 8) | pgm_read_byte(g + r * 3 + 2);
+          for (int c = 0; c < 24; c++) cbuf[r * 24 + c] = (bits & (0x800000UL >> c)) ? fg : bg;
+        }
+        blit(x, y, 24, 24);
+        return 24;
+      }
+      const uint8_t* g = &CJK_BITMAPS[idx * 32];
+      for (int r = 0; r < 16; r++) {
+        uint16_t bits = ((uint16_t)pgm_read_byte(g + r * 2) << 8) | pgm_read_byte(g + r * 2 + 1);
+        for (int c = 0; c < 16; c++) cbuf[r * 16 + c] = (bits & (0x8000 >> c)) ? fg : bg;
+      }
+      blit(x, y, 16, 16);
+      return 16;
+    }
+    drawCp('?', x, y, fg, bg);            // нет в шрифте: знак вопроса на 2 позиции
+    tft.fillRect(x + GW, y, GW, GH, bg);
+    return 2 * GW;
+  }
+  int gi = glyphIndex(cp);
+  if (gi < 0) gi = '?' - 32;
+  if (g_big) {                              // 12x24: 2 байта на строку, 12 бит слева
+    const uint8_t* g = &FONT12x24[gi * 48];
+    for (int r = 0; r < 24; r++) {
+      uint16_t bits = ((uint16_t)pgm_read_byte(g + r * 2) << 8) | pgm_read_byte(g + r * 2 + 1);
+      for (int c = 0; c < 12; c++) cbuf[r * 12 + c] = (bits & (0x8000 >> c)) ? fg : bg;
+    }
+    blit(x, y, 12, 24);
+    return 12;
+  }
+  const uint8_t* g = &FONT8x16[gi * 16];
+  for (int r = 0; r < 16; r++) {
+    uint8_t b = pgm_read_byte(g + r);
+    for (int c = 0; c < 8; c++) cbuf[r * 8 + c] = (b & (0x80 >> c)) ? fg : bg;
+  }
+  blit(x, y, 8, 16);
+  return 8;
+}
+
+// Рисует строку из n символов и стирает остаток строки экрана.
+void drawLine(const uint16_t* cps, int n, int y, uint16_t fg, uint16_t bg) {
+  int x = 0;
+  for (int i = 0; i < n && x + cellWidth(cps[i]) * GW <= 240; i++) x += drawCp(cps[i], x, y, fg, bg);
+  if (x < 240) tft.fillRect(x, y, 240 - x, GH, bg);
+}
+
+// Рисует короткую строку UTF-8 с позиции x (без переноса), возвращает конечный x.
+int drawUtf8(const char* s, int x, int y, uint16_t fg, uint16_t bg) {
+  std::vector<uint16_t> cps;
+  utf8ToCps(s, cps);
+  for (uint16_t c : cps) {
+    if (x + cellWidth(c) * GW > 240) break;
+    x += drawCp(c, x, y, fg, bg);
+  }
+  return x;
+}
+
+int textWidth(const char* s) {
+  std::vector<uint16_t> cps;
+  utf8ToCps(s, cps);
+  int w = 0;
+  for (uint16_t c : cps) w += cellWidth(c) * GW;
+  return w;
+}
+
+void renderRows(const std::vector<uint16_t>& cps, const std::vector<Line>& lines,
+                int top, uint16_t fg) {
+  for (int r = 0; r < ROWS; r++) {
+    size_t idx = (size_t)(top + r);
+    if (idx < lines.size()) drawLine(cps.data() + lines[idx].start, lines[idx].len, r * GH, fg, C_BLACK);
+    else tft.fillRect(0, r * GH, 240, GH, C_BLACK);
+  }
+}
+
+void showMsg(const String& s, uint16_t fg) {
+  std::vector<uint16_t> cps;
+  utf8ToCps(s.c_str(), cps);
+  std::vector<Line> lines;
+  bool prevBig = g_big;
+  g_big = true;
+  wrapCps(cps, COLS, lines);
+  if ((int)lines.size() > ROWS) {          // длинный текст (например, инструкция Wi-Fi) - мелким шрифтом
+    g_big = false;
+    lines.clear();
+    wrapCps(cps, COLS, lines);
+  }
+  tft.fillScreen(C_BLACK);
+  for (size_t i = 0; i < lines.size() && (int)i < ROWS; i++)
+    drawLine(cps.data() + lines[i].start, lines[i].len, (int)i * GH, fg, C_BLACK);
+  g_big = prevBig;
+}
+
+// ========================= ЗВУК =========================
+// Короткие сигналы пищалкой. Все звуки короткие и проигрываются «на месте» - зависнуть со включённым тоном нельзя.
+// Когда экран спрятан или погас, гаджет молчит.
+extern bool screenAsleep;
+
+void sndTone(int freq) {
+  if (BUZZER_ACTIVE) digitalWrite(PIN_BUZ, freq > 0 ? HIGH : LOW);
+  else ledcWriteTone(PIN_BUZ, freq > 0 ? (uint32_t)freq : 0);
+}
+
+void soundInit() {
+  if (BUZZER_ACTIVE) {
+    pinMode(PIN_BUZ, OUTPUT);
+    digitalWrite(PIN_BUZ, LOW);
+  } else {
+    ledcAttachChannel(PIN_BUZ, 2000, 10, 2);         // свой канал и таймер, чтобы не мешать подсветке экрана
+    ledcWriteTone(PIN_BUZ, 0);
+  }
+}
+
+// Один «бип». level: 1 - сигнал, 2 - щелчок клавиши (играет, только если в настройках «всё»).
+void beep(int level, int freq, int ms) {
+  if (cfgSound < level || screenAsleep) return;
+  sndTone(freq);
+  delay((uint32_t)ms);
+  sndTone(0);
+}
+
+// Мелодия: пары «частота, длительность»; частота 0 - пауза.
+void playNotes(int level, const uint16_t* notes, int count) {
+  if (cfgSound < level || screenAsleep) return;
+  for (int i = 0; i < count; i++) {
+    sndTone(notes[i * 2]);
+    delay(notes[i * 2 + 1]);
+  }
+  sndTone(0);
+}
+
+void sndOk() { static const uint16_t n[] = {880, 60, 1320, 90}; playNotes(1, n, 2); }
+void sndError() { static const uint16_t n[] = {300, 180}; playNotes(1, n, 1); }
+void sndMessage() { static const uint16_t n[] = {1200, 70, 0, 40, 1600, 90}; playNotes(1, n, 3); }
+void sndWin() { static const uint16_t n[] = {660, 90, 880, 90, 1320, 170}; playNotes(1, n, 3); }
+void sndLose() { static const uint16_t n[] = {440, 110, 330, 110, 220, 220}; playNotes(1, n, 3); }
+void sndBlip() { beep(1, 1500, 12); }
+
+// ========================= ЭКРАН: ЯРКОСТЬ И СОН =========================
+// Подсветка управляется ШИМ. Экран гаснет сам после простоя и сразу - если держать кнопку 2 секунды.
+// Любое движение джойстика или нажатие будит экран (само это действие не срабатывает).
+const int BRIGHT_PCT[5] = {8, 25, 50, 75, 100};
+const int IDLE_SECS[5] = {0, 30, 60, 120, 300};      // 0 - не гасить
+const uint32_t HIDE_HOLD_MS = 2000;
+bool screenAsleep = false;
+uint32_t lastActivity = 0;
+int keepAwakeCount = 0;
+
+void applyBrightness() { analogWrite(PIN_BLK, BRIGHT_PCT[cfgBright] * 255 / 100); }
+void noteActivity() { lastActivity = millis(); }
+void sleepScreen() {
+  if (screenAsleep) return;
+  screenAsleep = true;
+  analogWrite(PIN_BLK, 0);
+}
+void wakeScreen() {
+  screenAsleep = false;
+  lastActivity = millis();
+  applyBrightness();
+}
+bool saverArmed = false;      // мы на экране ввода: вместо гашения можно показать заставку
+bool saverDue = false;        // пора показать заставку
+void idleCheck() {
+  if (screenAsleep || keepAwakeCount > 0 || IDLE_SECS[cfgIdle] == 0) return;
+  if (millis() - lastActivity > (uint32_t)IDLE_SECS[cfgIdle] * 1000UL) {
+    if (saverArmed && cfgSaver) saverDue = true;
+    else sleepScreen();
+  }
+}
+struct SaverArm {             // пока объект жив - экран ввода «на дежурстве»
+  SaverArm() { saverArmed = true; saverDue = false; }
+  ~SaverArm() { saverArmed = false; saverDue = false; }
+};
+// Пока объект жив, экран сам не гаснет (часы, таймер, показ последовательности в игре).
+struct KeepAwake {
+  KeepAwake() { keepAwakeCount++; noteActivity(); }
+  ~KeepAwake() { keepAwakeCount--; noteActivity(); }
+};
+
+// Крупные цифры и буквы: символ шрифта 12x24, увеличенный в scale раз.
+void drawBigCp(uint16_t cp, int x, int y, int scale, uint16_t fg, uint16_t bg) {
+  int gi = glyphIndex(cp);
+  if (gi < 0) gi = '?' - 32;
+  const uint8_t* g = &FONT12x24[gi * 48];
+  tft.fillRect(x, y, 12 * scale, 24 * scale, bg);
+  for (int r = 0; r < 24; r++) {
+    uint16_t bits = ((uint16_t)pgm_read_byte(g + r * 2) << 8) | pgm_read_byte(g + r * 2 + 1);
+    int c = 0;
+    while (c < 12) {                                 // закрашиваем горизонтальными отрезками
+      if (!(bits & (0x8000 >> c))) {
+        c++;
+        continue;
+      }
+      int c0 = c;
+      while (c < 12 && (bits & (0x8000 >> c))) c++;
+      tft.fillRect(x + c0 * scale, y + r * scale, (c - c0) * scale, scale, fg);
+    }
+  }
+}
+
+// Строка крупными символами; prev - что уже на экране (перерисовываются только изменившиеся знаки).
+void drawBigStr(const char* s, const char* prev, int x, int y, int scale, uint16_t fg, uint16_t bg) {
+  std::vector<uint16_t> a, b;
+  utf8ToCps(s, a);
+  if (prev) utf8ToCps(prev, b);
+  for (size_t i = 0; i < a.size(); i++)
+    if (!prev || i >= b.size() || a[i] != b[i]) drawBigCp(a[i], x + (int)i * 12 * scale, y, scale, fg, bg);
+}
+
+// ========================= ДЖОЙСТИК И КНОПКА =========================
+int joyCx = 2048, joyCy = 2048;
+
+// Запоминаем положение ручки в покое (при включении джойстик не трогать).
+void joyCalibrate() {
+  long sx = 0, sy = 0;
+  for (int i = 0; i < 16; i++) {
+    sx += analogRead(PIN_JOY_X);
+    sy += analogRead(PIN_JOY_Y);
+    delay(2);
+  }
+  joyCx = (int)(sx / 16);
+  joyCy = (int)(sy / 16);
+}
+
+// Отклонение ручки от центра с учётом настроек осей: примерно -2048..2048.
+void joyAnalog(int& dx, int& dy) {
+  dx = analogRead(PIN_JOY_X) - joyCx;
+  dy = analogRead(PIN_JOY_Y) - joyCy;
+  if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
+  if (JOY_INVERT_X) dx = -dx;
+  if (JOY_INVERT_Y) dy = -dy;
+  if (dx > JOY_THRESHOLD / 2 || dx < -JOY_THRESHOLD / 2 || dy > JOY_THRESHOLD / 2 || dy < -JOY_THRESHOLD / 2) {
+    if (screenAsleep) wakeScreen();
+    noteActivity();
+  }
+  idleCheck();
+}
+
+uint8_t joyRawDir() {
+  int dx = analogRead(PIN_JOY_X) - joyCx;
+  int dy = analogRead(PIN_JOY_Y) - joyCy;
+  if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
+  if (JOY_INVERT_X) dx = -dx;
+  if (JOY_INVERT_Y) dy = -dy;
+  int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+  if (ax < JOY_THRESHOLD && ay < JOY_THRESHOLD) return J_NONE;
+  if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
+  return dy > 0 ? J_DOWN : J_UP;
+}
+
+// Направление ручки. Движение будит погасший экран (и само при этом не срабатывает).
+uint8_t joyRaw() {
+  static bool swallow = false;
+  uint8_t d = joyRawDir();
+  if (d == J_NONE) {
+    swallow = false;
+  } else {
+    if (screenAsleep) {
+      wakeScreen();
+      swallow = true;
+    }
+    noteActivity();
+  }
+  idleCheck();
+  return swallow ? (uint8_t)J_NONE : d;
+}
+
+// Одно событие на наклон; при удержании - автоповтор.
+bool g_joyRepeated = false;   // true - последнее событие было автоповтором (ручку держат)
+
+uint8_t joyEvent() {
+  static uint8_t last = J_NONE;
+  static uint32_t tNext = 0;
+  uint8_t d = joyRaw();
+  uint32_t now = millis();
+  if (d == J_NONE) {
+    last = J_NONE;
+    return J_NONE;
+  }
+  if (d != last) {
+    last = d;
+    tNext = now + REPEAT_DELAY_MS;
+    g_joyRepeated = false;
+    return d;
+  }
+  if ((int32_t)(now - tNext) >= 0) {
+    tNext = now + REPEAT_RATE_MS;
+    g_joyRepeated = true;
+    return d;
+  }
+  return J_NONE;
+}
+
+int joyVertical(uint8_t d) { return d == J_UP ? -1 : d == J_DOWN ? 1 : 0; }
+
+// Короткое нажатие срабатывает при отпускании, долгое - сразу по истечении времени.
+BtnEvent btnEvent() {
+  static int last = HIGH;
+  static uint32_t tChange = 0, tDown = 0;
+  static bool longFired = false;
+  static uint8_t swallow = 0;            // 1 - нажатие разбудило экран, 2 - экран спрятан удержанием: ждём отпускания
+  int v = digitalRead(PIN_SW);
+  uint32_t now = millis();
+  if (swallow == 0 && v == LOW && screenAsleep) {
+    wakeScreen();
+    swallow = 1;
+  }
+  if (swallow) {
+    if (v == HIGH) {
+      swallow = 0;
+      last = HIGH;
+      tChange = now;
+    }
+    return EV_NONE;
+  }
+  if (v == LOW) noteActivity();
+  idleCheck();
+  if (last == LOW && longFired && now - tDown >= HIDE_HOLD_MS) {   // держат 2 секунды - спрятать экран
+    sleepScreen();
+    swallow = 2;
+    return EV_NONE;
+  }
+  if (v != last && now - tChange > 30) {
+    last = v;
+    tChange = now;
+    if (v == LOW) {
+      tDown = now;
+      longFired = false;
+    } else if (!longFired) {
+      beep(2, 2200, 5);
+      return EV_CLICK;
+    }
+  }
+  if (last == LOW && !longFired && now - tDown >= LONG_PRESS_MS) {
+    longFired = true;
+    beep(2, 1100, 12);
+    return EV_LONG;
+  }
+  return EV_NONE;
+}
+
+BtnEvent waitButton() {
+  for (;;) {
+    BtnEvent e = btnEvent();
+    if (e != EV_NONE) return e;
+    delay(10);
+  }
+}
+
+// ========================= НАСТРОЙКА WI-FI С ТЕЛЕФОНА =========================
+WebServer server(80);
+DNSServer dns;
+String scanOptions;
+bool portalSaved = false;
+bool serverReady = false;
+
+String htmlEscape(const String& s) {
+  String o;
+  for (unsigned i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '"') o += "&quot;";
+    else o += c;
+  }
+  return o;
+}
+
+String pageHead() {
+  return String("<!doctype html><html><head><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>") + T().webTitle + "</title><style>"
+                "body{font-family:sans-serif;max-width:420px;margin:24px auto;padding:0 16px;"
+                "background:#111;color:#eee}h2{font-weight:600}label{display:block;margin-top:16px}"
+                "input,select,button,textarea{width:100%;box-sizing:border-box;font-size:17px;padding:10px;"
+                "margin-top:6px;border-radius:8px;border:1px solid #555;background:#222;color:#eee}"
+                "button{background:#2563eb;border:0;margin-top:24px}small{color:#999}"
+                "input[type=checkbox]{width:auto;margin-right:8px}hr{border:0;border-top:1px solid #444;margin:28px 0}"
+                "</style></head><body>";
+}
+
+String maskedKey() {
+  if (cfgKey.length() < 8) return "";
+  return cfgKey.substring(0, 3) + "..." + cfgKey.substring(cfgKey.length() - 4);
+}
+
+int noteCount();
+bool addNote(const String& title, const String& text);
+String portalNote;                                   // что только что пришло с телефона (показать на экране)
+
+// ---------- Галерея: картинки в памяти платы ----------
+// Телефон сам уменьшает фото под экран (до 240x200) и присылает маленький JPEG.
+const int MAX_PICS = 30;
+const size_t MAX_PIC_BYTES = 40000;
+
+String picPath(int i) {
+  char b[20];
+  snprintf(b, sizeof(b), "/pic%02d.jpg", i);
+  return String(b);
+}
+
+int picCount() {
+  int n = 0;
+  for (int i = 0; i < MAX_PICS; i++)
+    if (LittleFS.exists(picPath(i).c_str())) n++;
+  return n;
+}
+
+int picFreeSlot() {
+  for (int i = 0; i < MAX_PICS; i++)
+    if (!LittleFS.exists(picPath(i).c_str())) return i;
+  return -1;
+}
+
+bool picRoom() { return LittleFS.totalBytes() - LittleFS.usedBytes() > 60000; }   // оставляем запас памяти
+
+// Сохранить готовый JPEG из памяти (например, найденную в интернете картинку). Пустая строка - успех, иначе причина.
+String savePic(const uint8_t* data, size_t n) {
+  if (n < 100 || data[0] != 0xFF || data[1] != 0xD8) return L3("это не JPEG", "not a JPEG", "不是JPEG");
+  if (n > MAX_PIC_BYTES) return L3("файл слишком большой", "the file is too big", "文件太大");
+  int slot = picFreeSlot();
+  if (slot < 0) return L3("галерея заполнена (30)", "the gallery is full (30)", "相册已满（30）");
+  if (!picRoom()) return L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
+  File f = LittleFS.open(picPath(slot).c_str(), "w");
+  if (!f) return L3("не удалось записать", "cannot write the file", "无法写入");
+  size_t w = f.write(data, n);
+  f.close();
+  if (w != n) {
+    LittleFS.remove(picPath(slot).c_str());
+    return L3("не удалось записать", "cannot write the file", "无法写入");
+  }
+  return "";
+}
+
+// Приём файла с телефона по кусочкам.
+File picFile;
+String picFilePath, picErr;
+size_t picSize = 0;
+bool picOk = false;
+
+void picAbort(const char* why) {
+  if (picFile) picFile.close();
+  if (picFilePath.length()) LittleFS.remove(picFilePath.c_str());
+  picFilePath = "";
+  picErr = why;
+}
+
+void handlePicUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    picOk = false;
+    picSize = 0;
+    picErr = "";
+    picFilePath = "";
+    int slot = picFreeSlot();
+    if (slot < 0) {
+      picErr = L3("галерея заполнена (30). Удалите лишнее на устройстве.", "the gallery is full (30)", "相册已满（30）");
+    } else if (!picRoom()) {
+      picErr = L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
+    } else {
+      picFilePath = picPath(slot);
+      picFile = LittleFS.open(picFilePath.c_str(), "w");
+      if (!picFile) picAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!picFilePath.length()) return;                // уже отказали
+    if (picSize == 0 && (up.currentSize < 2 || up.buf[0] != 0xFF || up.buf[1] != 0xD8)) {
+      picAbort(L3("это не JPEG", "not a JPEG", "不是JPEG"));
+      return;
+    }
+    picSize += up.currentSize;
+    if (picSize > MAX_PIC_BYTES) {
+      picAbort(L3("файл слишком большой", "the file is too big", "文件太大"));
+      return;
+    }
+    if (picFile.write(up.buf, up.currentSize) != up.currentSize) picAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!picFilePath.length()) return;
+    picFile.close();
+    if (picSize < 100) picAbort(L3("файл пустой", "the file is empty", "文件为空"));
+    else picOk = true;
+  } else {                                           // связь оборвалась посреди файла
+    if (picFilePath.length()) picAbort(L3("загрузка прервана", "the upload was interrupted", "上传中断"));
+  }
+}
+
+void handlePicDone() {
+  if (picOk) {
+    server.send(200, "text/plain; charset=utf-8", "OK");
+    portalNote = String(L3("Получена картинка. В галерее: ", "Picture received. In the gallery: ", "已收到图片。相册中：")) + String(picCount());
+  } else {
+    server.send(200, "text/plain; charset=utf-8", String(L3("Ошибка: ", "Error: ", "错误：")) + (picErr.length() ? picErr : String("?")));
+  }
+  picOk = false;
+}
+
+void handleRoot() {
+  String h = pageHead();
+  h += "<h2>"; h += T().webTitle; h += "</h2><form method='post' action='/save'>";
+  if (netSsid.size()) {                              // запомненные сети: галочка - забыть
+    h += "<label>";
+    h += L3("Запомненные сети (отметьте, чтобы забыть):", "Saved networks (tick to forget):", "已保存的网络（勾选以删除）：");
+    h += "</label>";
+    for (size_t i = 0; i < netSsid.size(); i++) {
+      h += "<label><input type='checkbox' name='d"; h += String((int)i); h += "' value='1'>";
+      h += htmlEscape(netSsid[i]); h += "</label>";
+    }
+  }
+  h += "<label>";
+  h += L3("Добавить сеть (до 5: дом, телефон, школа...)", "Add a network (up to 5)", "添加网络（最多5个）");
+  h += "<select name='s'><option value=''>";
+  h += L3("- не добавлять -", "- do not add -", "- 不添加 -");
+  h += "</option>";
+  h += scanOptions;
+  h += "</select></label>";
+  h += "<label>"; h += T().webManual; h += "<input name='m' autocomplete='off'></label>";
+  h += "<label>"; h += T().webPass; h += "<input name='p' type='password'></label>";
+  h += "<label>"; h += T().webKey;
+  h += "<input name='k' autocomplete='off' placeholder='sk-...'><small>";
+  h += T().webKeyHint;
+  String mk = maskedKey();
+  if (mk.length()) { h += " ("; h += htmlEscape(mk); h += ")"; }
+  h += "</small></label><button type='submit'>"; h += T().webSave; h += "</button></form>";
+  // конспекты: текст с телефона сохраняется в память платы и читается без интернета
+  h += "<hr><h2>"; h += L3("Конспект", "Note", "笔记"); h += "</h2><form method='post' action='/note'>";
+  h += "<label>"; h += L3("Название", "Title", "标题"); h += "<input name='t' maxlength='60'></label>";
+  h += "<label>"; h += L3("Текст (до 4000 знаков)", "Text (up to 4000 characters)", "正文（最多4000字）");
+  h += "<textarea name='x' rows='10' maxlength='4000'></textarea></label><small>";
+  h += L3("Сохранено конспектов: ", "Notes saved: ", "已保存笔记："); h += String(noteCount()); h += " / 20</small>";
+  h += "<button type='submit'>"; h += L3("Сохранить конспект", "Save the note", "保存笔记"); h += "</button></form>";
+  // галерея: телефон уменьшает фото до 240x200 и отправляет по одному
+  h += "<hr><h2>"; h += L3("Картинки в галерею", "Pictures for the gallery", "相册图片"); h += "</h2>";
+  h += "<p><small>";
+  h += L3("Если кнопка выбора не нажимается: это окно входа в сеть, в нём выбор файлов не работает. Откройте в обычном браузере (Chrome, Safari) адрес ",
+          "If the button does not respond, this is the network sign-in window, where file selection does not work. Open in a normal browser (Chrome, Safari): ",
+          "如果按钮没有反应：这是网络登录窗口，无法选择文件。请在普通浏览器（Chrome、Safari）中打开：");
+  h += "<b>192.168.4.1</b></small></p>";
+  h += "<p id='oc' style='display:none'><a style='color:#8ab4ff' href='intent://192.168.4.1/#Intent;scheme=http;package=com.android.chrome;end'>";
+  h += L3("Открыть эту страницу в Chrome", "Open this page in Chrome", "在Chrome中打开此页面");
+  h += "</a></p>";
+  h += "<input type='file' id='pf' accept='image/*' multiple><p><small id='ps'>";
+  h += L3("В галерее: ", "In the gallery: ", "相册中："); h += String(picCount()); h += " / 30</small></p>";
+  h += "<script>var T1='"; h += L3("Отправляю", "Sending", "正在发送");
+  h += "',T2='"; h += L3("Загружено картинок: ", "Pictures uploaded: ", "已上传图片：");
+  h += "',T3='"; h += L3("Не получилось: ", "Failed: ", "失败：");
+  h += "';"
+       "if(/Android/.test(navigator.userAgent))document.getElementById('oc').style.display='block';"
+       "document.getElementById('pf').onchange=async function(){var s=document.getElementById('ps'),fs=this.files,ok=0;"
+       "for(var i=0;i<fs.length;i++){s.textContent=T1+' '+(i+1)+' / '+fs.length+'...';try{"
+       "var im=await new Promise(function(res,rej){var m=new Image();m.onload=function(){res(m)};m.onerror=function(){rej('image')};m.src=URL.createObjectURL(fs[i])});"
+       "var k=Math.min(240/im.width,200/im.height,1),w=Math.max(8,Math.round(im.width*k)),hh=Math.max(8,Math.round(im.height*k));"
+       "var c=document.createElement('canvas');c.width=w;c.height=hh;var g=c.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,w,hh);g.drawImage(im,0,0,w,hh);"
+       "var q=0.85,b;do{b=await new Promise(function(r){c.toBlob(r,'image/jpeg',q)});q-=0.15}while(b&&b.size>30000&&q>0.2);"
+       "var fd=new FormData();fd.append('f',b,'p.jpg');var r=await fetch('/pic',{method:'POST',body:fd});var t=await r.text();"
+       "if(t.indexOf('OK')==0)ok++;else{s.textContent=T3+t;this.value='';return}"
+       "}catch(e){s.textContent=T3+e;this.value='';return}}"
+       "s.textContent=T2+ok;this.value=''};</script></body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+void handleSave() {
+  bool changed = false;
+  for (int i = (int)netSsid.size() - 1; i >= 0; i--)   // забыть отмеченные сети
+    if (server.arg((String("d") + String(i)).c_str()) == "1") {
+      removeNet((size_t)i);
+      changed = true;
+    }
+  String ssid = server.arg("m");
+  ssid.trim();
+  if (ssid.length() == 0) ssid = server.arg("s");
+  if (ssid.length()) {
+    addNet(ssid, server.arg("p"));
+    changed = true;
+  }
+  String key = server.arg("k");
+  key.trim();
+  if (key.length()) {
+    saveKey(key);
+    changed = true;
+  }
+  if (!changed) {
+    server.send(200, "text/html; charset=utf-8", pageHead() + "<p>" + T().webNoSsid + "</p><p><a href='/'>&larr;</a></p></body></html>");
+    return;
+  }
+  server.send(200, "text/html; charset=utf-8", pageHead() + "<h2>" + T().webDone + "</h2></body></html>");
+  portalSaved = true;
+}
+
+void handleNote() {
+  String title = server.arg("t"), text = server.arg("x");
+  title.trim();
+  text.trim();
+  String msg;
+  if (text.length() == 0) {
+    msg = L3("Текст пустой - нечего сохранять.", "The text is empty.", "正文为空。");
+  } else {
+    if (title.length() == 0) title = L3("Без названия", "Untitled", "无标题");
+    if (addNote(title, text)) {
+      msg = String(L3("Конспект сохранён: ", "Note saved: ", "笔记已保存：")) + htmlEscape(title);
+      portalNote = String(L3("Получен конспект: ", "Note received: ", "已收到笔记：")) + title;
+    } else {
+      msg = L3("Нет места: уже 20 конспектов. Удалите лишние на устройстве.", "No room: 20 notes already. Delete some on the device.",
+               "没有空间：已有20条笔记。请在设备上删除一些。");
+    }
+  }
+  server.send(200, "text/html; charset=utf-8",
+              pageHead() + "<p>" + msg + "</p><p><a href='/' style='color:#8ab4ff'>" + L3("Добавить ещё", "Add another", "继续添加") + "</a></p></body></html>");
+}
+
+void handleRedirect() {
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void buildScanList() {
+  scanOptions = "";
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() == 0) continue;
+    bool dup = false;                       // одна сеть может встречаться несколько раз
+    for (int j = 0; j < i; j++) if (WiFi.SSID(j) == s) dup = true;
+    if (dup) continue;
+    String e = htmlEscape(s);
+    scanOptions += "<option value=\"" + e + "\"";
+    scanOptions += ">" + e + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  }
+  WiFi.scanDelete();
+}
+
+// Точка доступа + страница настройки. Возвращается при отмене кнопкой,
+// после сохранения перезапускает плату.
+void runPortal() {
+  Serial.println("Wi-Fi setup portal");
+  showMsg("Wi-Fi...", C_YELLOW);
+  WiFi.disconnect(true);
+  delay(300);
+  WiFi.mode(WIFI_AP_STA);
+  delay(200);
+  buildScanList();
+  WiFi.softAP(AP_NAME);
+  delay(300);
+  dns.start(53, "*", WiFi.softAPIP());
+  if (!serverReady) {
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/note", HTTP_POST, handleNote);
+    server.on("/pic", HTTP_POST, handlePicDone, handlePicUpload);
+    server.onNotFound(handleRedirect);   // открывает страницу сама (captive portal)
+    serverReady = true;
+  }
+  server.begin();
+  portalSaved = false;
+  showMsg(fmt(T().portal, AP_NAME), C_WHITE);
+
+  for (;;) {
+    dns.processNextRequest();
+    server.handleClient();
+    if (portalSaved) {
+      showMsg(T().portalSaved, C_GREEN);
+      uint32_t t = millis();
+      while (millis() - t < 1500) {        // даём странице «Сохранено» дойти до телефона
+        server.handleClient();
+        delay(10);
+      }
+      ESP.restart();
+    }
+    if (portalNote.length()) {             // с телефона пришёл конспект - сообщить и ждать дальше
+      showMsg(portalNote, C_GREEN);
+      sndOk();
+      portalNote = "";
+      uint32_t t = millis();
+      while (millis() - t < 2000) {
+        server.handleClient();
+        delay(10);
+      }
+      showMsg(fmt(T().portal, AP_NAME), C_WHITE);
+    }
+    if (btnEvent() == EV_CLICK) break;     // отмена
+    delay(2);
+  }
+  server.stop();
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  delay(200);
+}
+
+// ========================= ПОДКЛЮЧЕНИЕ К WI-FI =========================
+// Подключение идёт в фоне: плата сразу работает, а Wi-Fi подключается сам.
+uint32_t wifiBeginMs = 0;
+bool wifiStarted = false;
+
+bool wifiWasOk = false;
+
+void wifiStart() {
+  if (netSsid.empty()) {
+    cfgSsid = "";
+    return;
+  }
+  if (netIdx < 0 || netIdx >= (int)netSsid.size()) netIdx = 0;
+  cfgSsid = netSsid[(size_t)netIdx];
+  cfgPass = netPass[(size_t)netIdx];
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+#if LOW_TX_POWER
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+  wifiBeginMs = millis();
+  wifiStarted = true;
+  Serial.printf("Wi-Fi: trying network %d of %u\n", netIdx + 1, (unsigned)netSsid.size());
+}
+
+bool wifiOk() { return WiFi.status() == WL_CONNECTED; }
+
+// Вызывать почаще: если связи долго нет - начинаем подключение заново (раз в 30 с).
+void startNtp();
+extern bool ntpStarted;
+
+void wifiTick() {
+  if (wifiOk()) {
+    if (!ntpStarted) startNtp();                     // точное время - для часов
+    if (!wifiWasOk) {
+      wifiWasOk = true;
+      if (netIdx > 0 && netIdx < (int)netSsid.size()) {   // подключились не к первой - в следующий раз начнём с неё
+        String s1 = netSsid[(size_t)netIdx], p1 = netPass[(size_t)netIdx];
+        netSsid.erase(netSsid.begin() + netIdx);
+        netPass.erase(netPass.begin() + netIdx);
+        netSsid.insert(netSsid.begin(), s1);
+        netPass.insert(netPass.begin(), p1);
+        netIdx = 0;
+        storeNets();
+      }
+    }
+    return;
+  }
+  wifiWasOk = false;
+  if (netSsid.empty()) return;
+  // одна сеть - повторяем раз в 30 с; несколько - пробуем следующую каждые 12 с
+  uint32_t patience = netSsid.size() > 1 ? 12000 : 30000;
+  if (!wifiStarted) wifiStart();
+  else if (millis() - wifiBeginMs > patience) {
+    netIdx = (netIdx + 1) % (int)netSsid.size();
+    wifiStart();
+  }
+}
+
+// 0 - подключено, 1 - подключается, 2 - сеть не настроена
+int wifiState() {
+  if (wifiOk()) return 0;
+  return cfgSsid.length() ? 1 : 2;
+}
+
+void runGamesMenu();
+int listScreen(const char* title, const std::vector<String>& items, const std::vector<String>& right, int sel);
+
+// Ждём связь перед запросом к DeepSeek. true - подключились.
+// allowGames: удержание открывает игры (поиграть, пока ждём).
+bool waitWifi(bool allowGames) {
+  for (;;) {
+    if (wifiOk()) return true;
+    if (cfgSsid.length()) {
+      showMsg(T().wifiWait, C_YELLOW);
+      uint32_t t0 = millis();
+      while (millis() - t0 < 20000) {
+        if (wifiOk()) return true;
+        wifiTick();
+        BtnEvent e = btnEvent();
+        if (e == EV_CLICK) return false;
+        if (e == EV_LONG && allowGames) {
+          runGamesMenu();
+          if (wifiOk()) return true;
+          showMsg(T().wifiWait, C_YELLOW);
+          t0 = millis();
+        }
+        delay(20);
+      }
+    }
+    // не дождались (или сеть не настроена) - что дальше?
+    std::vector<String> items = {T().wifiRetry, T().menuWifi, T().menuBack};
+    if (allowGames) items.insert(items.begin() + 1, T().menuGames);
+    int k = listScreen(T().wifiNoConn, items, std::vector<String>(), 0);
+    if (k < 0 || k == (int)items.size() - 1) return false;
+    if (k == 0) {
+      netIdx = 0;
+      wifiStart();
+      continue;
+    }
+    if (allowGames && k == 1) {
+      runGamesMenu();
+      continue;
+    }
+    runPortal();                                     // после сохранения плата перезапустится
+    wifiStart();
+  }
+}
+
+// ========================= БАТАРЕЯ =========================
+float batVolts = 0;          // сглаженное напряжение
+uint32_t batNextMs = 0;
+int batShownPct = -2;        // что сейчас нарисовано (-1 = USB)
+
+float readBatVolts() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BAT);
+  return mv / 8.0f / 1000.0f * BAT_DIVIDER * BAT_CALIBRATION;
+}
+
+// Кривая разряда литиевого аккумулятора: напряжение -> процент.
+int batPercent(float v) {
+  static const float V[] = {3.27f, 3.61f, 3.69f, 3.71f, 3.73f, 3.75f, 3.77f, 3.79f, 3.80f, 3.82f, 3.84f,
+                            3.85f, 3.87f, 3.91f, 3.95f, 3.98f, 4.02f, 4.08f, 4.11f, 4.15f, 4.20f};
+  if (v <= V[0]) return 0;
+  if (v >= V[20]) return 100;
+  for (int i = 1; i <= 20; i++)
+    if (v < V[i]) return (int)((i - 1) * 5 + (v - V[i - 1]) / (V[i] - V[i - 1]) * 5 + 0.5f);
+  return 100;
+}
+
+// Обновляет напряжение раз в 5 секунд. true - если процент на экране надо перерисовать.
+bool updateBattery() {
+  if (!BATTERY_ENABLED) return false;
+  uint32_t now = millis();
+  if (batVolts > 0 && (int32_t)(now - batNextMs) < 0) return false;
+  batNextMs = now + 5000;
+  float v = readBatVolts();
+  batVolts = batVolts <= 0 ? v : batVolts * 0.7f + v * 0.3f;
+  int pct = batVolts > 4.35f ? -1 : batPercent(batVolts);   // больше 4,35 В - питание от USB
+  if (pct == batShownPct) return false;
+  batShownPct = pct;
+  return true;
+}
+
+// Маленький виджет: время и заряд, прижат вправо к xRight. Мелким шрифтом.
+void drawMiniStatus(int xRight, int y, uint16_t bg) {
+  SmallFont small;
+  char b[24] = "";
+  struct tm t;
+  if (timeNow(t)) snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+  if (BATTERY_ENABLED && batShownPct >= -1) {
+    size_t n = strlen(b);
+    if (batShownPct == -1) snprintf(b + n, sizeof(b) - n, "%sUSB", n ? " " : "");
+    else snprintf(b + n, sizeof(b) - n, "%s%d%%", n ? " " : "", batShownPct);
+  }
+  if (!b[0]) return;
+  int w = textWidth(b);
+  tft.fillRect(xRight - w - 4, y, w + 4, GH, bg);
+  uint16_t col = (BATTERY_ENABLED && batShownPct >= 0 && batShownPct <= 15) ? C_RED : C_LIGHT;
+  drawUtf8(b, xRight - w, y, col, bg);
+}
+
+// ========================= ПАМЯТЬ ЧАТА =========================
+std::vector<ChatMsg> chat;
+
+// Убираем самые старые пары «вопрос-ответ», пока история не влезет в лимиты.
+void trimHistory() {
+  for (;;) {
+    unsigned total = 0;
+    for (const ChatMsg& m : chat) total += m.text.length();
+    if ((int)chat.size() <= MAX_HISTORY_MSGS && total <= MAX_HISTORY_CHARS) return;
+    if (chat.size() <= 2) return;           // последнюю пару оставляем всегда
+    chat.erase(chat.begin(), chat.begin() + 2);
+  }
+}
+
+int chatPairs() { return (int)chat.size() / 2; }
+
+// Строка состояния внизу экрана: длина чата слева, батарея справа.
+const int STATUS_Y = 216;
+
+int statusMinute = -1;                               // какая минута сейчас показана в строке состояния
+
+// Пора ли обновить часы в строке состояния (раз в минуту).
+bool statusClockDue() {
+  static uint32_t next = 0;
+  if ((int32_t)(millis() - next) < 0) return false;
+  next = millis() + 2000;
+  struct tm t;
+  return timeNow(t) && t.tm_min != statusMinute;
+}
+
+void drawStatusBar() {
+  SmallFont small;
+  tft.fillRect(0, STATUS_Y, 240, 240 - STATUS_Y, C_BLACK);
+  tft.fillRect(0, STATUS_Y, 240, 1, C_GRAY);
+  int sx = 2;
+  {                                                  // время (когда оно известно), затем счётчик чата
+    struct tm t;
+    if (timeNow(t)) {
+      char b[8];
+      snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+      drawUtf8(b, sx, STATUS_Y + 5, C_WHITE, C_BLACK);
+      sx += 46;
+      statusMinute = t.tm_min;
+    }
+  }
+  String cc = String(L3("Чат", "Chat", "聊")) + ":" + String(chatPairs());
+  drawUtf8(cc.c_str(), sx, STATUS_Y + 5, C_LIGHT, C_BLACK);
+  int ws = wifiState();                              // Wi-Fi: зелёный - есть, жёлтый - подключается, красный - не настроен
+  drawUtf8("Wi-Fi", 100, STATUS_Y + 5, ws == 0 ? C_GREEN : ws == 1 ? C_YELLOW : C_RED, C_BLACK);
+  if (roomUnread > 0) {                              // новые сообщения в комнате: конвертик и число
+    int ex = 144, ey = STATUS_Y + 8;
+    tft.drawRect(ex, ey, 14, 10, C_YELLOW);
+    tft.drawLine(ex, ey, ex + 6, ey + 5, C_YELLOW);
+    tft.drawLine(ex + 13, ey, ex + 7, ey + 5, C_YELLOW);
+    String n = roomUnread > 9 ? String("9+") : String(roomUnread);
+    drawUtf8(n.c_str(), ex + 17, STATUS_Y + 5, C_YELLOW, C_BLACK);
+  }
+  roomUnreadDirty = false;
+  if (!BATTERY_ENABLED || batShownPct < -1) return;
+  if (batShownPct == -1) {
+    drawUtf8("USB", 240 - 3 * GW - 2, STATUS_Y + 5, C_LIGHT, C_BLACK);
+    return;
+  }
+  uint16_t col = batShownPct > 30 ? C_GREEN : batShownPct > 15 ? C_YELLOW : C_RED;
+  String t = String(batShownPct) + "%";
+  int tw = (int)t.length() * GW;
+  int tx = 240 - tw - 2;
+  drawUtf8(t.c_str(), tx, STATUS_Y + 5, col, C_BLACK);
+  // значок батареи 20x10 слева от процентов
+  int bx = tx - 26, by = STATUS_Y + 8;
+  tft.fillRect(bx, by, 20, 10, C_LIGHT);
+  tft.fillRect(bx + 1, by + 1, 18, 8, C_BLACK);
+  tft.fillRect(bx + 20, by + 3, 2, 4, C_LIGHT);
+  int fw = (16 * batShownPct + 50) / 100;
+  if (fw > 0) tft.fillRect(bx + 2, by + 2, fw, 6, col);
+}
+
+// ========================= ИГРА «БЛОКИ» =========================
+// Поле 8x8 клеток по 24 пикселя слева, лоток с тремя фигурами справа.
+const int GCELL = 24, GX0 = 0, GY0 = 22;          // поле: x 0..191, y 22..213
+const int TRAY_X = 194, TRAY_W = 46, SLOT_H = 64;   // лоток справа
+const int MINI = 8;                                 // клетка фигуры в лотке
+const uint16_t C_EMPTY_CELL = 0x18E3;
+
+blocks::Game game;
+bool gameStarted = false;
+
+uint32_t gameRandom() { return esp_random(); }
+
+uint16_t darker(uint16_t c) { return (c >> 1) & 0x7BEF; }
+uint16_t lighter(uint16_t c) { return ((c >> 1) & 0x7BEF) + 0x7BEF; }
+
+void drawBoardCellColor(int r, int c, uint16_t col, bool shine) {
+  int x = GX0 + c * GCELL, y = GY0 + r * GCELL;
+  tft.fillRect(x + 1, y + 1, GCELL - 2, GCELL - 2, col);
+  if (shine) tft.fillRect(x + 1, y + 1, GCELL - 2, 3, lighter(col));
+}
+
+void drawBoardCell(int r, int c) {
+  uint16_t v = game.cell[r][c];
+  drawBoardCellColor(r, c, v ? v : C_EMPTY_CELL, v != 0);
+}
+
+void drawBoard() {
+  tft.fillRect(GX0, GY0, GCELL * blocks::N, GCELL * blocks::N, C_BLACK);
+  for (int r = 0; r < blocks::N; r++)
+    for (int c = 0; c < blocks::N; c++) drawBoardCell(r, c);
+}
+
+// Призрак фигуры на поле: тёмный цвет фигуры, если встаёт; красный, если нет.
+void drawGhost(int idx, int gr, int gc) {
+  blocks::Piece p = blocks::Game::piece(idx);
+  bool ok = game.canPlace(idx, gr, gc);
+  for (int r = 0; r < p.h; r++)
+    for (int c = 0; c < p.w; c++) {
+      if (!blocks::pieceCell(p, r, c)) continue;
+      int br = gr + r, bc = gc + c;
+      if (ok) {
+        drawBoardCellColor(br, bc, darker(p.color), false);
+      } else if (game.cell[br][bc]) {
+        drawBoardCell(br, bc);
+        int x = GX0 + bc * GCELL, y = GY0 + br * GCELL;
+        tft.fillRect(x + 7, y + 7, GCELL - 14, GCELL - 14, C_RED);
+      } else {
+        drawBoardCellColor(br, bc, darker(C_RED), false);
+      }
+    }
+}
+
+void eraseGhost(int idx, int gr, int gc) {
+  blocks::Piece p = blocks::Game::piece(idx);
+  for (int r = 0; r < p.h; r++)
+    for (int c = 0; c < p.w; c++)
+      if (blocks::pieceCell(p, r, c)) drawBoardCell(gr + r, gc + c);
+}
+
+// mode: 0 - обычный, 1 - выбран (жёлтая рамка), 2 - взят и ставится (белая рамка)
+void drawTraySlot(int i, int mode) {
+  int y0 = GY0 + i * SLOT_H;
+  tft.fillRect(TRAY_X, y0, TRAY_W, SLOT_H - 2, C_BLACK);
+  if (mode) {
+    uint16_t fc = mode == 1 ? C_YELLOW : C_WHITE;
+    tft.fillRect(TRAY_X, y0, TRAY_W, 2, fc);
+    tft.fillRect(TRAY_X, y0 + SLOT_H - 4, TRAY_W, 2, fc);
+    tft.fillRect(TRAY_X, y0, 2, SLOT_H - 2, fc);
+    tft.fillRect(TRAY_X + TRAY_W - 2, y0, 2, SLOT_H - 2, fc);
+  }
+  int idx = game.tray[i];
+  if (idx < 0) return;
+  blocks::Piece p = blocks::Game::piece(idx);
+  int px = TRAY_X + (TRAY_W - p.w * MINI) / 2;
+  int py = y0 + (SLOT_H - 2 - p.h * MINI) / 2;
+  bool fits = game.fitsAnywhere(idx);
+  uint16_t col = fits ? p.color : C_GRAY;           // серым - если ей уже некуда встать
+  for (int r = 0; r < p.h; r++)
+    for (int c = 0; c < p.w; c++)
+      if (blocks::pieceCell(p, r, c)) tft.fillRect(px + c * MINI, py + r * MINI, MINI - 1, MINI - 1, col);
+}
+
+void drawGameTop() {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, GY0 - 2, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)game.score);
+  drawUtf8(b, 2, 2, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), T().gameBest, (unsigned)game.best);
+  drawUtf8(b, 240 - textWidth(b) - 2, 2, C_YELLOW, C_BLACK);
+}
+
+void drawGameHint(const char* h) {
+  SmallFont small;
+  tft.fillRect(0, 222, 240, 18, C_BLACK);
+  drawUtf8(h, (240 - textWidth(h)) / 2, 223, C_LIGHT, C_BLACK);
+}
+
+// Партия пишется в память платы после каждого хода - переживает выключение.
+void saveGameState() {
+  uint8_t buf[blocks::Game::SAVE_SIZE];
+  size_t n = game.saveTo(buf);
+  prefs.begin("dsk", false);
+  prefs.putBytes("game", buf, n);
+  prefs.end();
+}
+
+void clearGameState() {
+  prefs.begin("dsk", false);
+  prefs.remove("game");
+  prefs.end();
+}
+
+// true - если удалось продолжить сохранённую партию.
+bool loadGameState() {
+  uint8_t buf[blocks::Game::SAVE_SIZE];
+  prefs.begin("dsk", true);
+  size_t n = prefs.getBytesLength("game");
+  bool ok = n == sizeof(buf) && prefs.getBytes("game", buf, n) == n;
+  prefs.end();
+  return ok && game.loadFrom(buf, n) && !game.over;
+}
+
+void saveBest() {
+  prefs.begin("dsk", false);
+  if (game.best > prefs.getUInt("best", 0)) prefs.putUInt("best", game.best);
+  prefs.end();
+}
+
+int firstFreeSlot(int from, int dir) {
+  for (int k = 0; k < blocks::SLOTS; k++) {
+    int i = ((from + dir * k) % blocks::SLOTS + blocks::SLOTS) % blocks::SLOTS;
+    if (game.tray[i] >= 0) return i;
+  }
+  return -1;
+}
+
+// Вспышка сгоревших рядов и столбцов.
+void flashCleared() {
+  for (int r = 0; r < blocks::N; r++)
+    for (int c = 0; c < blocks::N; c++)
+      if ((game.clearedRows >> r & 1) || (game.clearedCols >> c & 1)) drawBoardCellColor(r, c, C_WHITE, false);
+  delay(160);
+}
+
+// Возвращает true, если играть заново; false - выйти в меню.
+// Окошко итога: заголовок и строка; нажатие - true (ещё раз), удержание - false (выход).
+bool resultBox(const char* title, const char* line, uint16_t titleCol) {
+  if (titleCol == C_GREEN) sndWin();
+  else if (titleCol == C_RED) sndLose();
+  else sndOk();
+  tft.fillRect(6, 74, 228, 92, C_BLACK);
+  tft.fillRect(6, 74, 228, 2, titleCol);
+  tft.fillRect(6, 164, 228, 2, titleCol);
+  drawUtf8(title, (240 - textWidth(title)) / 2 < 0 ? 0 : (240 - textWidth(title)) / 2, 82, titleCol, C_BLACK);
+  drawUtf8(line, (240 - textWidth(line)) / 2 < 0 ? 0 : (240 - textWidth(line)) / 2, 110, C_WHITE, C_BLACK);
+  {
+    SmallFont small;
+    drawUtf8(T().gameAgain, (240 - textWidth(T().gameAgain)) / 2, 142, C_LIGHT, C_BLACK);
+  }
+  delay(400);                                   // чтобы случайное нажатие не перезапустило сразу
+  while (btnEvent() != EV_NONE) delay(5);
+  return waitButton() == EV_CLICK;
+}
+
+bool gameOverBox(uint32_t score) {
+  char b[48];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)score);
+  return resultBox(T().gameOver, b, C_RED);
+}
+
+bool gameOverScreen() {
+  saveBest();
+  return gameOverBox(game.score);
+}
+
+bool askWith(const char* system, const std::vector<ChatMsg>& history, const String& question, int maxTokens, String& result);
+
+const char* blocksPickHint() { return L3("Нажать - взять, влево - совет", "Click - take, left - advice", "按下：拿起，左：建议"); }
+
+// Подсказка хода: плата отбирает лучшие варианты, DeepSeek (если есть интернет) выбирает из них и объясняет.
+// Без интернета советует сама плата. false - ходов нет.
+bool blocksAdvice(int& slot, int& row, int& col, String& why) {
+  blocks::Advice adv[6];
+  int n = blocks::bestMoves(game, adv, 6);
+  if (!n) return false;
+  int pick = 0;
+  bool ai = false;
+  if (wifiOk() && cfgKey.length()) {
+    drawGameHint(L3("DeepSeek думает...", "DeepSeek is thinking...", "DeepSeek思考中……"));
+    std::vector<ChatMsg> none;
+    String reply;
+    if (askWith(blocks::adviceSystem(T().promptLang).c_str(), none, String(blocks::adviceQuestion(game, adv, n).c_str()), 60, reply)) {
+      std::string w;
+      int k = blocks::parseAdvice(std::string(reply.c_str()), n, w);
+      if (k) {
+        pick = k - 1;
+        ai = true;
+        why = String("DeepSeek: ") + w.c_str();
+      }
+    }
+    noteActivity();
+  }
+  if (!ai) {
+    char b[64];
+    if (adv[0].lines) snprintf(b, sizeof(b), "%s %d", L3("Плата: сгорит линий:", "Board: lines cleared:", "设备：消除行数："), adv[0].lines);
+    else snprintf(b, sizeof(b), "%s", L3("Плата: так больше места", "Board: keeps more room", "设备：这样空间更大"));
+    why = b;
+  }
+  slot = adv[pick].slot;
+  row = adv[pick].row;
+  col = adv[pick].col;
+  return true;
+}
+
+// Совет на поле: клетки фигуры в белой рамке.
+void drawAdviceGhost(int idx, int gr, int gc) {
+  blocks::Piece p = blocks::Game::piece(idx);
+  for (int r = 0; r < p.h; r++)
+    for (int c = 0; c < p.w; c++) {
+      if (!blocks::pieceCell(p, r, c)) continue;
+      int x = GX0 + (gc + c) * GCELL, y = GY0 + (gr + r) * GCELL;
+      drawBoardCellColor(gr + r, gc + c, darker(p.color), false);
+      tft.drawRect(x + 1, y + 1, GCELL - 2, GCELL - 2, C_WHITE);
+      tft.drawRect(x + 2, y + 2, GCELL - 4, GCELL - 4, C_WHITE);
+    }
+}
+
+void runGame() {
+  if (!gameStarted || game.over) {
+    prefs.begin("dsk", true);
+    game.best = prefs.getUInt("best", 0);
+    prefs.end();
+    game.rnd = gameRandom;
+    if (gameStarted || !loadGameState()) game.reset();   // после включения - продолжаем сохранённую
+    gameStarted = true;
+  }
+  for (;;) {                                    // одна партия (или продолжение)
+    tft.fillScreen(C_BLACK);
+    drawGameTop();
+    drawBoard();
+    int slot = firstFreeSlot(0, 1);
+    for (int i = 0; i < blocks::SLOTS; i++) drawTraySlot(i, i == slot ? 1 : 0);
+    drawGameHint(blocksPickHint());
+    bool placing = false;
+    int gr = 0, gc = 0;
+    int advSlot = -1, advRow = 0, advCol = 0;        // показанный совет (advSlot < 0 - нет)
+    auto clearAdvice = [&]() {
+      if (advSlot >= 0 && game.tray[advSlot] >= 0) eraseGhost(game.tray[advSlot], advRow, advCol);
+      advSlot = -1;
+    };
+
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (!placing) {
+        if (j == J_LEFT && !g_joyRepeated) {   // совет: какую фигуру и куда поставить
+          clearAdvice();
+          String why;
+          int s2, r2, c2;
+          if (blocksAdvice(s2, r2, c2, why)) {
+            advSlot = s2;
+            advRow = r2;
+            advCol = c2;
+            if (slot != s2) {
+              drawTraySlot(slot, 0);
+              slot = s2;
+              drawTraySlot(slot, 1);
+            }
+            drawAdviceGhost(game.tray[advSlot], advRow, advCol);
+            drawGameHint(why.c_str());
+          }
+          while (btnEvent() != EV_NONE) delay(5);
+        } else if (j == J_UP || j == J_DOWN || j == J_RIGHT) {
+          int dir = j == J_UP ? -1 : 1;
+          int ns = firstFreeSlot(slot + dir, dir);
+          if (ns >= 0 && ns != slot) {
+            drawTraySlot(slot, 0);
+            slot = ns;
+            drawTraySlot(slot, 1);
+          }
+        }
+        if (e == EV_LONG) {                    // выход в меню, партия сохранена
+          saveBest();
+          saveGameState();
+          return;
+        }
+        if (e == EV_CLICK && slot >= 0) {
+          blocks::Piece p = blocks::Game::piece(game.tray[slot]);
+          gr = (blocks::N - p.h) / 2;
+          gc = (blocks::N - p.w) / 2;
+          if (advSlot == slot) {                 // взяли фигуру из совета - она сразу встаёт на предложенное место
+            gr = advRow;
+            gc = advCol;
+          }
+          clearAdvice();
+          placing = true;
+          drawTraySlot(slot, 2);
+          drawGhost(game.tray[slot], gr, gc);
+          drawGameHint(T().gameHintPlace);
+        }
+      } else {
+        int idx = game.tray[slot];
+        blocks::Piece p = blocks::Game::piece(idx);
+        if (j != J_NONE) {
+          int nr = gr + (j == J_DOWN) - (j == J_UP);
+          int nc = gc + (j == J_RIGHT) - (j == J_LEFT);
+          if (nr < 0) nr = 0;
+          if (nc < 0) nc = 0;
+          if (nr > blocks::N - p.h) nr = blocks::N - p.h;
+          if (nc > blocks::N - p.w) nc = blocks::N - p.w;
+          if (nr != gr || nc != gc) {
+            eraseGhost(idx, gr, gc);
+            gr = nr;
+            gc = nc;
+            drawGhost(idx, gr, gc);
+          }
+        }
+        if (e == EV_LONG) {                    // отмена - вернуть фигуру в лоток
+          eraseGhost(idx, gr, gc);
+          placing = false;
+          drawTraySlot(slot, 1);
+          drawGameHint(blocksPickHint());
+        }
+        if (e == EV_CLICK && game.canPlace(idx, gr, gc)) {
+          int lines = game.place(slot, gr, gc);
+          if (lines > 0) beep(1, 1100 + lines * 250, 50);
+          else beep(1, 500, 8);
+          if (lines > 0) flashCleared();
+          drawBoard();
+          drawGameTop();
+          placing = false;
+          slot = firstFreeSlot(slot, 1);
+          for (int i = 0; i < blocks::SLOTS; i++) drawTraySlot(i, i == slot ? 1 : 0);
+          drawGameHint(blocksPickHint());
+          if (game.over) {
+            clearGameState();
+            if (!gameOverScreen()) return;
+            game.reset();
+            saveGameState();
+            break;                              // новая партия - перерисовать всё
+          }
+          saveGameState();
+        }
+      }
+      delay(2);
+    }
+  }
+}
+
+// ========================= ОБЩЕЕ ДЛЯ ИГР =========================
+uint32_t loadBestKey(const char* key) {
+  prefs.begin("dsk", true);
+  uint32_t v = prefs.getUInt(key, 0);
+  prefs.end();
+  return v;
+}
+
+void saveBestKey(const char* key, uint32_t v) {
+  prefs.begin("dsk", false);
+  if (v > prefs.getUInt(key, 0)) {
+    prefs.putUInt(key, v);
+    hsDirty = true;
+  }
+  prefs.end();
+}
+
+// Верхняя строка игры: счёт слева, рекорд справа (мелким шрифтом).
+void drawScoreBar(uint32_t score, uint32_t best) {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)score);
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), T().gameBest, (unsigned)best);
+  drawUtf8(b, 240 - textWidth(b) - 2, 1, C_YELLOW, C_BLACK);
+}
+
+void drawSmallCenteredBg(const char* s, int y, uint16_t col, uint16_t bg) {
+  SmallFont small;
+  tft.fillRect(0, y, 240, 16, bg);
+  drawUtf8(s, (240 - textWidth(s)) / 2, y, col, bg);
+}
+
+void drawSmallCentered(const char* s, int y, uint16_t col) { drawSmallCenteredBg(s, y, col, C_BLACK); }
+
+// ========================= 2048 =========================
+g2048::Game g48;
+bool g48Started = false;
+const int T48 = 46, GAP48 = 4, X48 = (240 - (4 * T48 + 5 * GAP48)) / 2, Y48 = 20;
+
+uint16_t tileColor(uint8_t e) {
+  static const uint16_t C[] = {0x4208, 0xEF3B, 0xEEF9, 0xF58F, 0xF4AC, 0xF3EB, 0xF2E7,
+                               0xEE6E, 0xEE6C, 0xEE4A, 0xEE27, 0xEE05};
+  return e < 12 ? C[e] : 0x39C7;
+}
+
+void draw48Tile(int r, int c) {
+  uint8_t e = g48.cell[r][c];
+  int x = X48 + GAP48 + c * (T48 + GAP48), y = Y48 + GAP48 + r * (T48 + GAP48);
+  uint16_t bg = tileColor(e);
+  tft.fillRect(x, y, T48, T48, bg);
+  if (!e) return;
+  char b[12];
+  snprintf(b, sizeof(b), "%lu", (unsigned long)g2048::Game::value(e));
+  uint16_t fg = e <= 2 ? 0x7BAE : C_WHITE;
+  int n = (int)strlen(b);
+  if (n <= 3) {
+    drawUtf8(b, x + (T48 - n * 12) / 2, y + (T48 - 24) / 2, fg, bg);
+  } else {
+    SmallFont small;
+    drawUtf8(b, x + (T48 - n * 8) / 2, y + (T48 - 16) / 2, fg, bg);
+  }
+}
+
+void draw48Board() {
+  tft.fillRect(X48, Y48, 4 * T48 + 5 * GAP48, 4 * T48 + 5 * GAP48, 0x3186);
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) draw48Tile(r, c);
+}
+
+void save48() {
+  uint8_t buf[g2048::Game::SAVE_SIZE];
+  size_t n = g48.saveTo(buf);
+  prefs.begin("dsk", false);
+  prefs.putBytes("g2048", buf, n);
+  prefs.end();
+}
+
+void clear48() {
+  prefs.begin("dsk", false);
+  prefs.remove("g2048");
+  prefs.end();
+}
+
+bool load48() {
+  uint8_t buf[g2048::Game::SAVE_SIZE];
+  prefs.begin("dsk", true);
+  size_t n = prefs.getBytesLength("g2048");
+  bool ok = n == sizeof(buf) && prefs.getBytes("g2048", buf, n) == n;
+  prefs.end();
+  return ok && g48.loadFrom(buf, n) && !g48.over;
+}
+
+void run2048() {
+  if (!g48Started || g48.over) {
+    g48.best = loadBestKey("b2048");
+    g48.rnd = gameRandom;
+    if (g48Started || !load48()) g48.reset();
+    g48Started = true;
+  }
+  bool wonShown = g48.won;
+  for (;;) {
+    tft.fillScreen(C_BLACK);
+    drawScoreBar(g48.score, g48.best);
+    draw48Board();
+    drawSmallCentered(T().hint2048, 224, C_LIGHT);
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        saveBestKey("b2048", g48.best);
+        save48();
+        return;
+      }
+      if (j != J_NONE && !g_joyRepeated) {        // один наклон - один ход
+        int dir = j == J_UP ? g2048::UP : j == J_DOWN ? g2048::DOWN : j == J_LEFT ? g2048::LEFT : g2048::RIGHT;
+        if (g48.move(dir)) {
+          { static uint32_t ps = 0; beep(1, g48.score > ps ? 1300 : 600, g48.score > ps ? 18 : 5); ps = g48.score; }
+          draw48Board();
+          drawScoreBar(g48.score, g48.best);
+          save48();
+          if (g48.won && !wonShown) {
+            wonShown = true;
+            drawSmallCentered(T().won2048, 224, C_YELLOW);
+            delay(1500);
+            drawSmallCentered(T().hint2048, 224, C_LIGHT);
+          }
+        }
+        if (g48.over) {
+          clear48();
+          saveBestKey("b2048", g48.best);
+          if (!gameOverBox(g48.score)) return;
+          g48.reset();
+          wonShown = false;
+          save48();
+          break;
+        }
+      }
+      delay(2);
+    }
+  }
+}
+
+// ========================= ЗМЕЙКА =========================
+// Поле 20x18 клеток по 12 пикселей, под строкой счёта.
+const int SC = 12, SY0 = 24;
+const uint16_t C_SNAKE = 0x2DC5, C_SNAKE_HEAD = 0x5FEA, C_FOOD = 0xF8C3, C_FIELD = 0x0861;
+
+void drawSnakeCell(int x, int y, uint8_t what) {
+  int px = x * SC, py = SY0 + y * SC;
+  if (what == 0) {
+    tft.fillRect(px, py, SC, SC, C_FIELD);
+    return;
+  }
+  tft.fillRect(px, py, SC, SC, C_FIELD);
+  uint16_t col = what == 1 ? C_SNAKE : what == 2 ? C_SNAKE_HEAD : C_FOOD;
+  if (what == 3) tft.fillRect(px + 2, py + 2, SC - 4, SC - 4, col);
+  else tft.fillRect(px + 1, py + 1, SC - 2, SC - 2, col);
+}
+
+void runSnake() {
+  snake::Game sg;
+  sg.rnd = gameRandom;
+  sg.best = loadBestKey("bsnake");
+  sg.reset();
+  static uint8_t shown[snake::H][snake::W];
+  for (;;) {                                         // одна партия
+    tft.fillScreen(C_BLACK);
+    tft.fillRect(0, SY0, 240, 240 - SY0, C_FIELD);
+    memset(shown, 0, sizeof(shown));
+    drawScoreBar(sg.score, sg.best);
+    bool paused = true;                              // ждём первого нажатия
+    drawSmallCentered(T().hintSnake, 120, C_WHITE);
+    uint32_t nextStep = 0;
+    bool needDraw = true;
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        saveBestKey("bsnake", sg.best);
+        return;
+      }
+      if (e == EV_CLICK) {
+        paused = !paused;
+        if (paused) drawSmallCentered(T().paused, 120, C_WHITE);
+        else {
+          tft.fillRect(0, 120, 240, 16, C_FIELD);    // стираем надпись
+          memset(shown, 0, sizeof(shown));
+          tft.fillRect(0, SY0, 240, 240 - SY0, C_FIELD);
+          needDraw = true;
+          nextStep = millis() + sg.stepMs();
+        }
+      }
+      if (!paused && j != J_NONE)
+        sg.turn(j == J_UP ? snake::UP : j == J_DOWN ? snake::DOWN : j == J_LEFT ? snake::LEFT : snake::RIGHT);
+      if (!paused && (int32_t)(millis() - nextStep) >= 0) {
+        nextStep = millis() + sg.stepMs();
+        int res = sg.step();
+        if (res == 1) beep(1, 1500, 12);
+        if (res == 1) drawScoreBar(sg.score, sg.best);
+        needDraw = true;
+        if (res < 0) {
+          saveBestKey("bsnake", sg.best);
+          if (!gameOverBox(sg.score)) return;
+          sg.reset();
+          break;
+        }
+      }
+      if (needDraw && !paused) {                     // перерисовываем только изменившиеся клетки
+        static uint8_t want[snake::H][snake::W];
+        memset(want, 0, sizeof(want));
+        for (int i = sg.len - 1; i >= 0; i--) want[sg.body[i].y][sg.body[i].x] = i == 0 ? 2 : 1;
+        want[sg.food.y][sg.food.x] = 3;
+        for (int y = 0; y < snake::H; y++)
+          for (int x = 0; x < snake::W; x++)
+            if (want[y][x] != shown[y][x]) {
+              drawSnakeCell(x, y, want[y][x]);
+              shown[y][x] = want[y][x];
+            }
+        needDraw = false;
+      }
+      delay(2);
+    }
+  }
+}
+
+// ========================= ПАДАЮЩИЕ БЛОКИ =========================
+// Стакан 10x20 клеток по 11 пикселей слева, справа - следующая фигура и счёт.
+const int FC = 11, FX0 = 6, FY0 = 10, PANEL_X = 126;
+fall::Game fallG;
+bool fallStarted = false;
+
+void drawFallCell(int x, int y, uint16_t v) {
+  int px = FX0 + x * FC, py = FY0 + y * FC;
+  if (!v) {
+    tft.fillRect(px, py, FC, FC, C_FIELD);
+    return;
+  }
+  bool ghost = v & 1;                                // нечётный цвет - метка «тени»
+  uint16_t col = v & 0xFFFE;
+  if (ghost) {
+    tft.fillRect(px, py, FC, FC, C_FIELD);
+    tft.fillRect(px + 1, py + 1, FC - 2, 1, col);
+    tft.fillRect(px + 1, py + FC - 2, FC - 2, 1, col);
+    tft.fillRect(px + 1, py + 1, 1, FC - 2, col);
+    tft.fillRect(px + FC - 2, py + 1, 1, FC - 2, col);
+  } else {
+    tft.fillRect(px, py, FC, FC, C_FIELD);
+    tft.fillRect(px + 1, py + 1, FC - 2, FC - 2, col);
+  }
+}
+
+void drawFallPanel() {
+  SmallFont small;
+  tft.fillRect(PANEL_X, 0, 240 - PANEL_X, 240, C_BLACK);
+  int y = 8;
+  drawUtf8(T().nextLabel, PANEL_X, y, C_LIGHT, C_BLACK);
+  y += 20;
+  for (int i = 0; i < 4; i++) {
+    int x, yy;
+    fall::Game::cellOf(fallG.nextKind, 0, i, x, yy);
+    tft.fillRect(PANEL_X + 8 + x * 10, y + yy * 10, 9, 9, fall::KIND[fallG.nextKind].color);
+  }
+  y += 46;
+  char b[40];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)fallG.score);
+  drawUtf8(b, PANEL_X, y, C_WHITE, C_BLACK);
+  y += 20;
+  snprintf(b, sizeof(b), T().linesFmt, (unsigned)fallG.lines);
+  drawUtf8(b, PANEL_X, y, C_WHITE, C_BLACK);
+  y += 20;
+  snprintf(b, sizeof(b), T().levelFmt, (unsigned)fallG.level);
+  drawUtf8(b, PANEL_X, y, C_WHITE, C_BLACK);
+  y += 20;
+  snprintf(b, sizeof(b), T().gameBest, (unsigned)fallG.best);
+  drawUtf8(b, PANEL_X, y, C_YELLOW, C_BLACK);
+  drawUtf8(T().fallRotate, PANEL_X, 184, C_LIGHT, C_BLACK);
+  drawUtf8(T().fallDrop, PANEL_X, 202, C_LIGHT, C_BLACK);
+  drawUtf8(T().fallExit, PANEL_X, 220, C_LIGHT, C_BLACK);
+}
+
+void runFalling() {
+  if (!fallStarted || fallG.over) {
+    fallG.rnd = gameRandom;
+    fallG.best = loadBestKey("bfall");
+    fallG.reset();
+    fallStarted = true;
+  }
+  static uint16_t shown[fall::H][fall::W], want[fall::H][fall::W];
+  for (;;) {
+    tft.fillScreen(C_BLACK);
+    tft.fillRect(FX0 - 2, FY0 - 2, fall::W * FC + 4, fall::H * FC + 4, C_GRAY);
+    tft.fillRect(FX0, FY0, fall::W * FC, fall::H * FC, C_FIELD);
+    for (int y = 0; y < fall::H; y++)
+      for (int x = 0; x < fall::W; x++) shown[y][x] = 0;
+    drawFallPanel();
+    uint32_t nextFall = millis() + fallG.gravityMs();
+    uint32_t lastScore = fallG.score;
+    int lastNext = fallG.nextKind;
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {                            // выход; партия ждёт, пока плата включена
+        saveBestKey("bfall", fallG.best);
+        return;
+      }
+      if (j == J_LEFT) fallG.moveH(-1);
+      if (j == J_RIGHT) fallG.moveH(1);
+      if (j == J_UP && !g_joyRepeated) fallG.rotate();
+      if (j == J_DOWN) {
+        if (!fallG.down(true)) nextFall = millis() + fallG.gravityMs();
+      }
+      uint32_t linesBefore = fallG.lines;
+      if (e == EV_CLICK) {
+        fallG.drop();
+        nextFall = millis() + fallG.gravityMs();
+        beep(1, 400, 8);
+      }
+      if ((int32_t)(millis() - nextFall) >= 0) {
+        fallG.down(false);
+        nextFall = millis() + fallG.gravityMs();
+      }
+      if (fallG.lines > linesBefore) beep(1, 1000 + (int)(fallG.lines - linesBefore) * 250, 60);
+      // картинка: стакан + тень + фигура; рисуем только изменения
+      for (int y = 0; y < fall::H; y++)
+        for (int x = 0; x < fall::W; x++) want[y][x] = fallG.cell[y][x] & 0xFFFE;
+      if (!fallG.over) {
+        uint16_t col = fall::KIND[fallG.cur].color & 0xFFFE;
+        int gy = fallG.ghostY();
+        for (int i = 0; i < 4; i++) {
+          int x, y;
+          fall::Game::cellOf(fallG.cur, fallG.rot, i, x, y);
+          if (gy + y >= 0 && !want[gy + y][fallG.px + x]) want[gy + y][fallG.px + x] = col | 1;
+        }
+        for (int i = 0; i < 4; i++) {
+          int x, y;
+          fall::Game::cellOf(fallG.cur, fallG.rot, i, x, y);
+          if (fallG.py + y >= 0) want[fallG.py + y][fallG.px + x] = col;
+        }
+      }
+      for (int y = 0; y < fall::H; y++)
+        for (int x = 0; x < fall::W; x++)
+          if (want[y][x] != shown[y][x]) {
+            drawFallCell(x, y, want[y][x]);
+            shown[y][x] = want[y][x];
+          }
+      if (fallG.score != lastScore || fallG.nextKind != lastNext) {
+        drawFallPanel();
+        lastScore = fallG.score;
+        lastNext = fallG.nextKind;
+      }
+      if (fallG.over) {
+        saveBestKey("bfall", fallG.best);
+        if (!gameOverBox(fallG.score)) return;
+        fallG.reset();
+        break;
+      }
+      delay(2);
+    }
+  }
+}
+
+// ========================= СПИСКИ И ВЫБОР =========================
+uint32_t loadMinKey(const char* key) { return loadBestKey(key); }
+void saveMinKey(const char* key, uint32_t v) {           // для рекордов «чем меньше, тем лучше»
+  prefs.begin("dsk", false);
+  uint32_t old = prefs.getUInt(key, 0);
+  if (old == 0 || v < old) {
+    prefs.putUInt(key, v);
+    hsDirty = true;
+  }
+  prefs.end();
+}
+
+// Прокручиваемый список: крупные пункты, справа мелкая подпись. Возвращает номер или -1 (удержание).
+int listScreen(const char* title, const std::vector<String>& items, const std::vector<String>& right, int sel) {
+  const int ROW = 30, Y0 = 32, VIS = 6;
+  int n = (int)items.size(), top = 0;
+  if (sel < 0 || sel >= n) sel = 0;
+  auto drawRow = [&](int i) {
+    int y = Y0 + (i - top) * ROW;
+    uint16_t bg = i == sel ? C_BLUE : C_BLACK;
+    tft.fillRect(0, y, 240, ROW - 2, bg);
+    drawUtf8(items[(size_t)i].c_str(), 6, y + 2, C_WHITE, bg);
+    if ((size_t)i < right.size() && right[(size_t)i].length()) {
+      SmallFont small;
+      drawUtf8(right[(size_t)i].c_str(), 240 - textWidth(right[(size_t)i].c_str()) - 6, y + 6, C_YELLOW, bg);
+    }
+  };
+  auto drawAll = [&]() {
+    tft.fillScreen(C_BLACK);
+    drawUtf8(title, 0, 0, C_YELLOW, C_BLACK);
+    updateBattery();
+    drawMiniStatus(222, 5, C_BLACK);               // время и заряд - в правом углу любого меню
+    for (int i = top; i < n && i < top + VIS; i++) drawRow(i);
+    SmallFont small;                               // стрелки, если список длиннее экрана
+    if (top > 0) drawUtf8("^", 228, 8, C_LIGHT, C_BLACK);
+    if (top + VIS < n) drawUtf8("v", 228, 218, C_LIGHT, C_BLACK);
+  };
+  if (sel >= VIS) top = sel - VIS + 1;
+  drawAll();
+  for (;;) {
+    int d = joyVertical(joyEvent());
+    if (d) {
+      int old = sel;
+      sel = ((sel + d) % n + n) % n;
+      if (sel < top || sel >= top + VIS) {
+        top = sel < top ? sel : sel - VIS + 1;
+        drawAll();
+      } else {
+        drawRow(old);
+        drawRow(sel);
+      }
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_CLICK) return sel;
+    if (e == EV_LONG) return -1;
+    delay(2);
+  }
+}
+
+std::vector<String> splitBar(const char* s) {
+  std::vector<String> out;
+  String cur;
+  for (const char* p = s;; p++) {
+    if (*p == '|' || *p == 0) {
+      out.push_back(cur);
+      cur = "";
+      if (!*p) break;
+    } else {
+      cur += *p;
+    }
+  }
+  return out;
+}
+
+// Экран с текстом сверху и вариантами ниже - крупным шрифтом. Всё в одной колонке:
+// если не помещается, экран прокручивается так, чтобы выбранный вариант был виден целиком.
+// Возвращает номер варианта или -1 (удержание).
+int choiceScreen(const String& header, const std::vector<String>& opts) {
+  struct Row {
+    int opt;                                         // -1 - текст вопроса, -2 - пустая строка, иначе номер варианта
+    std::vector<uint16_t> cps;
+  };
+  std::vector<Row> rows;
+  std::vector<uint16_t> hc;
+  utf8ToCps(header.c_str(), hc);
+  std::vector<Line> hl;
+  wrapCps(hc, COLS, hl);
+  for (const Line& l : hl) rows.push_back({-1, std::vector<uint16_t>(hc.begin() + l.start, hc.begin() + l.start + l.len)});
+  if (!hl.empty()) rows.push_back({-2, std::vector<uint16_t>()});
+  int n = (int)opts.size();
+  std::vector<int> first(opts.size()), last(opts.size());
+  for (int i = 0; i < n; i++) {
+    std::vector<uint16_t> oc;
+    utf8ToCps(opts[(size_t)i].c_str(), oc);
+    std::vector<Line> ol;
+    wrapCps(oc, COLS - 1, ol);
+    if (ol.empty()) ol.push_back({0, 0});
+    first[(size_t)i] = (int)rows.size();
+    for (const Line& l : ol) rows.push_back({i, std::vector<uint16_t>(oc.begin() + l.start, oc.begin() + l.start + l.len)});
+    last[(size_t)i] = (int)rows.size() - 1;
+  }
+  int sel = 0, top = 0;
+  auto fit = [&]() {                                 // прокрутить так, чтобы выбранный вариант был виден
+    int t = top;
+    if (last[(size_t)sel] - t >= ROWS) t = last[(size_t)sel] - ROWS + 1;
+    if (first[(size_t)sel] < t) t = first[(size_t)sel];
+    bool changed = t != top;
+    top = t;
+    return changed;
+  };
+  auto drawRow = [&](int idx) {
+    int r = idx - top;
+    if (r < 0 || r >= ROWS) return;
+    int y = r * GH;
+    if (idx >= (int)rows.size()) {
+      tft.fillRect(0, y, 240, GH, C_BLACK);
+      return;
+    }
+    const Row& row = rows[(size_t)idx];
+    uint16_t bg = row.opt < 0 ? C_BLACK : row.opt == sel ? C_BLUE : (row.opt % 2 ? 0x2104 : 0x18C3);
+    tft.fillRect(0, y, 240, GH, bg);
+    int x = row.opt >= 0 ? GW / 2 : 0;
+    for (uint16_t c : row.cps) {
+      if (x + cellWidth(c) * GW > 240) break;
+      x += drawCp(c, x, y, row.opt == -1 ? C_WHITE : C_WHITE, bg);
+    }
+  };
+  auto drawAll = [&]() {
+    for (int r = 0; r < ROWS; r++) drawRow(top + r);
+  };
+  auto drawOpt = [&](int i) {
+    for (int k = first[(size_t)i]; k <= last[(size_t)i]; k++) drawRow(k);
+  };
+  fit();
+  tft.fillScreen(C_BLACK);
+  drawAll();
+  for (;;) {
+    int d = joyVertical(joyEvent());
+    if (d && n > 0) {
+      int old = sel;
+      sel = ((sel + d) % n + n) % n;
+      if (fit()) drawAll();
+      else {
+        drawOpt(old);
+        drawOpt(sel);
+      }
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_CLICK && n > 0) return sel;
+    if (e == EV_LONG) return -1;
+    delay(2);
+  }
+}
+
+// ========================= ЛАБИРИНТ =========================
+arcade::maze::Game mz;
+bool mzStarted = false;
+const uint16_t C_MAZE_BG = 0x0841, C_MAZE_WALL = 0xBDF7, C_TRAIL = 0x2A6B;
+
+void mazeGeom(int& cell, int& ox, int& oy) {
+  cell = 220 / mz.n;
+  ox = (240 - cell * mz.n) / 2;
+  oy = 20 + (220 - cell * mz.n) / 2;
+}
+
+void drawMazeCellInner(int x, int y, uint16_t col, int inset) {
+  int cell, ox, oy;
+  mazeGeom(cell, ox, oy);
+  int t = cell >= 14 ? 2 : 1;
+  tft.fillRect(ox + x * cell + t + inset, oy + y * cell + t + inset, cell - t - 2 * inset, cell - t - 2 * inset, col);
+}
+
+void drawMaze() {
+  int cell, ox, oy;
+  mazeGeom(cell, ox, oy);
+  int t = cell >= 14 ? 2 : 1;
+  tft.fillRect(0, 18, 240, 222, C_BLACK);
+  tft.fillRect(ox, oy, cell * mz.n + t, cell * mz.n + t, C_MAZE_BG);
+  for (int y = 0; y < mz.n; y++)
+    for (int x = 0; x < mz.n; x++) {
+      int px = ox + x * cell, py = oy + y * cell;
+      if (mz.wall[y][x] & arcade::maze::WN) tft.fillRect(px, py, cell + t, t, C_MAZE_WALL);
+      if (mz.wall[y][x] & arcade::maze::WW) tft.fillRect(px, py, t, cell + t, C_MAZE_WALL);
+      if (y == mz.n - 1 && (mz.wall[y][x] & arcade::maze::WS)) tft.fillRect(px, py + cell, cell + t, t, C_MAZE_WALL);
+      if (x == mz.n - 1 && (mz.wall[y][x] & arcade::maze::WE)) tft.fillRect(px + cell, py, t, cell + t, C_MAZE_WALL);
+    }
+  drawMazeCellInner(mz.n - 1, mz.n - 1, C_GREEN, 1);
+  drawMazeCellInner(mz.px, mz.py, C_YELLOW, 1);
+}
+
+void drawMazeBar(uint32_t secs) {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[40];
+  snprintf(b, sizeof(b), T().levelFmt, (unsigned)mz.level);
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), T().timeFmt, (unsigned)secs);
+  drawUtf8(b, 240 - textWidth(b) - 2, 1, C_YELLOW, C_BLACK);
+}
+
+void runMaze() {
+  if (!mzStarted) {
+    mz.rnd = gameRandom;
+    mz.best = (int)loadBestKey("bmaze");
+    mz.level = 1;
+    mz.generate();
+    mzStarted = true;
+  }
+  for (;;) {                                         // один уровень
+    tft.fillScreen(C_BLACK);
+    drawMaze();
+    uint32_t t0 = millis(), shownSec = 0xFFFFFFFF;
+    for (;;) {
+      uint32_t secs = (millis() - t0) / 1000;
+      if (secs != shownSec) {
+        drawMazeBar(secs);
+        shownSec = secs;
+      }
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) return;
+      if (j != J_NONE) {
+        int dir = j == J_UP ? 0 : j == J_RIGHT ? 1 : j == J_DOWN ? 2 : 3;
+        int ox = mz.px, oy = mz.py;
+        if (mz.move(dir)) {
+          beep(2, 900, 3);
+          drawMazeCellInner(ox, oy, C_MAZE_BG, 0);
+          drawMazeCellInner(ox, oy, C_TRAIL, 3);      // след
+          drawMazeCellInner(mz.px, mz.py, C_YELLOW, 1);
+        }
+      }
+      if (mz.atExit()) {
+        char b[64];
+        snprintf(b, sizeof(b), T().mazeDone, (unsigned)mz.level, (unsigned)secs);
+        drawSmallCentered(b, 222, C_GREEN);
+        delay(1500);
+        mz.nextLevel();
+        saveBestKey("bmaze", (uint32_t)mz.best);
+        break;
+      }
+      delay(2);
+    }
+  }
+}
+
+// ========================= ПАМЯТЬ =========================
+arcade::memory::Game mem;
+bool memStarted = false;                             // незаконченная партия продолжается, пока плата включена
+const int MC = 50, MG = 4, MX0 = 10, MY0 = 18;
+
+void drawMemSymbol(int k, int x, int y) {
+  int cx = x + MC / 2, cy = y + MC / 2;
+  switch (k) {
+    case 0: tft.fillRect(cx - 12, cy - 12, 24, 24, 0xF8C3); break;                         // красный квадрат
+    case 1: tft.fillCircle(cx, cy, 13, 0x2DC5); break;                                      // зелёный круг
+    case 2: tft.fillTriangle(cx, cy - 14, cx - 14, cy + 12, cx + 14, cy + 12, 0x3C1F); break;  // синий треугольник
+    case 3: tft.fillRect(cx - 14, cy - 4, 28, 8, 0xFC40); tft.fillRect(cx - 4, cy - 14, 8, 28, 0xFC40); break;  // крест
+    case 4: tft.fillCircle(cx, cy, 14, 0xA27F); tft.fillCircle(cx, cy, 7, 0xEF7D); break;   // фиолетовое кольцо
+    case 5: tft.fillTriangle(cx, cy - 15, cx - 12, cy, cx + 12, cy, 0x2EDD);
+            tft.fillTriangle(cx, cy + 15, cx - 12, cy, cx + 12, cy, 0x2EDD); break;          // голубой ромб
+    case 6: tft.fillRect(cx - 13, cy - 13, 13, 13, 0xEE05); tft.fillRect(cx, cy, 13, 13, 0xEE05); break;  // шахматка
+    default: for (int i = 0; i < 3; i++) tft.fillRect(cx - 14, cy - 12 + i * 10, 28, 5, 0xF97B); break;   // полоски
+  }
+}
+
+void drawMemCard(int i, bool cursor) {
+  int x = MX0 + MG + (i % 4) * (MC + MG), y = MY0 + MG + (i / 4) * (MC + MG);
+  tft.fillRect(x - 2, y - 2, MC + 4, MC + 4, cursor ? C_YELLOW : C_BLACK);
+  uint8_t st = mem.state[i];
+  if (st == arcade::memory::HIDDEN) {
+    tft.fillRect(x, y, MC, MC, 0x3A7F);
+    tft.fillRect(x + 4, y + 4, MC - 8, MC - 8, 0x29B5);
+  } else {
+    tft.fillRect(x, y, MC, MC, st == arcade::memory::MATCHED ? 0x8C51 : 0xEF7D);
+    drawMemSymbol(mem.card[i], x, y);
+  }
+}
+
+void drawMemBar() {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[40];
+  snprintf(b, sizeof(b), T().movesFmt, (unsigned)mem.moves);
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  uint32_t best = loadBestKey("bmem");
+  if (best) {
+    snprintf(b, sizeof(b), T().gameBest, (unsigned)best);
+    drawUtf8(b, 240 - textWidth(b) - 2, 1, C_YELLOW, C_BLACK);
+  }
+}
+
+void runMemory() {
+  mem.rnd = gameRandom;
+  if (!memStarted || mem.done()) mem.reset();
+  memStarted = true;
+  mem.hideMismatch();                                // если вышли, пока пара была открыта
+  for (;;) {
+    tft.fillScreen(C_BLACK);
+    drawMemBar();
+    int cur = 0;
+    for (int i = 0; i < arcade::memory::CARDS; i++) drawMemCard(i, i == cur);
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) return;
+      if (j != J_NONE) {
+        int old = cur, x = cur % 4, y = cur / 4;
+        if (j == J_LEFT) x = (x + 3) % 4;
+        if (j == J_RIGHT) x = (x + 1) % 4;
+        if (j == J_UP) y = (y + 3) % 4;
+        if (j == J_DOWN) y = (y + 1) % 4;
+        cur = y * 4 + x;
+        drawMemCard(old, false);
+        drawMemCard(cur, true);
+      }
+      if (e == EV_CLICK) {
+        int a = mem.first;
+        int res = mem.pick(cur);
+        if (res != arcade::memory::INVALID) {
+          drawMemCard(cur, true);
+          if (res == arcade::memory::MATCH) {
+            beep(1, 1400, 40);
+            drawMemCard(a, false);
+            drawMemBar();
+          }
+          if (res == arcade::memory::MISMATCH) {
+            beep(1, 300, 50);
+            drawMemBar();
+            delay(800);                              // запомнить, что было открыто
+            int b = mem.second;
+            mem.hideMismatch();
+            drawMemCard(a, a == cur);
+            drawMemCard(b, b == cur);
+          }
+        }
+        if (mem.done()) {
+          saveMinKey("bmem", (uint32_t)mem.moves);
+          char b[64];
+          snprintf(b, sizeof(b), T().movesFmt, (unsigned)mem.moves);
+          if (!resultBox(T().gMemory, b, C_GREEN)) return;
+          mem.reset();
+          break;
+        }
+      }
+      delay(2);
+    }
+  }
+}
+
+// ========================= ПИНГ-ПОНГ =========================
+arcade::pong::Game png;
+
+void drawPongBar() {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[64];
+  snprintf(b, sizeof(b), "%s  %d : %d  %s", T().pongYou, png.playerScore, png.cpuScore, T().pongCpu);
+  drawUtf8(b, (240 - textWidth(b)) / 2, 1, C_WHITE, C_BLACK);
+}
+
+void drawPongNet(int y0, int y1) {
+  for (int y = 20; y < 240; y += 12)
+    if (y + 6 >= y0 && y <= y1) tft.fillRect(119, y, 2, 6, C_GRAY);
+}
+
+// Сдвиг ракетки: стираем/дорисовываем только полоску, которая изменилась (без мерцания).
+void movePaddle(int x, int oldY, int newY) {
+  const int W = (int)arcade::pong::PW, H = (int)arcade::pong::PH;
+  if (newY == oldY) return;
+  if (newY > oldY) {
+    int d = newY - oldY < H ? newY - oldY : H;
+    tft.fillRect(x, oldY, W, d, C_BLACK);
+    tft.fillRect(x, newY + H - d, W, d, C_WHITE);
+  } else {
+    int d = oldY - newY < H ? oldY - newY : H;
+    tft.fillRect(x, oldY + H - d, W, d, C_BLACK);
+    tft.fillRect(x, newY, W, d, C_WHITE);
+  }
+}
+
+void runPong() {
+  png.rnd = gameRandom;
+  png.reset();
+  for (;;) {
+    tft.fillScreen(C_BLACK);
+    drawPongBar();
+    drawPongNet(0, 240);
+    int opy = (int)png.py, ocy = (int)png.cy, obx = (int)png.bx, oby = (int)png.by;
+    tft.fillRect((int)arcade::pong::PLAYER_X, opy, (int)arcade::pong::PW, (int)arcade::pong::PH, C_WHITE);
+    tft.fillRect((int)arcade::pong::CPU_X, ocy, (int)arcade::pong::PW, (int)arcade::pong::PH, C_WHITE);
+    uint32_t next = millis();
+    for (;;) {
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) return;
+      if ((int32_t)(millis() - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 16;                                   // ~60 кадров в секунду
+      uint8_t raw = joyRaw();
+      int in = raw == J_UP ? -1 : raw == J_DOWN ? 1 : 0;
+      int r = png.step(in);
+      if (r != 0) beep(1, 900, 25);
+      int npy = (int)png.py, ncy = (int)png.cy, nbx = (int)png.bx, nby = (int)png.by;
+      tft.fillRect(obx, oby, (int)arcade::pong::BALL, (int)arcade::pong::BALL, C_BLACK);
+      drawPongNet(oby, oby + (int)arcade::pong::BALL);
+      movePaddle((int)arcade::pong::PLAYER_X, opy, npy);
+      movePaddle((int)arcade::pong::CPU_X, ocy, ncy);
+      tft.fillRect(nbx, nby, (int)arcade::pong::BALL, (int)arcade::pong::BALL, C_WHITE);
+      opy = npy; ocy = ncy; obx = nbx; oby = nby;
+      if (r) {
+        drawPongBar();
+        delay(500);                                 // пауза после очка
+        next = millis();
+      }
+      if (png.over) {
+        bool won = png.playerWon();
+        if (won) saveBestKey("bpong", loadBestKey("bpong") + 1);   // счётчик побед
+        char b[32];
+        snprintf(b, sizeof(b), "%d : %d", png.playerScore, png.cpuScore);
+        if (!resultBox(won ? T().pongWin : T().pongLose, b, won ? C_GREEN : C_RED)) return;
+        png.reset();
+        break;
+      }
+    }
+  }
+}
+
+// ========================= ЛЕТЯЩАЯ ПТИЧКА =========================
+arcade::flappy::Game fly;
+const uint16_t C_SKY = 0x5D7F, C_PIPE = 0x2E64, C_BIRD = 0xFFE0;
+
+void drawPipeStrip(const arcade::flappy::Pipe& p, int x, int w, uint16_t col) {
+  if (x < 0) { w += x; x = 0; }
+  if (x + w > 240) w = 240 - x;
+  if (w <= 0) return;
+  int top = (int)arcade::flappy::Y0, gy = p.gapY, gb = p.gapY + (int)arcade::flappy::GAP;
+  tft.fillRect(x, top, w, gy - top, col);
+  tft.fillRect(x, gb, w, 240 - gb, col);
+}
+
+void runFlappy() {
+  fly.rnd = gameRandom;
+  fly.best = loadBestKey("bflap");
+  fly.reset();
+  for (;;) {
+    tft.fillScreen(C_BLACK);
+    tft.fillRect(0, 20, 240, 220, C_SKY);
+    drawScoreBar(fly.score, fly.best);
+    drawSmallCenteredBg(T().flapHint, 200, C_BLACK, C_SKY);
+    int prevX[arcade::flappy::MAXP];
+    bool prevUsed[arcade::flappy::MAXP];
+    for (int i = 0; i < arcade::flappy::MAXP; i++) prevUsed[i] = false;
+    int oby = (int)fly.y;
+    const int BX = (int)arcade::flappy::BIRD_X, BW = (int)arcade::flappy::BW, BH = (int)arcade::flappy::BH;
+    tft.fillRect(BX, oby, BW, BH, C_BIRD);
+    bool hintShown = true;
+    uint32_t next = millis();
+    for (;;) {
+      BtnEvent e = btnEvent();
+      uint8_t j = joyEvent();
+      if (e == EV_LONG) {
+        saveBestKey("bflap", fly.best);
+        return;
+      }
+      if (e == EV_CLICK || (j == J_UP && !g_joyRepeated)) fly.flap();
+      if ((int32_t)(millis() - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 20;                                   // 50 кадров в секунду
+      bool scored = fly.step();
+      if (scored) beep(1, 1600, 10);
+      if (hintShown && fly.started) {
+        tft.fillRect(0, 200, 240, 16, C_SKY);
+        hintShown = false;
+      }
+      // трубы: дорисовываем левый край, стираем правый
+      for (int i = 0; i < arcade::flappy::MAXP; i++) {
+        const arcade::flappy::Pipe& p = fly.pipe[i];
+        int W = (int)arcade::flappy::PIPE_W;
+        if (!p.used) {
+          prevUsed[i] = false;
+          continue;
+        }
+        int nx = (int)p.x;
+        if (!prevUsed[i]) {
+          drawPipeStrip(p, nx, W, C_PIPE);
+        } else if (nx != prevX[i]) {
+          drawPipeStrip(p, nx, prevX[i] - nx, C_PIPE);
+          drawPipeStrip(p, nx + W, prevX[i] - nx, C_SKY);
+        }
+        prevX[i] = nx;
+        prevUsed[i] = true;
+      }
+      int nby = (int)fly.y;
+      if (nby != oby) {
+        tft.fillRect(BX, oby, BW, BH, C_SKY);
+        tft.fillRect(BX, nby, BW, BH, C_BIRD);
+        tft.fillRect(BX + BW - 4, nby + 2, 2, 2, C_BLACK);   // глаз
+        oby = nby;
+      }
+      if (scored) drawScoreBar(fly.score, fly.best);
+      if (fly.over) {
+        saveBestKey("bflap", fly.best);
+        if (!gameOverBox(fly.score)) return;
+        fly.reset();
+        break;
+      }
+    }
+  }
+}
+
+// ========================= ГОНКА =========================
+void viewAnswer(const String& utf8, uint16_t fg);    // определено ниже
+// Кадр 120x110 считается в памяти и выводится на экран с увеличением в 2 раза (240x220 под панелью).
+void pushRaceFrame(const uint16_t* fb) {
+  static uint16_t line[240];
+  tft.startWrite();
+  tft.setAddrWindow(0, 20, 240, 220);
+  for (int y = 0; y < race::H; y++) {
+    const uint16_t* src = fb + y * race::W;
+    for (int r = 0; r < 2; r++) {                      // каждую строку - дважды
+      for (int x = 0; x < race::W; x++) line[2 * x] = line[2 * x + 1] = src[x];
+      tft.writePixels(line, 240, true);
+    }
+  }
+  tft.endWrite();
+}
+
+void drawRaceBar(const race::Game& rg, const char* msg, uint16_t msgCol) {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 20, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), T().timeFmt, (unsigned)ceilf(rg.timeLeft));
+  drawUtf8(b, 2, 2, rg.timeLeft < 10 ? C_RED : C_YELLOW, C_BLACK);
+  if (msg) {
+    drawUtf8(msg, (240 - textWidth(msg)) / 2, 2, msgCol, C_BLACK);
+  } else {
+    snprintf(b, sizeof(b), T().raceKmh, (unsigned)rg.kmh());
+    drawUtf8(b, (240 - textWidth(b)) / 2, 2, C_WHITE, C_BLACK);
+  }
+  snprintf(b, sizeof(b), T().raceMeters, (unsigned)rg.meters());
+  drawUtf8(b, 240 - textWidth(b) - 2, 2, C_WHITE, C_BLACK);
+}
+
+void runRace() {
+  // кадр и трасса берут ~45 КБ памяти - только на время игры
+  uint16_t* fb = (uint16_t*)malloc(race::W * race::H * sizeof(uint16_t));
+  race::Game* rg = new race::Game();
+  if (!fb || !rg) {
+    free(fb);
+    delete rg;
+    viewAnswer(T().errMem, C_RED);
+    return;
+  }
+  rg->rnd = gameRandom;
+  uint32_t best = loadBestKey("brace");
+  for (;;) {                                         // один заезд
+    rg->reset();
+    tft.fillScreen(C_BLACK);
+    rg->render(fb);
+    pushRaceFrame(fb);
+    drawRaceBar(*rg, nullptr, C_WHITE);
+    drawSmallCenteredBg(T().raceStart, 112, C_WHITE, C_BLACK);
+    bool paused = true, quit = false;
+    uint32_t last = millis(), acc = 0, nextBar = 0;
+    const uint32_t STEP_MS = 33;
+    while (!quit) {
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) quit = true;
+      if (e == EV_CLICK) {
+        paused = !paused;
+        last = millis();
+        acc = 0;
+        if (paused) drawSmallCenteredBg(T().paused, 112, C_WHITE, C_BLACK);
+      }
+      if (paused) {
+        delay(5);
+        continue;
+      }
+      uint32_t now = millis();
+      acc += now - last;
+      last = now;
+      if (acc > STEP_MS * 4) acc = STEP_MS * 4;         // если кадр долго рисовался - не «прыгаем»
+      int dx, dy;
+      joyAnalog(dx, dy);
+      float steer = 0;
+      if (dx > 300 || dx < -300) steer = (float)dx / 1500.0f;   // плавный руль: чем сильнее наклон, тем круче
+      if (steer > 1) steer = 1;
+      if (steer < -1) steer = -1;
+      bool brake = dy > JOY_THRESHOLD;
+      bool check = false;
+      while (acc >= STEP_MS) {
+        if (rg->step(steer, brake)) check = true;
+        acc -= STEP_MS;
+      }
+      rg->render(fb);
+      pushRaceFrame(fb);
+      if (check || millis() >= nextBar) {               // панель - 4 раза в секунду
+        nextBar = millis() + 250;
+        if (rg->checkMsg > 0) {
+          char m[40];
+          snprintf(m, sizeof(m), T().raceCheck, (unsigned)(rg->lastBonus + 0.5f));
+          drawRaceBar(*rg, m, C_GREEN);
+        } else {
+          drawRaceBar(*rg, nullptr, C_WHITE);
+        }
+      }
+      if (rg->over) break;
+      delay(1);                                          // отдать процессор системе (иначе сработает сторожевой таймер)
+    }
+    uint32_t m = rg->meters();
+    if (m > best) best = m;
+    saveBestKey("brace", m);
+    if (quit) break;
+    char b[48];
+    snprintf(b, sizeof(b), T().raceDist, (unsigned)m);
+    if (!resultBox(T().raceOver, b, C_YELLOW)) break;
+  }
+  free(fb);
+  delete rg;
+}
+
+// ========================= МЕНЮ =========================
+void runGamesMenu();                                 // определено ниже, после DeepSeek
+
+Suggester sugg;
+
+void saveLearned() {
+  File f = LittleFS.open("/learn.txt", "w");
+  if (!f) return;
+  std::string data = sugg.serialize();
+  f.write((const uint8_t*)data.data(), data.size());
+  f.close();
+}
+
+void loadLearned() {
+  File f = LittleFS.open("/learn.txt", "r");
+  if (!f) return;
+  String data = f.readString();
+  f.close();
+  sugg.deserialize(data.c_str());
+}
+
+void runImages();
+void runSaver();
+void runGallery();
+void runRoom();
+void runNotes();
+void runReference();
+void runTools();
+void runSaved();
+bool runTemplates();
+bool runSettings();
+String inputText();
+void viewAnswer(const String& utf8, uint16_t fg);
+BtnEvent viewText(const String& utf8, uint16_t fg);
+int choiceScreen(const String& header, const std::vector<String>& opts);
+extern String pendingInput;
+
+// Возвращает true, если нужно перерисовать клавиатуру с начала (сменился язык или выбран шаблон).
+bool runMenu() {
+  bool changed = false;
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items = splitBar(L3("Шаблоны|Сохранённое|Конспекты|Справочник|Инструменты|Комната|Игры|Новый чат|Настройки|Назад",
+                                            "Templates|Saved|Notes|Reference|Tools|Room|Games|New chat|Settings|Back",
+                                            "模板|已保存|笔记|手册|工具|房间|游戏|新对话|设置|返回"));
+    std::vector<String> right(items.size());
+    if (roomUnread > 0) right[5] = String("+") + String(roomUnread);
+    int k = listScreen(T().menuTitle, items, right, sel);
+    if (k < 0) return changed;
+    sel = k;
+    switch (k) {
+      case 0:
+        if (runTemplates()) return true;
+        break;
+      case 1:
+        runSaved();
+        break;
+      case 2:
+        runNotes();
+        break;
+      case 3:
+        runReference();
+        break;
+      case 4:
+        runTools();
+        break;
+      case 5:
+        runRoom();
+        break;
+      case 6:
+        runGamesMenu();
+        break;
+      case 7:
+        chat.clear();
+        showMsg(T().chatCleared, C_GREEN);
+        delay(1200);
+        return changed;
+      case 8:
+        if (runSettings()) changed = true;
+        break;
+      default:
+        return changed;
+    }
+  }
+}
+
+// ========================= ЭКРАННАЯ КЛАВИАТУРА =========================
+const char* LAYERS[] = {
+  "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+  "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
+  "abcdefghijklmnopqrstuvwxyz",
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  "0123456789.,?!-:;()+=/%@*'\"",
+};
+const int N_LAYERS = sizeof(LAYERS) / sizeof(LAYERS[0]);
+const int CW = 24, CH = 26, PER_ROW = 10, KY = 108, MAX_IN = 200;   // клавиши 24x26, ряды 108..211
+const int INPUT_LINES = 3;          // строк под набранный текст (0..71)
+const int SUG_Y = 80, SUG_N = 3;    // строка подсказок 80..103
+const uint16_t C_SUG_BG = 0x2124;   // тёмно-серый фон подсказки
+
+int startLayer() { return cfgLang == LANG_RU ? 0 : 2; }   // английский и китайский - с латиницы (пиньинь)
+
+void buildLayer(int layer, std::vector<Key>& keys) {
+  keys.clear();
+  std::vector<uint16_t> cps;
+  utf8ToCps(LAYERS[layer], cps);
+  for (uint16_t c : cps) keys.push_back({c, K_CHAR, nullptr});
+  keys.push_back({' ', K_CHAR, "_"});
+  keys.push_back({0, K_DEL, "<-"});
+  keys.push_back({0, K_LAYER, "Aa"});
+  keys.push_back({0, K_SEND, "OK"});
+}
+
+int kbRows(const std::vector<Key>& ks) { return ((int)ks.size() + PER_ROW - 1) / PER_ROW; }
+int kbRowLen(const std::vector<Key>& ks, int r) {
+  int n = (int)ks.size() - r * PER_ROW;
+  return n < PER_ROW ? n : PER_ROW;
+}
+
+void drawCell(const std::vector<Key>& ks, int i, bool sel) {
+  int cx = (i % PER_ROW) * CW;
+  int cy = KY + (i / PER_ROW) * CH;
+  uint16_t bg = sel ? C_BLUE : C_BLACK;
+  tft.fillRect(cx, cy, CW, CH, bg);
+  const Key& k = ks[i];
+  if (k.label) {                       // служебные клавиши подписаны мелким шрифтом - чтобы не слипались
+    SmallFont small;
+    int w = (int)strlen(k.label) * GW;
+    drawUtf8(k.label, cx + (CW - w) / 2, cy + 5, C_YELLOW, bg);
+  } else {
+    drawCp(k.cp, cx + (CW - GW) / 2, cy + 1, C_WHITE, bg);
+  }
+}
+
+void drawKeyboard(const std::vector<Key>& ks, int sel) {
+  tft.fillRect(0, KY, 240, STATUS_Y - KY, C_BLACK);
+  for (int i = 0; i < (int)ks.size(); i++) drawCell(ks, i, i == sel);
+}
+
+// Подсказки идут подряд, каждая шириной по своему слову; сколько влезло - столько и показываем.
+const int SUG_MAX_CH = 17;            // длиннее - обрезаем с точкой
+int sugWidth(const std::vector<uint16_t>& w) {
+  int n = (int)w.size() > SUG_MAX_CH ? SUG_MAX_CH : (int)w.size();
+  return n * GW + GW;                 // по полсимвола поля слева и справа
+}
+
+// Сколько подсказок помещается в строку (остальные отбрасываем).
+size_t fitSuggestions(std::vector<std::vector<uint16_t>>& sg) {
+  int x = 0;
+  size_t n = 0;
+  for (; n < sg.size(); n++) {
+    int w = sugWidth(sg[n]);
+    if (x + w > 240) break;
+    x += w + 4;
+  }
+  sg.resize(n);
+  return n;
+}
+
+// Строка подсказок; sel = номер выделенной или -1.
+void drawSuggestions(const std::vector<std::vector<uint16_t>>& sg, int sel) {
+  tft.fillRect(0, SUG_Y, 240, 24, C_BLACK);
+  int x = 0;
+  for (int i = 0; i < (int)sg.size(); i++) {
+    int w = sugWidth(sg[i]);
+    uint16_t bg = i == sel ? C_BLUE : C_SUG_BG;
+    tft.fillRect(x, SUG_Y, w, 24, bg);
+    int n = (int)sg[i].size();
+    bool cut = n > SUG_MAX_CH;
+    if (cut) n = SUG_MAX_CH - 1;
+    int tx = x + GW / 2;
+    for (int k = 0; k < n; k++) tx += drawCp(sg[i][k], tx, SUG_Y, C_WHITE, bg);
+    if (cut) drawCp('.', tx, SUG_Y, C_WHITE, bg);
+    x += w + 4;
+  }
+}
+
+void drawInput(const std::vector<uint16_t>& text) {
+  std::vector<uint16_t> s(text);
+  s.push_back('_');
+  int total = (int)s.size();
+  int nLines = (total + COLS - 1) / COLS;
+  int first = nLines > INPUT_LINES ? nLines - INPUT_LINES : 0;
+  tft.fillRect(0, 0, 240, INPUT_LINES * GH, C_BLACK);
+  for (int l = first; l < nLines; l++) {
+    int st = l * COLS;
+    int n = total - st < COLS ? total - st : COLS;
+    drawLine(s.data() + st, n, (l - first) * GH, C_WHITE, C_BLACK);
+  }
+}
+
+// Курсор: row = -1 - строка подсказок, 0.. - ряды клавиатуры.
+String pendingInput;           // вопрос, который не удалось отправить (вернётся в поле ввода)
+
+String inputText() {
+  SaverArm arm;
+  int layer = startLayer();
+  int row = 0, col = 0;        // где курсор
+  int kbRow = 0, kbCol = 0;    // куда вернуться из строки подсказок
+  std::vector<Key> keys;
+  std::vector<uint16_t> text;
+  if (pendingInput.length()) {
+    utf8ToCps(pendingInput.c_str(), text);
+    pendingInput = "";
+  }
+  std::vector<std::vector<uint16_t>> sg;
+  bool redraw = true;
+
+  auto kbIndex = [&]() { return row >= 0 ? row * PER_ROW + col : -1; };
+  auto refreshSuggestions = [&]() {
+    size_t pl = partialWordLen(text);
+    if (pl) sg = sugg.suggest(std::vector<uint16_t>(text.end() - (long)pl, text.end()), SUG_N);
+    else sg.clear();
+    fitSuggestions(sg);
+    if (row < 0) {
+      if (sg.empty()) {                        // подсказки пропали - назад на клавиатуру
+        row = kbRow;
+        col = kbCol;
+        drawCell(keys, kbIndex(), true);
+      } else if (col >= (int)sg.size()) {
+        col = (int)sg.size() - 1;
+      }
+    }
+    drawSuggestions(sg, row < 0 ? col : -1);
+  };
+  auto goSuggestions = [&]() {
+    kbRow = row;
+    kbCol = col;
+    drawCell(keys, kbIndex(), false);
+    row = -1;
+    col = col * (int)sg.size() / PER_ROW;   // примерно над той же клавишей
+    if (col >= (int)sg.size()) col = (int)sg.size() - 1;
+    drawSuggestions(sg, col);
+  };
+  auto leaveSuggestions = [&](int newRow) {
+    row = newRow;
+    col = kbCol;
+    if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+    drawSuggestions(sg, -1);
+    drawCell(keys, kbIndex(), true);
+  };
+
+  for (;;) {
+    if (saverDue) {                                  // долго не трогали - заставка с часами, потом клавиатура заново
+      runSaver();
+      saverDue = false;
+      redraw = true;
+    }
+    if (redraw) {
+      buildLayer(layer, keys);
+      if (row >= kbRows(keys)) row = kbRows(keys) - 1;
+      if (row >= 0 && col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+      tft.fillScreen(C_BLACK);
+      tft.fillRect(0, INPUT_LINES * GH + 4, 240, 1, C_GRAY);   // линия под полем ввода (y=76)
+      drawInput(text);
+      drawKeyboard(keys, kbIndex());
+      refreshSuggestions();
+      updateBattery();
+      drawStatusBar();
+      redraw = false;
+    }
+    if (g_bgTick) g_bgTick();
+    if (updateBattery() || roomUnreadDirty || statusClockDue()) drawStatusBar();
+    {                                                // фоновый Wi-Fi: обновить значок, если состояние сменилось
+      static uint32_t nextWifiCheck = 0;
+      static int shownWifi = -1;
+      if ((int32_t)(millis() - nextWifiCheck) >= 0) {
+        nextWifiCheck = millis() + 500;
+        wifiTick();
+        int ws = wifiState();
+        if (ws != shownWifi) {
+          shownWifi = ws;
+          drawStatusBar();
+        }
+      }
+    }
+
+    uint8_t j = joyEvent();
+    if (j != J_NONE) {
+      int nRows = kbRows(keys);
+      if (row < 0) {                                   // в строке подсказок
+        int n = (int)sg.size();
+        if (j == J_LEFT || j == J_RIGHT) {
+          col = (col + (j == J_RIGHT ? 1 : -1) + n) % n;
+          drawSuggestions(sg, col);
+        } else if (j == J_DOWN) {
+          leaveSuggestions(0);
+        } else {
+          leaveSuggestions(nRows - 1);
+        }
+      } else if (j == J_LEFT || j == J_RIGHT) {
+        int n = kbRowLen(keys, row);
+        drawCell(keys, kbIndex(), false);
+        col = (col + (j == J_RIGHT ? 1 : -1) + n) % n;
+        drawCell(keys, kbIndex(), true);
+      } else if (j == J_UP && row == 0) {
+        if (!sg.empty()) goSuggestions();
+        else {
+          drawCell(keys, kbIndex(), false);
+          row = nRows - 1;
+          if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+          drawCell(keys, kbIndex(), true);
+        }
+      } else if (j == J_DOWN && row == nRows - 1) {
+        if (!sg.empty()) goSuggestions();
+        else {
+          drawCell(keys, kbIndex(), false);
+          row = 0;
+          drawCell(keys, kbIndex(), true);
+        }
+      } else {
+        drawCell(keys, kbIndex(), false);
+        row += j == J_DOWN ? 1 : -1;
+        if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+        drawCell(keys, kbIndex(), true);
+      }
+    }
+
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) {                      // долгое нажатие - меню
+      saverArmed = false;
+      bool menuChanged = runMenu();
+      saverArmed = true;
+      saverDue = false;
+      noteActivity();
+      if (menuChanged) { layer = startLayer(); row = 0; col = 0; }
+      if (pendingInput.length()) {                   // выбран шаблон - он становится началом вопроса
+        text.clear();
+        utf8ToCps(pendingInput.c_str(), text);
+        pendingInput = "";
+      }
+      redraw = true;
+      continue;
+    }
+    if (e == EV_CLICK) {
+      if (row < 0) {                         // вставить подсказку вместо недописанного слова
+        size_t pl = partialWordLen(text);
+        text.erase(text.end() - (long)pl, text.end());
+        for (uint16_t c : sg[(size_t)col]) if ((int)text.size() < MAX_IN) text.push_back(c);
+        if ((int)text.size() < MAX_IN) text.push_back(' ');
+        if (layer == 1 || layer == 3) {      // заглавные - обратно на строчные
+          layer--;
+          buildLayer(layer, keys);
+        }
+        row = kbRow;
+        col = kbCol;
+        if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+        drawKeyboard(keys, kbIndex());
+        drawInput(text);
+        refreshSuggestions();
+      } else {
+        Key k = keys[(size_t)kbIndex()];
+        switch (k.kind) {
+          case K_CHAR:
+            if ((int)text.size() < MAX_IN) {
+              text.push_back(k.cp);
+              drawInput(text);
+            }
+            if (layer == 1 || layer == 3) {    // после заглавной - снова строчные
+              layer--;
+              buildLayer(layer, keys);
+              if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+              drawKeyboard(keys, kbIndex());
+            }
+            refreshSuggestions();
+            break;
+          case K_DEL:
+            if (!text.empty()) {
+              text.pop_back();
+              drawInput(text);
+              refreshSuggestions();
+            }
+            break;
+          case K_LAYER:
+            layer = (layer + 1) % N_LAYERS;
+            buildLayer(layer, keys);
+            if (row >= kbRows(keys)) row = kbRows(keys) - 1;
+            if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
+            drawKeyboard(keys, kbIndex());
+            break;
+          case K_SEND:
+            return String(cpsToUtf8(text.data(), text.size()).c_str());
+        }
+      }
+    }
+    delay(2);
+  }
+}
+
+// ========================= СОХРАНЁННЫЕ ОТВЕТЫ =========================
+// Хранятся в памяти платы (файл /saved.txt) и читаются без интернета.
+const size_t MAX_SAVED = 20;
+std::vector<String> savedTitle, savedText;
+bool savedLoaded = false;
+
+void loadSaved() {
+  if (savedLoaded) return;
+  savedLoaded = true;
+  File f = LittleFS.open("/saved.txt", "r");
+  if (!f) return;
+  std::string d = toStd(f.readString());
+  f.close();
+  size_t p = 0;
+  while (p < d.size()) {                             // запись: заголовок \x1F текст \x1E
+    size_t e = d.find('\x1E', p);
+    if (e == std::string::npos) e = d.size();
+    std::string rec = d.substr(p, e - p);
+    size_t m = rec.find('\x1F');
+    if (m != std::string::npos && savedTitle.size() < MAX_SAVED) {
+      savedTitle.push_back(fromStd(rec.substr(0, m)));
+      savedText.push_back(fromStd(rec.substr(m + 1)));
+    }
+    p = e + 1;
+  }
+}
+
+void storeSaved() {
+  File f = LittleFS.open("/saved.txt", "w");
+  if (!f) return;
+  for (size_t i = 0; i < savedTitle.size(); i++) {
+    std::string rec = toStd(savedTitle[i]) + '\x1F' + toStd(savedText[i]) + '\x1E';
+    f.write((const uint8_t*)rec.data(), rec.size());
+  }
+  f.close();
+}
+
+// Сохранить (новые - в начало списка). Если места нет - самая старая запись удаляется.
+void saveItem(const String& title, const String& text) {
+  loadSaved();
+  for (size_t i = 0; i < savedTitle.size(); i++)
+    if (savedTitle[i] == title && savedText[i] == text) return;   // уже есть
+  if (savedTitle.size() >= MAX_SAVED) {
+    savedTitle.pop_back();
+    savedText.pop_back();
+  }
+  savedTitle.insert(savedTitle.begin(), title);
+  savedText.insert(savedText.begin(), text);
+  storeSaved();
+}
+
+// ========================= ПРОСМОТР ОТВЕТА =========================
+// Вверх/вниз - на строку, влево/вправо - на страницу, нажатие - выход.
+BtnEvent viewText(const String& utf8, uint16_t fg) {
+  noteActivity();
+  std::vector<uint16_t> cps;
+  utf8ToCps(utf8.c_str(), cps);
+  std::vector<Line> lines;
+  wrapCps(cps, COLS, lines);
+  int top = 0;
+  int maxTop = (int)lines.size() > ROWS ? (int)lines.size() - ROWS : 0;
+  renderRows(cps, lines, top, fg);
+  for (;;) {
+    uint8_t j = joyEvent();
+    int d = j == J_UP ? -1 : j == J_DOWN ? 1 : j == J_LEFT ? -(ROWS - 1) : j == J_RIGHT ? ROWS - 1 : 0;
+    if (d) {
+      int nt = top + d;
+      if (nt < 0) nt = 0;
+      if (nt > maxTop) nt = maxTop;
+      if (nt != top) {
+        top = nt;
+        renderRows(cps, lines, top, fg);
+      }
+    }
+    BtnEvent e = btnEvent();
+    if (e != EV_NONE) return e;
+    delay(2);
+  }
+}
+
+void viewAnswer(const String& utf8, uint16_t fg) { viewText(utf8, fg); }
+
+// ========================= ЛЕНТА ЧАТА =========================
+struct ViewLine {
+  std::vector<uint16_t> cps;
+  uint16_t color;
+};
+
+// Вся переписка: «Вы:» и вопрос жёлтым, «DeepSeek:» и ответ белым.
+// Открывается на последнем вопросе; вверх - листать к старым сообщениям.
+// Возвращает: 0 - назад к клавиатуре, 1 - «решить по шагам», 2 - «объяснить проще».
+int viewChat() {
+  noteActivity();
+  std::vector<ViewLine> vl;
+  int lastQuestionLine = 0;
+  for (size_t m = 0; m < chat.size(); m++) {
+    const ChatMsg& msg = chat[m];
+    if (msg.user) lastQuestionLine = (int)vl.size();
+    uint16_t labelCol = msg.user ? C_YELLOW : 0x07FF;   // голубой для DeepSeek
+    uint16_t textCol = msg.user ? 0xFFF0 : C_WHITE;
+    std::vector<uint16_t> lab;
+    utf8ToCps(msg.user ? T().youLabel : T().botLabel, lab);
+    vl.push_back({lab, labelCol});
+    std::vector<uint16_t> cps;
+    utf8ToCps(msg.text.c_str(), cps);
+    std::vector<Line> lines;
+    wrapCps(cps, COLS, lines);
+    for (const Line& l : lines)
+      vl.push_back({std::vector<uint16_t>(cps.begin() + l.start, cps.begin() + l.start + l.len), textCol});
+    if (m + 1 < chat.size()) vl.push_back({std::vector<uint16_t>(), C_WHITE});   // пустая строка между сообщениями
+  }
+  int maxTop = (int)vl.size() > ROWS ? (int)vl.size() - ROWS : 0;
+  int top = lastQuestionLine < maxTop ? lastQuestionLine : maxTop;
+  auto render = [&]() {
+    for (int r = 0; r < ROWS; r++) {
+      size_t i = (size_t)(top + r);
+      if (i < vl.size()) drawLine(vl[i].cps.data(), (int)vl[i].cps.size(), r * GH, vl[i].color, C_BLACK);
+      else tft.fillRect(0, r * GH, 240, GH, C_BLACK);
+    }
+  };
+  render();
+  for (;;) {
+    uint8_t j = joyEvent();
+    int d = j == J_UP ? -1 : j == J_DOWN ? 1 : j == J_LEFT ? -(ROWS - 1) : j == J_RIGHT ? ROWS - 1 : 0;
+    if (d) {
+      int nt = top + d;
+      if (nt < 0) nt = 0;
+      if (nt > maxTop) nt = maxTop;
+      if (nt != top) {
+        top = nt;
+        render();
+      }
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_CLICK) return 0;
+    if (e == EV_LONG && chat.size() >= 2) {          // удержание - что сделать с последним ответом
+      std::vector<String> o = splitBar(L3("Решить по шагам|Объяснить проще|Сохранить|Назад", "Step by step|Explain simpler|Save|Back",
+                                          "分步解答|讲得更简单|保存|返回"));
+      int k = choiceScreen(L3("Что сделать с ответом?", "What to do with the answer?", "如何处理这个回答？"), o);
+      if (k == 0) return 1;
+      if (k == 1) return 2;
+      if (k == 2) {
+        saveItem(chat[chat.size() - 2].text, chat[chat.size() - 1].text);
+        showMsg(L3("Сохранено. Смотрите в Меню - Сохранённое.", "Saved. See Menu - Saved.", "已保存。见菜单-已保存。"), C_GREEN);
+        delay(1200);
+      }
+      render();
+    }
+    delay(2);
+  }
+}
+
+// ========================= DEEPSEEK =========================
+// Потоковый ответ: сервер присылает текст кусочками, мы сразу показываем его на экране.
+// HTTPClient сам разбирает «chunked» и передаёт данные сюда через write().
+class SseSink : public Stream {
+ public:
+  std::string line, text, raw;
+  bool sawData = false;
+  std::function<void(const std::string&)> onText;
+  size_t write(uint8_t c) override {
+    feed((char)c);
+    return 1;
+  }
+  size_t write(const uint8_t* b, size_t n) override {
+    for (size_t i = 0; i < n; i++) feed((char)b[i]);
+    return n;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void feed(char c) {
+    if (raw.size() < 3000) raw += c;
+    if (c == '\n') {
+      std::string piece;
+      bool done = false;
+      if (tools::sseLine(line, piece, done)) {
+        sawData = true;
+        if (!piece.empty()) {
+          text += piece;
+          if (onText) onText(text);
+        }
+      }
+      line.clear();
+    } else if (c != '\r' && line.size() < 8000) {
+      line += c;
+    }
+  }
+};
+std::function<void(const std::string&)> g_streamCb;   // задан - просим ответ потоком и вызываем по мере прихода текста
+bool g_streamed = false;                              // последний ответ пришёл потоком (в payload - готовый текст)
+
+// Возвращает HTTP-код (200 = успех) или отрицательный код ошибки сети.
+int apiCall(const Attempt& a, const char* system, const std::vector<ChatMsg>& history, const String& question,
+            int maxTokens, String& payload) {
+  JsonDocument doc;
+  doc["model"] = a.model;
+  JsonArray msgs = doc["messages"].to<JsonArray>();
+  JsonObject sys = msgs.add<JsonObject>();
+  sys["role"] = "system";
+  sys["content"] = system;
+  for (const ChatMsg& m : history) {       // прошлые сообщения - чтобы DeepSeek помнил разговор
+    JsonObject h = msgs.add<JsonObject>();
+    h["role"] = m.user ? "user" : "assistant";
+    h["content"] = m.text;
+  }
+  JsonObject usr = msgs.add<JsonObject>();
+  usr["role"] = "user";
+  usr["content"] = question;
+  doc["max_tokens"] = maxTokens;
+  if (a.noThink) doc["thinking"]["type"] = "disabled";
+  bool stream = (bool)g_streamCb;
+  if (stream) doc["stream"] = true;
+  g_streamed = false;
+  String body;
+  serializeJson(doc, body);
+
+  WiFiClientSecure client;
+  client.setInsecure();   // без проверки сертификата
+  client.setHandshakeTimeout(20);   // секунды: если сервер недоступен - ошибка, а не вечное «Думаю»
+  HTTPClient http;
+  http.setConnectTimeout(15000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(client, API_URL)) return -100;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + cfgKey);
+  int code = http.POST(body);
+  if (code == 200 && stream) {
+    SseSink sink;
+    sink.onText = g_streamCb;
+    http.writeToStream(&sink);
+    if (sink.line.size()) sink.feed('\n');           // последняя строка без перевода строки
+    if (sink.sawData) {
+      payload = sink.text.c_str();
+      g_streamed = true;
+    } else {
+      payload = sink.raw.c_str();                    // сервер ответил обычным JSON
+    }
+  } else if (code > 0) payload = http.getString();
+  else payload = HTTPClient::errorToString(code);
+  http.end();
+  Serial.printf("HTTP %d, free heap: %u\n", code, (unsigned)ESP.getFreeHeap());
+  return code;
+}
+
+String errorText(int code, const String& payload) {
+  if (code == 401) return T().err401;
+  if (code == 402) return T().err402;
+  if (code == 429) return T().err429;
+  if (code == -1) return T().errConn;
+  if (code == -8) return T().errMem;
+  if (code == -11) return fmt(T().errTimeout, HTTP_TIMEOUT_MS / 1000);
+  if (code < 0) return String(T().errNet) + "(" + String(code) + "): " + payload;
+  String msg;
+  JsonDocument r;
+  if (!deserializeJson(r, payload)) msg = r["error"]["message"] | "";
+  return "HTTP " + String(code) + ": " + msg;
+}
+
+// true = в result текст ответа, false = в result текст ошибки.
+bool askWith(const char* system, const std::vector<ChatMsg>& history, const String& question, int maxTokens,
+             String& result) {
+  if (cfgKey.length() == 0) {
+    result = T().errNoKey;
+    return false;
+  }
+  int code = 0;
+  String payload;
+  for (int i = bestAttempt; i < N_ATTEMPTS; i++) {
+    payload = "";
+    code = apiCall(ATTEMPTS[i], system, history, question, maxTokens, payload);
+    if (code == 200) {
+      String text;
+      if (g_streamed) {
+        text = payload;
+      } else {
+        JsonDocument r;
+        if (deserializeJson(r, payload)) {
+          result = T().errBadReply;
+          return false;
+        }
+        text = r["choices"][0]["message"]["content"] | "";
+      }
+      text.trim();
+      if (text.length() == 0) {
+        result = T().errEmpty;
+        return false;
+      }
+      bestAttempt = i;
+      result = text;
+      return true;
+    }
+    Serial.println(payload.substring(0, 300));
+    if (code != 400 && code != 404 && code != 422) break;  // ошибка модели - пробуем другое имя
+  }
+  result = errorText(code, payload);
+  return false;
+}
+
+// Показ ответа по мере прихода: последние строки текста, не чаще 4 раз в секунду.
+uint32_t streamLastDraw = 0;
+void streamDraw(const std::string& t) {
+  if (millis() - streamLastDraw < 250) return;
+  streamLastDraw = millis();
+  noteActivity();
+  std::string p = tools::prettify(t);
+  std::vector<uint16_t> cps;
+  utf8ToCps(p.c_str(), cps);
+  std::vector<Line> lines;
+  wrapCps(cps, COLS, lines);
+  int top = (int)lines.size() > ROWS ? (int)lines.size() - ROWS : 0;
+  renderRows(cps, lines, top, C_WHITE);
+}
+
+// Обычный чат: инструкция и память переписки; ответ печатается на экране по мере генерации.
+bool askLen(const String& question, int maxTokens, String& result) {
+  streamLastDraw = 0;
+  g_streamCb = streamDraw;
+  bool ok = askWith(T().systemPrompt, chat, question, maxTokens, result);
+  g_streamCb = nullptr;
+  if (ok) result = fromStd(tools::prettify(toStd(result)));   // формулы - читаемыми символами
+  return ok;
+}
+
+bool ask(const String& question, String& result) { return askLen(question, MAX_TOKENS, result); }
+
+// ========================= КАРТИНКИ (WIKIMEDIA) =========================
+#if ENABLE_IMAGES
+const int IMG_Y0 = 20, IMG_Y1 = 220;                 // область картинки на экране
+#define IMG_UA APP_UA
+bool imgFromWiki = true;                             // откуда текущие картинки (для подписи)
+
+// Кусочки картинки от декодера JPEG: выводим только то, что попадает в область.
+bool jpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+  if (y >= IMG_Y1 || y + h <= IMG_Y0 || x >= 240 || x + w <= 0) return true;
+  int x0 = x < 0 ? 0 : x, x1 = x + w > 240 ? 240 : x + w;
+  int y0 = y < IMG_Y0 ? IMG_Y0 : y, y1 = y + h > IMG_Y1 ? IMG_Y1 : y + h;
+  tft.startWrite();
+  tft.setAddrWindow(x0, y0, x1 - x0, y1 - y0);
+  for (int yy = y0; yy < y1; yy++) tft.writePixels(bmp + (yy - y) * w + (x0 - x), (uint32_t)(x1 - x0), true);
+  tft.endWrite();
+  return true;
+}
+
+// Приёмник для скачивания файла в память. HTTPClient сам следит за длиной, паузами и «chunked».
+class BufSink : public Stream {
+ public:
+  uint8_t* buf = nullptr;
+  size_t cap = 0, n = 0;
+  bool overflow = false;
+  size_t write(uint8_t c) override { return write(&c, 1); }
+  size_t write(const uint8_t* b, size_t len) override {
+    size_t room = cap - n;
+    if (len > room) overflow = true;
+    size_t k = len < room ? len : room;
+    memcpy(buf + n, b, k);
+    n += k;
+    return len;                                      // лишнее молча отбрасываем, чтобы загрузка не зависла
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+};
+
+// Одна попытка скачать файл в память (до 120 КБ). nullptr - ошибка (текст в err).
+uint8_t* httpDownloadOnce(const String& url, size_t& n, String& err) {
+  n = 0;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+  HTTPClient http;
+  http.setUserAgent(IMG_UA);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) {
+    err = "begin";
+    return nullptr;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    err = "HTTP " + String(code);
+    http.end();
+    return nullptr;
+  }
+  int len = http.getSize();                          // -1 - длина заранее неизвестна
+  BufSink sink;
+  sink.cap = (len > 0 && len < 120000) ? (size_t)len : 120000;
+  sink.buf = (uint8_t*)malloc(sink.cap);
+  if (!sink.buf) {
+    err = T().errMem;
+    http.end();
+    return nullptr;
+  }
+  int got = http.writeToStream(&sink);
+  http.end();
+  Serial.printf("[img] %d of %d bytes, result %d\n", (int)sink.n, len, got);
+  // файл должен прийти целиком: обрезанную картинку декодер покажет наполовину и выдаст ошибку
+  bool whole = got >= 0 && sink.n > 0 && !sink.overflow && (len < 0 || sink.n == (size_t)len);
+  if (!whole) {
+    free(sink.buf);
+    err = sink.overflow ? String(L3("файл слишком большой", "the file is too big", "文件太大"))
+                        : String(L3("связь оборвалась", "the connection dropped", "连接中断"));
+    return nullptr;
+  }
+  n = sink.n;
+  return sink.buf;
+}
+
+// Скачать файл; при обрыве связи - ещё одна попытка.
+uint8_t* httpDownload(const String& url, size_t& n, String& err) {
+  uint8_t* p = httpDownloadOnce(url, n, err);
+  if (!p && wifiOk()) {
+    delay(300);
+    p = httpDownloadOnce(url, n, err);
+  }
+  return p;
+}
+
+bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& err) {
+  std::string url = wiki::searchUrl(toStd(query), 240, IMG_Y1 - IMG_Y0);
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+  HTTPClient http;
+  http.setUserAgent(IMG_UA);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  if (!http.begin(client, String(url.c_str()))) {
+    err = "begin";
+    return false;
+  }
+  int code = http.GET();
+  String body = code > 0 ? http.getString() : HTTPClient::errorToString(code);
+  http.end();
+  Serial.printf("[img] wikimedia HTTP %d, %u bytes\n", code, (unsigned)body.length());
+  if (code != 200) {
+    err = "HTTP " + String(code) + (code < 0 ? String(" ") + body : String(""));
+    return false;
+  }
+  hits = wiki::parseHits(toStd(body));
+  return true;
+}
+
+// Поиск картинок в Wikimedia Commons: без ключа, без VPN.
+bool imageSearch(const String& query, std::vector<pixabay::Hit>& hits, String& err) {
+  imgFromWiki = true;
+  return wikiSearch(query, hits, err);
+}
+
+void drawImgBars(int i, int n, const pixabay::Hit& h) {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, IMG_Y0, C_BLACK);
+  tft.fillRect(0, IMG_Y1, 240, 240 - IMG_Y1, C_BLACK);
+  String top = String(i + 1) + "/" + String(n) + "  " + fromStd(h.tags);
+  drawUtf8(top.c_str(), 2, 2, C_WHITE, C_BLACK);
+  char b[96];
+  snprintf(b, sizeof(b), imgFromWiki ? T().imgByWiki : T().imgBy, h.user.c_str());
+  drawUtf8(b, 2, IMG_Y1 + 2, C_LIGHT, C_BLACK);  // автор - так просит лицензия Wikimedia
+}
+
+uint8_t* lastJpg = nullptr;                          // последняя показанная картинка из поиска
+size_t lastJpgN = 0;
+
+// Нарисовать JPEG из памяти по центру области картинки. false - показать не удалось (на экране сообщение).
+bool drawJpegFit(const uint8_t* jpg, size_t n) {
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setCallback(jpgOutput);
+  tft.fillRect(0, IMG_Y0, 240, IMG_Y1 - IMG_Y0, C_BLACK);
+  uint16_t w = 0, h = 0;
+  TJpgDec.getJpgSize(&w, &h, jpg, (uint32_t)n);
+  int sc = 1;                                        // слишком большая - уменьшаем в 2/4/8 раз при декодировании
+  while (sc < 8 && ((int)w / sc > 340 || (int)h / sc > IMG_Y1 - IMG_Y0 + 10)) sc *= 2;
+  TJpgDec.setJpgScale((uint8_t)sc);
+  int x = (240 - (int)w / sc) / 2;                   // чуть шире экрана - обрезаем края поровну
+  int y = IMG_Y0 + ((IMG_Y1 - IMG_Y0) - (int)h / sc) / 2;
+  // JPEG начинается с метки FF D8; если её нет - пришло что-то другое, рисовать нечего
+  bool complete = n > 4 && jpg[0] == 0xFF && jpg[1] == 0xD8;
+  int rc = (w && h && complete) ? TJpgDec.drawJpg(x, y, jpg, (uint32_t)n) : -1;
+  if (rc == 0) return true;
+  // повреждённый файл или «прогрессивный» JPEG - декодер такие не умеет
+  tft.fillRect(0, IMG_Y0, 240, IMG_Y1 - IMG_Y0, C_BLACK);
+  SmallFont small;
+  const char* m1 = L3("Эту картинку показать не удалось", "This picture cannot be shown", "无法显示这张图片");
+  const char* m2 = L3("листайте дальше", "go to the next one", "请看下一张");
+  drawUtf8(m1, (240 - textWidth(m1)) / 2 < 0 ? 0 : (240 - textWidth(m1)) / 2, 104, C_YELLOW, C_BLACK);
+  drawUtf8(m2, (240 - textWidth(m2)) / 2, 124, C_LIGHT, C_BLACK);
+  Serial.printf("[img] decode error %d (%ux%u)\n", rc, (unsigned)w, (unsigned)h);
+  return false;
+}
+
+// Показать i-ю картинку: скачать и нарисовать по центру.
+void showImage(const std::vector<pixabay::Hit>& hits, int i) {
+  tft.fillRect(0, IMG_Y0, 240, IMG_Y1 - IMG_Y0, C_BLACK);
+  drawImgBars(i, (int)hits.size(), hits[(size_t)i]);
+  {
+    SmallFont small;
+    drawUtf8(T().imgLoading, (240 - textWidth(T().imgLoading)) / 2, 112, C_YELLOW, C_BLACK);
+  }
+  size_t n;
+  String err;
+  uint8_t* jpg = httpDownload(fromStd(hits[(size_t)i].url), n, err);
+  tft.fillRect(0, IMG_Y0, 240, IMG_Y1 - IMG_Y0, C_BLACK);
+  if (!jpg) {
+    if (lastJpg) free(lastJpg);
+    lastJpg = nullptr;
+    lastJpgN = 0;
+    SmallFont small;
+    drawUtf8(T().imgError, (240 - textWidth(T().imgError)) / 2 < 0 ? 0 : (240 - textWidth(T().imgError)) / 2, 104, C_RED, C_BLACK);
+    drawUtf8(err.c_str(), (240 - textWidth(err.c_str())) / 2 < 0 ? 0 : (240 - textWidth(err.c_str())) / 2, 124, C_RED, C_BLACK);
+    return;
+  }
+  if (lastJpg) free(lastJpg);                        // держим последнюю картинку: её можно сохранить в галерею
+  lastJpg = jpg;
+  lastJpgN = n;
+  drawJpegFit(jpg, n);
+}
+
+void runImages() {
+  struct FreeLast {                                  // при выходе освобождаем память последней картинки
+    ~FreeLast() {
+      if (lastJpg) free(lastJpg);
+      lastJpg = nullptr;
+      lastJpgN = 0;
+    }
+  } freeLast;
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setCallback(jpgOutput);
+  for (;;) {                                         // один поиск
+    showMsg(T().imgPrompt, C_YELLOW);
+    delay(1200);
+    String q = inputText();
+    q.trim();
+    if (!q.length()) return;
+    if (!waitWifi(false)) return;
+    showMsg(T().imgSearching, C_YELLOW);
+    std::vector<pixabay::Hit> hits;
+    String err;
+    if (!imageSearch(q, hits, err)) {
+      String m = String(T().errPrefix) + err;
+      viewAnswer(m, C_RED);
+      continue;
+    }
+    if (hits.empty()) {
+      viewAnswer(T().imgNone, C_YELLOW);
+      continue;
+    }
+    showMsg(T().imgHelp, C_WHITE);
+    delay(1500);
+    int i = 0;
+    tft.fillScreen(C_BLACK);
+    showImage(hits, i);
+    bool again = false;
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        std::vector<String> o = splitBar(L3("Сохранить в галерею|Вернуться|Выйти из картинок", "Save to the gallery|Return|Leave images",
+                                            "保存到相册|返回|退出图片"));
+        int k = choiceScreen(L3("Картинка", "Picture", "图片"), o);
+        if (k == 2) return;
+        if (k == 0) {
+          String why = lastJpg ? savePic(lastJpg, lastJpgN) : String(L3("картинка не загружена", "the picture is not loaded", "图片未加载"));
+          showMsg(why.length() ? String(L3("Не сохранено: ", "Not saved: ", "未保存：")) + why
+                               : String(L3("Сохранено в галерею. Картинок: ", "Saved to the gallery. Pictures: ", "已保存到相册。图片数：")) + String(picCount()),
+                  why.length() ? C_RED : C_GREEN);
+          delay(1500);
+        }
+        tft.fillScreen(C_BLACK);                      // вернуть картинку на экран
+        drawImgBars(i, (int)hits.size(), hits[(size_t)i]);
+        if (lastJpg) drawJpegFit(lastJpg, lastJpgN);
+        continue;
+      }
+      if (e == EV_CLICK) {
+        again = true;
+        break;
+      }
+      if ((j == J_RIGHT || j == J_DOWN) && !g_joyRepeated) {
+        i = (i + 1) % (int)hits.size();
+        showImage(hits, i);
+      }
+      if ((j == J_LEFT || j == J_UP) && !g_joyRepeated) {
+        i = (i + (int)hits.size() - 1) % (int)hits.size();
+        showImage(hits, i);
+      }
+      delay(2);
+    }
+    if (!again) return;
+  }
+}
+
+// ---------- Галерея ----------
+void drawGalleryBars(int pos, int total) {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, IMG_Y0, C_BLACK);
+  tft.fillRect(0, IMG_Y1, 240, 240 - IMG_Y1, C_BLACK);
+  char b[40];
+  snprintf(b, sizeof(b), "%s %d/%d", L3("Галерея", "Gallery", "相册"), pos + 1, total);
+  drawUtf8(b, 2, 2, C_WHITE, C_BLACK);
+  drawUtf8(L3("Держать - меню", "Hold - menu", "长按：菜单"), 2, IMG_Y1 + 2, C_LIGHT, C_BLACK);
+}
+
+void showGalleryPic(int slot, int pos, int total) {
+  drawGalleryBars(pos, total);
+  File f = LittleFS.open(picPath(slot).c_str(), "r");
+  size_t n = f ? (size_t)f.size() : 0;
+  uint8_t* buf = (n > 0 && n <= MAX_PIC_BYTES) ? (uint8_t*)malloc(n) : nullptr;
+  if (buf && f.read(buf, n) == n) {
+    f.close();
+    drawJpegFit(buf, n);
+  } else {
+    if (f) f.close();
+    tft.fillRect(0, IMG_Y0, 240, IMG_Y1 - IMG_Y0, C_BLACK);
+    SmallFont small;
+    const char* m = L3("Файл не читается", "Cannot read the file", "无法读取文件");
+    drawUtf8(m, (240 - textWidth(m)) / 2, 112, C_RED, C_BLACK);
+  }
+  if (buf) free(buf);
+}
+
+void runGallery() {
+  int pos = 0;
+  for (;;) {
+    std::vector<int> slots;
+    for (int i = 0; i < MAX_PICS; i++)
+      if (LittleFS.exists(picPath(i).c_str())) slots.push_back(i);
+    if (slots.empty()) {
+      std::vector<String> o = splitBar(L3("Загрузить с телефона|Назад", "Upload from phone|Back", "从手机上传|返回"));
+      int k = choiceScreen(L3("В галерее пока пусто. Картинки загружаются с телефона или сохраняются из поиска картинок.",
+                              "The gallery is empty. Upload pictures from your phone or save them from image search.",
+                              "相册是空的。可以从手机上传图片，或从图片搜索中保存。"), o);
+      if (k != 0) return;
+      runPortal();
+      netIdx = 0;
+      wifiStart();
+      continue;
+    }
+    if (pos >= (int)slots.size()) pos = (int)slots.size() - 1;
+    tft.fillScreen(C_BLACK);
+    showGalleryPic(slots[(size_t)pos], pos, (int)slots.size());
+    for (;;) {
+      uint8_t j = joyEvent();
+      BtnEvent e = btnEvent();
+      if (e == EV_CLICK) return;
+      if (e == EV_LONG) {
+        std::vector<String> o = splitBar(L3("Вернуться|Удалить эту картинку|Загрузить с телефона|Выйти", "Return|Delete this picture|Upload from phone|Leave",
+                                            "返回|删除这张图片|从手机上传|退出"));
+        int k = choiceScreen(L3("Галерея", "Gallery", "相册"), o);
+        if (k == 3) return;
+        if (k == 1) LittleFS.remove(picPath(slots[(size_t)pos]).c_str());
+        if (k == 2) {
+          runPortal();
+          netIdx = 0;
+          wifiStart();
+        }
+        break;                                        // список мог измениться - перечитать и перерисовать
+      }
+      int n = (int)slots.size();
+      if ((j == J_RIGHT || j == J_DOWN) && !g_joyRepeated && n > 1) {
+        pos = (pos + 1) % n;
+        showGalleryPic(slots[(size_t)pos], pos, n);
+      }
+      if ((j == J_LEFT || j == J_UP) && !g_joyRepeated && n > 1) {
+        pos = (pos + n - 1) % n;
+        showGalleryPic(slots[(size_t)pos], pos, n);
+      }
+      delay(2);
+    }
+  }
+}
+
+// ---------- Аватарка из галереи ----------
+extern uint8_t myAva[];
+extern bool myAvaSet;
+void drawAvatar(const uint8_t* ava, const String& id, const String& nick, int x, int y);
+uint32_t* avaSum = nullptr;                          // суммы цветов по клеткам 24x24 (r, g, b, сколько точек)
+int avaOx = 0, avaOy = 0, avaSide = 1;
+
+// Декодер отдаёт кусочки картинки; складываем точки центрального квадрата в клетки 24x24.
+bool avaCollect(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+  for (int j = 0; j < h; j++) {
+    int cy = (y + j - avaOy) * mqtt::AVA / avaSide;
+    if (y + j < avaOy || cy < 0 || cy >= mqtt::AVA) continue;
+    for (int i = 0; i < w; i++) {
+      int cx = (x + i - avaOx) * mqtt::AVA / avaSide;
+      if (x + i < avaOx || cx < 0 || cx >= mqtt::AVA) continue;
+      uint16_t c = bmp[j * w + i];
+      uint32_t* cell = avaSum + (cy * mqtt::AVA + cx) * 4;
+      cell[0] += (c >> 11) << 3;
+      cell[1] += ((c >> 5) & 63) << 2;
+      cell[2] += (c & 31) << 3;
+      cell[3]++;
+    }
+  }
+  return true;
+}
+
+// Сделать аватарку 24x24 из картинки галереи. false - не получилось.
+bool makeAvatar(int slot, uint8_t* out) {
+  File f = LittleFS.open(picPath(slot).c_str(), "r");
+  size_t n = f ? (size_t)f.size() : 0;
+  uint8_t* buf = (n > 0 && n <= MAX_PIC_BYTES) ? (uint8_t*)malloc(n) : nullptr;
+  bool ok = buf && f.read(buf, n) == n;
+  if (f) f.close();
+  avaSum = ok ? (uint32_t*)calloc(mqtt::AVA_BYTES * 4, sizeof(uint32_t)) : nullptr;
+  if (!avaSum) ok = false;
+  if (ok) {
+    uint16_t w = 0, h = 0;
+    TJpgDec.getJpgSize(&w, &h, buf, (uint32_t)n);
+    int m = w < h ? w : h, sc = 1;
+    while (sc < 8 && m / (sc * 2) >= mqtt::AVA) sc *= 2;   // уменьшаем при декодировании, но не мельче 24 точек
+    int W = w / sc, H = h / sc;
+    avaSide = W < H ? W : H;
+    if (avaSide < 1) avaSide = 1;
+    avaOx = (W - avaSide) / 2;
+    avaOy = (H - avaSide) / 2;
+    TJpgDec.setSwapBytes(false);
+    TJpgDec.setJpgScale((uint8_t)sc);
+    TJpgDec.setCallback(avaCollect);
+    ok = w && h && TJpgDec.drawJpg(0, 0, buf, (uint32_t)n) == 0;
+    TJpgDec.setCallback(jpgOutput);
+    for (size_t i = 0; ok && i < mqtt::AVA_BYTES; i++) {
+      uint32_t* cell = avaSum + i * 4;
+      uint32_t k = cell[3] ? cell[3] : 1;
+      out[i] = mqtt::to332((int)(cell[0] / k), (int)(cell[1] / k), (int)(cell[2] / k));
+    }
+  }
+  if (avaSum) free(avaSum);
+  avaSum = nullptr;
+  if (buf) free(buf);
+  return ok;
+}
+
+bool pickAvatar() {
+  std::vector<int> slots;
+  for (int i = 0; i < MAX_PICS; i++)
+    if (LittleFS.exists(picPath(i).c_str())) slots.push_back(i);
+  std::vector<String> o = splitBar(L3("Выбрать из галереи|Убрать аватарку|Назад", "Choose from the gallery|Remove the avatar|Back", "从相册选择|移除头像|返回"));
+  int k = choiceScreen(L3("Аватарка", "Avatar", "头像"), o);
+  if (k == 1) {
+    myAvaSet = false;
+    LittleFS.remove("/avatar.bin");
+    return true;
+  }
+  if (k != 0) return false;
+  if (slots.empty()) {
+    viewAnswer(L3("В галерее пусто. Загрузите картинку: Инструменты - Галерея.", "The gallery is empty. Upload a picture: Tools - Gallery.",
+                  "相册是空的。请上传图片：工具-相册。"), C_YELLOW);
+    return false;
+  }
+  int pos = 0, n = (int)slots.size();
+  auto show = [&]() {
+    tft.fillScreen(C_BLACK);
+    SmallFont small;
+    char b[48];
+    snprintf(b, sizeof(b), "%s %d/%d", L3("Аватарка", "Avatar", "头像"), pos + 1, n);
+    drawUtf8(b, 2, 2, C_WHITE, C_BLACK);
+    drawUtf8(L3("Нажать - выбрать, держать - отмена", "Click - choose, hold - cancel", "按下：选择，长按：取消"), 2, IMG_Y1 + 2, C_LIGHT, C_BLACK);
+  };
+  auto pic = [&]() {
+    File f = LittleFS.open(picPath(slots[(size_t)pos]).c_str(), "r");
+    size_t sz = f ? (size_t)f.size() : 0;
+    uint8_t* buf = (sz > 0 && sz <= MAX_PIC_BYTES) ? (uint8_t*)malloc(sz) : nullptr;
+    if (buf && f.read(buf, sz) == sz) drawJpegFit(buf, sz);
+    if (f) f.close();
+    if (buf) free(buf);
+  };
+  show();
+  pic();
+  for (;;) {
+    uint8_t j = joyEvent();
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return false;
+    if (e == EV_CLICK) break;
+    if (j != J_NONE && !g_joyRepeated && n > 1) {
+      pos = (j == J_RIGHT || j == J_DOWN) ? (pos + 1) % n : (pos + n - 1) % n;
+      show();
+      pic();
+    }
+    delay(2);
+  }
+  uint8_t a[mqtt::AVA_BYTES];
+  if (!makeAvatar(slots[(size_t)pos], a)) {
+    showMsg(L3("Из этой картинки аватарку сделать не удалось.", "Could not make an avatar from this picture.", "无法用这张图片制作头像。"), C_RED);
+    delay(1800);
+    return false;
+  }
+  memcpy(myAva, a, mqtt::AVA_BYTES);
+  myAvaSet = true;
+  File f = LittleFS.open("/avatar.bin", "w");
+  if (f) {
+    f.write(myAva, mqtt::AVA_BYTES);
+    f.close();
+  }
+  tft.fillScreen(C_BLACK);                            // показать результат крупно (x4) и в настоящем размере
+  for (int y = 0; y < mqtt::AVA; y++)
+    for (int x = 0; x < mqtt::AVA; x++) tft.fillRect(72 + x * 4, 40 + y * 4, 4, 4, mqtt::from332(myAva[y * mqtt::AVA + x]));
+  drawAvatar(myAva, roomId, cfgNick, 108, 150);
+  drawSmallCentered(L3("Аватарка готова", "The avatar is ready", "头像已设置"), 190, C_GREEN);
+  delay(1800);
+  return true;
+}
+#else
+bool pickAvatar() {
+  viewAnswer(L3("Аватарки выключены: в скетче ENABLE_IMAGES 0.", "Avatars are off: ENABLE_IMAGES is 0 in the sketch.", "头像已关闭。"), C_YELLOW);
+  return false;
+}
+void runGallery() {
+  viewAnswer(L3("Галерея выключена: в скетче ENABLE_IMAGES 0.", "The gallery is off: ENABLE_IMAGES is 0 in the sketch.", "相册已关闭。"), C_YELLOW);
+}
+void runImages() {}
+#endif
+
+// ========================= ИНСТРУМЕНТЫ =========================
+// Запрос GET: возвращает HTTP-код (или отрицательный код ошибки сети), в body - ответ.
+int httpGetText(const String& url, String& body) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+  HTTPClient http;
+  http.setUserAgent(APP_UA);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) return -100;
+  int code = http.GET();
+  body = code > 0 ? http.getString() : HTTPClient::errorToString(code);
+  http.end();
+  Serial.printf("[get] %d, %u bytes\n", code, (unsigned)body.length());
+  return code;
+}
+
+String httpErr(int code, const String& body) {
+  return String(T().errPrefix) + "HTTP " + String(code) + (code < 0 ? String(" ") + body : String(""));
+}
+
+// Текст с прокруткой; удержание кнопки сохраняет его в «Сохранённое».
+void viewSavable(const String& title, const String& text) {
+  for (;;) {
+    if (viewText(title + "\n\n" + text, C_WHITE) != EV_LONG) return;
+    saveItem(title, text);
+    showMsg(L3("Сохранено. Смотрите в Меню - Сохранённое.", "Saved. See Menu - Saved.", "已保存。见菜单-已保存。"), C_GREEN);
+    delay(1200);
+  }
+}
+
+// ---------- Шаблоны вопросов ----------
+// true - шаблон выбран и положен в поле ввода.
+bool runTemplates() {
+  std::vector<String> items = splitBar(L3(
+    "Объясни просто: |Реши задачу: |Формула: |Что такое |Кратко о |Сравни: |Исправь ошибки: |Приведи пример: |План ответа на тему: |Назад",
+    "Explain simply: |Solve: |Formula for |What is |Briefly about |Compare: |Fix the mistakes: |Give an example of |Outline an answer on: |Back",
+    "简单解释：|解题：|公式：|什么是|简述|比较：|改正错误：|举例说明|回答提纲：|返回"));
+  int k = listScreen(L3("Шаблоны", "Templates", "模板"), items, std::vector<String>(), 0);
+  if (k < 0 || k == (int)items.size() - 1) return false;
+  pendingInput = items[(size_t)k];
+  return true;
+}
+
+// ---------- Сохранённое ----------
+void runSaved() {
+  int sel = 0;
+  for (;;) {
+    loadSaved();
+    if (savedTitle.empty()) {
+      viewAnswer(L3("Пока пусто. Чтобы сохранить ответ, удерживайте кнопку, когда он на экране.",
+                    "Nothing yet. To save an answer, hold the button while it is on the screen.",
+                    "还没有内容。要保存回答，请在显示回答时长按按钮。"), C_YELLOW);
+      return;
+    }
+    char t[48];
+    snprintf(t, sizeof(t), "%s %u/%u", L3("Сохранённое", "Saved", "已保存"), (unsigned)savedTitle.size(), (unsigned)MAX_SAVED);
+    sel = listScreen(t, savedTitle, std::vector<String>(), sel);
+    if (sel < 0) return;
+    if (viewText(savedTitle[(size_t)sel] + "\n\n" + savedText[(size_t)sel], C_WHITE) == EV_LONG) {
+      std::vector<String> yn = splitBar(L3("Удалить|Оставить", "Delete|Keep", "删除|保留"));
+      if (choiceScreen(L3("Удалить эту запись?", "Delete this entry?", "删除这条记录？"), yn) == 0) {
+        savedTitle.erase(savedTitle.begin() + sel);
+        savedText.erase(savedText.begin() + sel);
+        storeSaved();
+        if (sel > 0) sel--;
+      }
+    }
+  }
+}
+
+// ---------- Калькулятор ----------
+struct CalcKey {
+  const char* label;     // что написано на клавише
+  const char* ins;       // что вставить (nullptr - особое действие по label)
+};
+const CalcKey CALC_KEYS[6][6] = {
+  {{"sin", "sin("}, {"cos", "cos("}, {"tan", "tan("}, {"(", "("}, {")", ")"}, {"<-", nullptr}},
+  {{"asin", "asin("}, {"acos", "acos("}, {"atan", "atan("}, {"x\xC2\xB2", "\xC2\xB2"}, {"^", "^"}, {"C", nullptr}},
+  {{"ln", "ln("}, {"log", "log("}, {"7", "7"}, {"8", "8"}, {"9", "9"}, {"\xC3\xB7", "\xC3\xB7"}},
+  {{"\xE2\x88\x9A", "\xE2\x88\x9A("}, {"x!", "!"}, {"4", "4"}, {"5", "5"}, {"6", "6"}, {"\xC3\x97", "\xC3\x97"}},
+  {{"\xCF\x80", "\xCF\x80"}, {"e", "e"}, {"1", "1"}, {"2", "2"}, {"3", "3"}, {"-", "-"}},
+  {{"DEG", nullptr}, {"Ans", "Ans"}, {"0", "0"}, {".", "."}, {"=", nullptr}, {"+", "+"}},
+};
+calc::Parser calcP;
+const int CK_W = 40, CK_H = 25, CK_Y = 90;
+
+void drawCalcKey(int r, int c, bool sel) {
+  const CalcKey& k = CALC_KEYS[r][c];
+  const char* label = k.label;
+  if (r == 5 && c == 0) label = calcP.degrees ? "DEG" : "RAD";
+  bool digit = c >= 2 && r >= 2 && c <= 4;
+  uint16_t bg = sel ? C_BLUE : digit ? 0x2104 : (c == 5 || (r < 2 && c >= 3)) ? 0x39C7 : 0x10A2;
+  uint16_t fg = (r == 5 && c == 4) ? C_GREEN : C_WHITE;
+  int x = c * CK_W, y = CK_Y + r * CK_H;
+  tft.fillRect(x, y, CK_W - 1, CK_H - 1, bg);
+  std::vector<uint16_t> cps;
+  utf8ToCps(label, cps);
+  if ((int)cps.size() * BIG_W <= CK_W - 2) {         // короткая подпись - крупно
+    int lx = x + (CK_W - 1 - (int)cps.size() * BIG_W) / 2;
+    for (uint16_t ch : cps) lx += drawCp(ch, lx, y, fg, bg);
+  } else {
+    SmallFont small;
+    int lx = x + (CK_W - 1 - (int)cps.size() * GLYPH_W) / 2;
+    for (uint16_t ch : cps) lx += drawCp(ch, lx, y + 4, fg, bg);
+  }
+}
+
+// Удалить последний знак; имя функции со скобкой («sin(») удаляется целиком.
+void calcBackspace(std::string& e) {
+  if (e.empty()) return;
+  static const char* TOK[] = {"asin(", "acos(", "atan(", "sin(", "cos(", "tan(", "ln(", "log(", "\xE2\x88\x9A(", "Ans"};
+  for (const char* t : TOK) {
+    size_t n = strlen(t);
+    if (e.size() >= n && e.compare(e.size() - n, n, t) == 0) {
+      e.erase(e.size() - n);
+      return;
+    }
+  }
+  size_t i = e.size() - 1;
+  while (i > 0 && ((unsigned char)e[i] & 0xC0) == 0x80) i--;   // целый символ UTF-8
+  e.erase(i);
+}
+
+void drawCalcDisplay(const std::string& expr, const std::string& res, uint16_t resCol) {
+  std::vector<uint16_t> cps;
+  utf8ToCps(expr.c_str(), cps);
+  size_t from = cps.size() > 40 ? cps.size() - 40 : 0;       // две строки по 20 знаков, виден конец
+  for (int line = 0; line < 2; line++) {
+    size_t a = from + (size_t)line * 20;
+    int n = a < cps.size() ? (int)(cps.size() - a < 20 ? cps.size() - a : 20) : 0;
+    drawLine(n ? cps.data() + a : nullptr, n, line * 24, C_WHITE, C_BLACK);
+  }
+  tft.fillRect(0, 52, 240, 24, C_BLACK);
+  std::vector<uint16_t> rc;
+  utf8ToCps(res.c_str(), rc);
+  int w = (int)rc.size() * BIG_W;
+  if (w <= 236) {
+    int x = 238 - w;
+    for (uint16_t ch : rc) x += drawCp(ch, x, 52, resCol, C_BLACK);
+  } else {
+    SmallFont small;
+    drawUtf8(res.c_str(), 2, 56, resCol, C_BLACK);
+  }
+}
+
+void runCalc() {
+  std::string expr, res;
+  uint16_t resCol = C_LIGHT;
+  bool fresh = false;                                // только что нажато «=»
+  int row = 2, col = 2;
+  bool ru = cfgLang == LANG_RU;
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 80, 240, 1, C_GRAY);
+  for (int r = 0; r < 6; r++)
+    for (int c = 0; c < 6; c++) drawCalcKey(r, c, r == row && c == col);
+  auto preview = [&]() {                             // считаем на лету, пока идёт набор
+    calc::Err err;
+    double v = calcP.eval(expr, err);
+    if (expr.empty()) res = "";
+    else if (err == calc::E_NONE) res = "= " + calc::format(v);
+    else res = "";
+    resCol = C_LIGHT;
+    drawCalcDisplay(expr, res, resCol);
+  };
+  drawCalcDisplay(expr, res, resCol);
+  for (;;) {
+    uint8_t j = joyEvent();
+    if (j != J_NONE) {
+      drawCalcKey(row, col, false);
+      if (j == J_LEFT) col = (col + 5) % 6;
+      if (j == J_RIGHT) col = (col + 1) % 6;
+      if (j == J_UP) row = (row + 5) % 6;
+      if (j == J_DOWN) row = (row + 1) % 6;
+      drawCalcKey(row, col, true);
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (e == EV_CLICK) {
+      const CalcKey& k = CALC_KEYS[row][col];
+      if (k.ins) {
+        char c0 = k.ins[0];
+        bool op = c0 == '+' || c0 == '^' || c0 == '!' || !strcmp(k.ins, "\xC3\x97") || !strcmp(k.ins, "\xC3\xB7") ||
+                  !strcmp(k.ins, "\xC2\xB2");
+        if (fresh) {                                 // после «=»: знак действия продолжает с Ans, остальное - новый пример
+          expr = (op || c0 == '-') ? "Ans" : "";
+          fresh = false;
+        } else if (expr.empty() && op) {             // пример начат со знака действия - берём прошлый ответ
+          expr = "Ans";
+        }
+        if (expr.size() < 120) expr += k.ins;
+        preview();
+      } else if (!strcmp(k.label, "<-")) {
+        fresh = false;
+        calcBackspace(expr);
+        preview();
+      } else if (!strcmp(k.label, "C")) {
+        fresh = false;
+        expr.clear();
+        preview();
+      } else if (!strcmp(k.label, "DEG")) {
+        calcP.degrees = !calcP.degrees;
+        drawCalcKey(row, col, true);
+        if (!fresh) preview();
+      } else if (!expr.empty()) {                    // «=»
+        calc::Err err;
+        double v = calcP.eval(expr, err);
+        if (err == calc::E_NONE) {
+          calcP.ans = v;
+          res = "= " + calc::format(v);
+          resCol = C_GREEN;
+          fresh = true;
+        } else {
+          res = calc::errName(err, ru);
+          resCol = C_RED;
+        }
+        drawCalcDisplay(expr, res, resCol);
+      }
+    }
+    delay(2);
+  }
+}
+
+// ---------- Википедия ----------
+void runWiki() {
+  for (;;) {
+    showMsg(L3("Википедия: о чём рассказать? Наберите и нажмите OK.", "Wikipedia: what to look up? Type it and press OK.",
+               "维基百科：想查什么？输入后按OK。"), C_YELLOW);
+    delay(1200);
+    String q = inputText();
+    q.trim();
+    if (!q.length()) return;
+    if (!waitWifi(false)) return;
+    showMsg(L3("Ищу в Википедии...", "Searching Wikipedia...", "正在搜索维基百科……"), C_YELLOW);
+    const char* lang = cfgLang == LANG_RU ? "ru" : cfgLang == LANG_ZH ? "zh" : "en";
+    String body;
+    int code = httpGetText(fromStd(tools::wikiUrl(lang, toStd(q))), body);
+    if (code != 200) {
+      viewAnswer(httpErr(code, body), C_RED);
+      continue;
+    }
+    std::string title, text;
+    if (!tools::parseWiki(toStd(body), title, text)) {
+      viewAnswer(L3("В Википедии ничего не нашлось. Попробуйте другой запрос.", "Nothing found on Wikipedia. Try another query.",
+                    "维基百科没有找到。请换个关键词。"), C_YELLOW);
+      continue;
+    }
+    viewSavable(fromStd(title), fromStd(text));
+  }
+}
+
+// ---------- Погода (Open-Meteo, без ключа) ----------
+const char* weatherName(int code) {
+  static const char* RU[] = {"Ясно", "Облачно", "Туман", "Морось", "Дождь", "Снег", "Ливень", "Гроза"};
+  static const char* EN[] = {"Clear", "Cloudy", "Fog", "Drizzle", "Rain", "Snow", "Showers", "Thunder"};
+  static const char* ZH[] = {"晴", "多云", "雾", "毛毛雨", "雨", "雪", "阵雨", "雷暴"};
+  int k = tools::weatherKind(code);
+  return cfgLang == LANG_RU ? RU[k] : cfgLang == LANG_ZH ? ZH[k] : EN[k];
+}
+
+// Спросить город и найти его координаты. true - найден и сохранён.
+bool chooseCity() {
+  showMsg(L3("Погода: наберите город и нажмите OK.", "Weather: type a city and press OK.", "天气：输入城市后按OK。"), C_YELLOW);
+  delay(1200);
+  String q = inputText();
+  q.trim();
+  if (!q.length()) return false;
+  if (!waitWifi(false)) return false;
+  showMsg(L3("Ищу город...", "Looking up the city...", "正在查找城市……"), C_YELLOW);
+  const char* lang = cfgLang == LANG_RU ? "ru" : cfgLang == LANG_ZH ? "zh" : "en";
+  String body;
+  int code = httpGetText(fromStd(tools::geoUrl(toStd(q), lang)), body);
+  tools::Place pl;
+  if (code != 200) {
+    viewAnswer(httpErr(code, body), C_RED);
+    return false;
+  }
+  if (!tools::parseGeo(toStd(body), pl)) {
+    viewAnswer(L3("Город не найден. Проверьте название.", "City not found. Check the name.", "未找到城市。请检查名称。"), C_YELLOW);
+    return false;
+  }
+  cfgCity = fromStd(pl.name);
+  cfgLat = (float)pl.lat;
+  cfgLon = (float)pl.lon;
+  prefs.begin("dsk", false);
+  prefs.putString("city", cfgCity);
+  prefs.putString("lat", String(cfgLat, 4));
+  prefs.putString("lon", String(cfgLon, 4));
+  prefs.end();
+  return true;
+}
+
+String degStr(double t) {
+  if (isnan(t)) return String("?");
+  int v = (int)lround(t);
+  return String(v > 0 ? "+" : "") + String(v) + "\xC2\xB0";
+}
+
+void runWeather() {
+  for (;;) {
+    if (cfgCity.length() == 0 && !chooseCity()) return;
+    if (!waitWifi(false)) return;
+    showMsg(L3("Узнаю погоду...", "Getting the weather...", "正在获取天气……"), C_YELLOW);
+    String body;
+    int code = httpGetText(fromStd(tools::forecastUrl(cfgLat, cfgLon)), body);
+    tools::Forecast f;
+    if (code != 200 || !tools::parseForecast(toStd(body), f)) {
+      viewAnswer(code != 200 ? httpErr(code, body) : String(T().errBadReply), C_RED);
+      return;
+    }
+    noteActivity();
+    tft.fillScreen(C_BLACK);
+    drawUtf8(cfgCity.c_str(), 2, 0, C_YELLOW, C_BLACK);
+    String t = degStr(f.temp);
+    drawBigStr(t.c_str(), nullptr, 4, 28, 2, C_WHITE, C_BLACK);
+    drawUtf8(weatherName(f.code), 4 + textWidth(t.c_str()) * 2 + 10, 40, 0x07FF, C_BLACK);
+    {
+      SmallFont small;
+      char b[80];
+      snprintf(b, sizeof(b), "%s %s", L3("Ощущается как", "Feels like", "体感"), degStr(f.feels).c_str());
+      drawUtf8(b, 4, 82, C_LIGHT, C_BLACK);
+      snprintf(b, sizeof(b), "%s %.0f %s   %s %.0f%%", L3("Ветер", "Wind", "风"), f.wind, L3("м/с", "m/s", "米/秒"),
+               L3("Влажность", "Humidity", "湿度"), f.hum);
+      drawUtf8(b, 4, 100, C_LIGHT, C_BLACK);
+      tft.fillRect(0, 122, 240, 1, C_GRAY);
+      for (size_t i = 1; i < f.days.size() && i < 4; i++) {     // следующие три дня
+        int y = 128 + (int)(i - 1) * 26;
+        const std::string& d = f.days[i];
+        std::string dd = d.size() >= 10 ? d.substr(8, 2) + "." + d.substr(5, 2) : d;
+        drawUtf8(dd.c_str(), 4, y, C_WHITE, C_BLACK);
+        String range = (i < f.tmin.size() ? degStr(f.tmin[i]) : String("?")) + ".." + (i < f.tmax.size() ? degStr(f.tmax[i]) : String("?"));
+        drawUtf8(range.c_str(), 52, y, C_WHITE, C_BLACK);
+        if (i < f.dcode.size() && !isnan(f.dcode[i])) drawUtf8(weatherName((int)f.dcode[i]), 132, y, 0x07FF, C_BLACK);
+        if (i < f.rain.size() && !isnan(f.rain[i])) {
+          snprintf(b, sizeof(b), "%.0f%%", f.rain[i]);
+          drawUtf8(b, 240 - textWidth(b) - 2, y, C_LIGHT, C_BLACK);
+        }
+      }
+      drawUtf8(L3("Нажать-назад, держать-город", "Click-back, hold-city", "按下：返回，长按：换城市"), 2, 222, C_LIGHT, C_BLACK);
+    }
+    while (btnEvent() != EV_NONE) delay(5);
+    BtnEvent e = waitButton();
+    if (e != EV_LONG) return;
+    if (!chooseCity()) return;
+  }
+}
+
+// ---------- Курсы валют ЦБ РФ ----------
+void runRates() {
+  if (!waitWifi(false)) return;
+  showMsg(L3("Загружаю курсы ЦБ...", "Loading exchange rates...", "正在加载汇率……"), C_YELLOW);
+  String body;
+  int code = httpGetText(tools::cbrUrl(), body);
+  std::vector<tools::Rate> rates;
+  std::string date;
+  if (code != 200) {
+    viewAnswer(httpErr(code, body), C_RED);
+    return;
+  }
+  bool ok = tools::parseCbr(toStd(body), rates, date);
+  body = "";
+  if (!ok) {
+    viewAnswer(T().errBadReply, C_RED);
+    return;
+  }
+  std::vector<String> items, right;
+  for (const tools::Rate& r : rates) {
+    char b[40];
+    if (r.nominal != 1) snprintf(b, sizeof(b), "%.0f %s", r.nominal, r.code.c_str());
+    else snprintf(b, sizeof(b), "%s", r.code.c_str());
+    items.push_back(b);
+    snprintf(b, sizeof(b), "%.2f %s", r.value, r.value > r.prev ? "\xE2\x86\x91" : r.value < r.prev ? "\xE2\x86\x93" : " ");
+    right.push_back(b);
+  }
+  String title = String(L3("Курсы ЦБ ", "CBR rates ", "汇率 ")) + (date.size() >= 5 ? date.substr(0, 5).c_str() : "");
+  int sel = 0;
+  for (;;) {
+    sel = listScreen(title.c_str(), items, right, sel);
+    if (sel < 0) return;
+    const tools::Rate& r = rates[(size_t)sel];
+    char b[300];
+    snprintf(b, sizeof(b), "%s\n\n%.0f %s = %.4f \xE2\x82\xBD\n%s: %.4f\n%s: %+.4f\n\n%s %s", r.name.c_str(), r.nominal, r.code.c_str(),
+             r.value, L3("Вчера", "Before", "之前"), r.prev, L3("Изменение", "Change", "变化"), r.value - r.prev,
+             L3("Курс ЦБ РФ на", "Bank of Russia rate for", "俄罗斯央行汇率"), date.c_str());
+    viewAnswer(b, C_WHITE);
+  }
+}
+
+// ---------- Часы, таймер, секундомер ----------
+bool ntpStarted = false;
+void startNtp() {                                    // время из интернета; дальше часы идут сами
+  configTime((long)cfgTz * 3600, 0, "pool.ntp.org", "time.google.com", "ru.pool.ntp.org");
+  ntpStarted = true;
+}
+bool timeNow(struct tm& t);
+bool timeNow(struct tm& t) {
+  if (!ntpStarted) {
+    if (!wifiOk()) return false;
+    startNtp();
+  }
+  return getLocalTime(&t, 5) && t.tm_year > 120;
+}
+
+void runClock() {
+  KeepAwake awake;
+  tft.fillScreen(C_BLACK);
+  char prevT[8] = "", prevS[4] = "", prevD[24] = "";
+  bool hadTime = false, first = true;
+  for (;;) {
+    if (btnEvent() != EV_NONE) return;
+    static uint32_t next = 0;
+    if (first || (int32_t)(millis() - next) >= 0) {
+      next = millis() + 200;
+      wifiTick();
+      struct tm t;
+      if (timeNow(t)) {
+        if (!hadTime) tft.fillScreen(C_BLACK);
+        hadTime = true;
+        char b[24];
+        snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+        drawBigStr(b, prevT[0] ? prevT : nullptr, 30, 44, 3, C_WHITE, C_BLACK);
+        strcpy(prevT, b);
+        snprintf(b, sizeof(b), "%02d", t.tm_sec);
+        if (strcmp(b, prevS)) drawUtf8(b, 108, 120, C_YELLOW, C_BLACK);
+        strcpy(prevS, b);
+        static const char* WD_RU[] = {"воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"};
+        static const char* WD_EN[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+        static const char* WD_ZH[] = {"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"};
+        snprintf(b, sizeof(b), "%02d.%02d.%04d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+        if (strcmp(b, prevD)) {
+          strcpy(prevD, b);
+          tft.fillRect(0, 160, 240, 56, C_BLACK);
+          drawUtf8(b, (240 - textWidth(b)) / 2, 160, C_WHITE, C_BLACK);
+          const char* wd = cfgLang == LANG_RU ? WD_RU[t.tm_wday] : cfgLang == LANG_ZH ? WD_ZH[t.tm_wday] : WD_EN[t.tm_wday];
+          drawUtf8(wd, (240 - textWidth(wd)) / 2, 188, 0x07FF, C_BLACK);
+        }
+      } else if (first) {
+        showMsg(L3("Узнаю точное время... Нужен Wi-Fi.", "Getting the time... Wi-Fi is needed.", "正在获取时间……需要Wi-Fi。"), C_YELLOW);
+      }
+      first = false;
+    }
+    delay(5);
+  }
+}
+
+void drawClockHint(const char* s) {
+  SmallFont small;
+  tft.fillRect(0, 204, 240, 36, C_BLACK);
+  std::vector<uint16_t> cps;
+  utf8ToCps(s, cps);
+  std::vector<Line> lines;
+  wrapCps(cps, COLS, lines);
+  for (size_t i = 0; i < lines.size() && i < 2; i++) drawLine(cps.data() + lines[i].start, lines[i].len, 206 + (int)i * 16, C_LIGHT, C_BLACK);
+}
+
+void runTimer() {
+  KeepAwake awake;
+  static int setSecs = 300;                          // запоминается до выключения
+  int left = setSecs;
+  bool running = false, ringing = false;
+  int ringShown = -1;                                // что нарисовано при мигании (-1 - ещё ничего)
+  uint32_t endMs = 0;
+  char prev[8] = "";
+  tft.fillScreen(C_BLACK);
+  drawUtf8(L3("Таймер", "Timer", "计时器"), 2, 0, C_YELLOW, C_BLACK);
+  auto show = [&](uint16_t fg, uint16_t bg, bool all) {
+    char b[8];
+    snprintf(b, sizeof(b), "%02d:%02d", left / 60, left % 60);
+    drawBigStr(b, all || !prev[0] ? nullptr : prev, 30, 70, 3, fg, bg);
+    strcpy(prev, b);
+  };
+  auto hint = [&]() {
+    drawClockHint(running ? L3("Нажать - пауза, держать - выход", "Click - pause, hold - exit", "按下：暂停，长按：退出")
+                          : L3("Вверх/вниз: 1 мин, вбок: 10 с. Нажать - старт", "Up/down: 1 min, sideways: 10 s. Click - start",
+                               "上下：分钟，左右：10秒。按下：开始"));
+  };
+  show(C_WHITE, C_BLACK, true);
+  hint();
+  for (;;) {
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (ringing) {                                   // время вышло: экран мигает, пока не нажмут
+      int on = (int)((millis() / 350) % 2);
+      if (on != ringShown) {
+        ringShown = on;
+        if (on) beep(1, 2000, 140);
+        tft.fillRect(0, 60, 240, 92, on ? C_RED : C_BLACK);
+        show(C_WHITE, on ? C_RED : C_BLACK, true);
+      }
+      if (e == EV_CLICK) {
+        ringing = false;
+        ringShown = -1;
+        left = setSecs;
+        tft.fillRect(0, 60, 240, 92, C_BLACK);
+        show(C_WHITE, C_BLACK, true);
+        hint();
+      }
+      delay(5);
+      continue;
+    }
+    if (running) {
+      int l = (int)((int32_t)(endMs - millis()) + 999) / 1000;
+      if (l <= 0) {
+        left = 0;
+        running = false;
+        ringing = true;
+        drawClockHint(L3("Время вышло! Нажмите кнопку.", "Time is up! Press the button.", "时间到！请按按钮。"));
+        continue;
+      }
+      if (l != left) {
+        left = l;
+        show(C_GREEN, C_BLACK, false);
+      }
+      if (e == EV_CLICK) {
+        running = false;
+        show(C_WHITE, C_BLACK, true);
+        hint();
+      }
+    } else {
+      uint8_t j = joyEvent();
+      int d = j == J_UP ? 60 : j == J_DOWN ? -60 : j == J_RIGHT ? 10 : j == J_LEFT ? -10 : 0;
+      if (d) {
+        left += d;
+        if (left < 10) left = 10;
+        if (left > 99 * 60) left = 99 * 60;
+        setSecs = left;
+        show(C_WHITE, C_BLACK, false);
+      }
+      if (e == EV_CLICK) {
+        running = true;
+        endMs = millis() + (uint32_t)left * 1000UL;
+        show(C_GREEN, C_BLACK, true);
+        hint();
+      }
+    }
+    delay(5);
+  }
+}
+
+void runStopwatch() {
+  KeepAwake awake;
+  uint32_t acc = 0, startMs = 0;
+  bool running = false;
+  char prev[8] = "", prevT[4] = "";
+  tft.fillScreen(C_BLACK);
+  drawUtf8(L3("Секундомер", "Stopwatch", "秒表"), 2, 0, C_YELLOW, C_BLACK);
+  auto show = [&](bool all) {
+    uint32_t ms = acc + (running ? millis() - startMs : 0);
+    uint32_t s = ms / 1000;
+    char b[8], t[4];
+    snprintf(b, sizeof(b), "%02u:%02u", (unsigned)((s / 60) % 100), (unsigned)(s % 60));
+    snprintf(t, sizeof(t), ".%u", (unsigned)((ms / 100) % 10));
+    uint16_t col = running ? C_GREEN : C_WHITE;
+    drawBigStr(b, all || !prev[0] ? nullptr : prev, 18, 70, 3, col, C_BLACK);
+    if (all || strcmp(t, prevT)) drawBigStr(t, nullptr, 200, 118, 1, col, C_BLACK);
+    strcpy(prev, b);
+    strcpy(prevT, t);
+  };
+  auto hint = [&]() {
+    drawClockHint(running ? L3("Нажать - стоп, держать - выход", "Click - stop, hold - exit", "按下：停止，长按：退出")
+                          : L3("Нажать - старт, влево - сброс, держать - выход", "Click - start, left - reset, hold - exit",
+                               "按下：开始，左：清零，长按：退出"));
+  };
+  show(true);
+  hint();
+  uint32_t next = 0;
+  for (;;) {
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (e == EV_CLICK) {
+      if (running) acc += millis() - startMs;
+      else startMs = millis();
+      running = !running;
+      show(true);
+      hint();
+    }
+    if (!running && joyEvent() == J_LEFT && acc) {
+      acc = 0;
+      show(true);
+    }
+    if (running && (int32_t)(millis() - next) >= 0) {
+      next = millis() + 100;
+      show(false);
+    }
+    delay(5);
+  }
+}
+
+// ---------- Конспекты: свои тексты, загруженные с телефона ----------
+const int MAX_NOTES = 20;
+
+String notePath(int i) {
+  char b[20];
+  snprintf(b, sizeof(b), "/note%02d.txt", i);
+  return String(b);
+}
+
+int noteCount() {
+  int n = 0;
+  for (int i = 0; i < MAX_NOTES; i++)
+    if (LittleFS.exists(notePath(i).c_str())) n++;
+  return n;
+}
+
+// Файл конспекта: первая строка - название, дальше текст.
+bool addNote(const String& title, const String& text) {
+  for (int i = 0; i < MAX_NOTES; i++) {
+    if (LittleFS.exists(notePath(i).c_str())) continue;
+    File f = LittleFS.open(notePath(i).c_str(), "w");
+    if (!f) return false;
+    std::string t = toStd(title);
+    for (char& c : t)
+      if (c == '\n' || c == '\r') c = ' ';
+    std::string d = t + "\n" + toStd(text);
+    f.write((const uint8_t*)d.data(), d.size());
+    f.close();
+    return true;
+  }
+  return false;
+}
+
+bool readNote(int i, String& title, String& text) {
+  File f = LittleFS.open(notePath(i).c_str(), "r");
+  if (!f) return false;
+  std::string d = toStd(f.readString());
+  f.close();
+  size_t e = d.find('\n');
+  title = fromStd(e == std::string::npos ? d : d.substr(0, e));
+  text = fromStd(e == std::string::npos ? std::string() : d.substr(e + 1));
+  return true;
+}
+
+void runNotes() {
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items;
+    std::vector<int> ids;
+    for (int i = 0; i < MAX_NOTES; i++) {
+      String t, x;
+      if (!readNote(i, t, x)) continue;
+      items.push_back(t);
+      ids.push_back(i);
+    }
+    items.push_back(L3("+ С телефона", "+ From phone", "+ 从手机上传"));
+    items.push_back(T().menuBack);
+    char title[48];
+    snprintf(title, sizeof(title), "%s %u/%d", L3("Конспекты", "Notes", "笔记"), (unsigned)ids.size(), MAX_NOTES);
+    sel = listScreen(title, items, std::vector<String>(), sel);
+    if (sel < 0 || sel == (int)items.size() - 1) return;
+    if (sel == (int)ids.size()) {                    // страница на телефоне: там же, где настройка Wi-Fi
+      viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет форма «Конспект». "
+                    "Когда закончите - нажмите кнопку на устройстве.",
+                    "The device will now create a Wi-Fi network. Join it from your phone; the Note form is at the bottom of the page. "
+                    "Press the button on the device when done.",
+                    "设备将创建Wi-Fi网络。用手机连接，页面底部有“笔记”表单。完成后按设备上的按钮。"), C_WHITE);
+      runPortal();
+      netIdx = 0;
+      wifiStart();
+      continue;
+    }
+    String t, x;
+    if (!readNote(ids[(size_t)sel], t, x)) continue;
+    if (viewText(t + "\n\n" + x, C_WHITE) == EV_LONG) {
+      std::vector<String> yn = splitBar(L3("Удалить|Оставить", "Delete|Keep", "删除|保留"));
+      if (choiceScreen(L3("Удалить этот конспект?", "Delete this note?", "删除这条笔记？"), yn) == 0) {
+        LittleFS.remove(notePath(ids[(size_t)sel]).c_str());
+        if (sel > 0) sel--;
+      }
+    }
+  }
+}
+
+// ---------- Справочник (работает без интернета) ----------
+void runReference() {
+  const reference::Topic* topics = cfgLang == LANG_RU ? reference::TOPICS_RU : reference::TOPICS_EN;
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items;
+    for (int i = 0; i < reference::TOPIC_COUNT; i++) items.push_back(topics[i].title);
+    items.push_back(T().menuBack);
+    sel = listScreen(L3("Справочник", "Reference", "手册"), items, std::vector<String>(), sel);
+    if (sel < 0 || sel >= reference::TOPIC_COUNT) return;
+    viewAnswer(topics[sel].text, C_WHITE);
+  }
+}
+
+// ---------- Заставка: часы на тёмном экране ----------
+// Показывается на экране ввода после простоя. Любое движение или нажатие возвращает клавиатуру.
+// Через 10 минут подсветка гаснет совсем. Если точного времени нет - экран просто гаснет.
+void runSaver() {
+  struct tm t;
+  if (!timeNow(t)) {
+    sleepScreen();
+    return;
+  }
+  KeepAwake awake;
+  analogWrite(PIN_BLK, BRIGHT_PCT[0] * 255 / 100);   // самая слабая подсветка
+  tft.fillScreen(C_BLACK);
+  int shownMin = -1, x = 30, y = 80;
+  uint32_t start = millis(), next = 0;
+  bool dark = false;
+  for (;;) {
+    if (joyRawDir() != J_NONE || digitalRead(PIN_SW) == LOW) break;
+    if (!dark && millis() - start > 600000UL) {      // 10 минут - гасим подсветку совсем
+      analogWrite(PIN_BLK, 0);
+      dark = true;
+    }
+    if (!dark && (int32_t)(millis() - next) >= 0) {
+      next = millis() + 500;
+      if (timeNow(t) && t.tm_min != shownMin) {      // раз в минуту часы переезжают на новое место
+        tft.fillRect(x, y, 180, 100, C_BLACK);
+        shownMin = t.tm_min;
+        x = (int)(esp_random() % 61);
+        y = 10 + (int)(esp_random() % 121);
+        char b[24];
+        snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+        drawBigStr(b, nullptr, x, y, 3, 0x05FF, C_BLACK);
+        snprintf(b, sizeof(b), "%02d.%02d.%04d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+        drawUtf8(b, x + (180 - textWidth(b)) / 2, y + 74, C_GRAY, C_BLACK);
+      }
+      wifiTick();
+    }
+    delay(10);
+  }
+  while (joyRawDir() != J_NONE || digitalRead(PIN_SW) == LOW) delay(5);   // действие, которое разбудило, не срабатывает
+  delay(40);
+  applyBrightness();
+  noteActivity();
+}
+
+// ========================= КОМНАТА =========================
+// Общий чат всех таких гаджетов через открытый сервер сообщений (MQTT).
+// Сообщения не шифруются и нигде не хранятся: их видят те, кто в этот момент в той же комнате.
+WiFiClient mqClient;
+std::string mqRx;                                    // принятые, ещё не разобранные байты
+bool mqUp = false;
+uint32_t mqLastPing = 0, mqLastTry = 0, mqLastHere = 0, avaResendAt = 0;
+String cfgNick, cfgRoom, roomId;
+int cfgRoomBg = 1;                                   // принимать сообщения, когда комната закрыта (счётчик на главном экране)
+struct RoomMsg {
+  String id, nick, text, time;
+  bool mine;
+};
+struct RoomUser {
+  String id, nick;
+  uint32_t seen;
+  bool hasAva;
+  uint8_t ava[mqtt::AVA_BYTES];
+};
+std::vector<RoomMsg> roomMsgs;
+std::vector<RoomUser> roomUsers;                     // кого видели в комнате (до 10)
+std::vector<std::string> netInbox;                   // сообщения сетевых игр (<комната>/g), ждут разбора
+bool hsDirty = false;
+void hsPublishAll();
+void hsReceive(const std::string& rest, const std::string& payload);
+uint8_t myAva[mqtt::AVA_BYTES];
+bool myAvaSet = false;
+bool roomDirty = true, inRoom = false, roomOpen = false;
+int roomUnread = 0;                                  // новых сообщений, пока комната закрыта
+bool roomUnreadDirty = false;
+const size_t ROOM_KEEP = 40;                         // сколько последних сообщений помним
+const size_t ROOM_USERS = 10;
+
+bool mqWrite(const std::string& pkt) { return mqClient.write((const uint8_t*)pkt.data(), pkt.size()) == pkt.size(); }
+std::string roomBase() { return mqtt::roomTopic(toStd(cfgRoom)); }
+
+void mqDrop() {
+  mqClient.stop();
+  mqUp = false;
+  mqRx.clear();
+  roomDirty = true;
+}
+
+// Найти участника по метке (или завести; самый давний вытесняется). Индекс в roomUsers.
+int roomUserIndex(const String& id, bool create) {
+  for (size_t i = 0; i < roomUsers.size(); i++)
+    if (roomUsers[i].id == id) return (int)i;
+  if (!create) return -1;
+  if (roomUsers.size() >= ROOM_USERS) {
+    size_t old = 0;
+    for (size_t i = 1; i < roomUsers.size(); i++)
+      if ((int32_t)(roomUsers[i].seen - roomUsers[old].seen) < 0) old = i;
+    roomUsers.erase(roomUsers.begin() + old);
+  }
+  RoomUser u;
+  u.id = id;
+  u.seen = millis();
+  u.hasAva = false;
+  roomUsers.push_back(u);
+  return (int)roomUsers.size() - 1;
+}
+
+void sendHere(bool here) {
+  mqWrite(mqtt::publish(roomBase() + "/p", mqtt::presence(toStd(roomId), toStd(cfgNick), here)));
+  mqLastHere = millis();
+}
+
+// Аватарка уходит «сохраняемым» сообщением: сервер отдаст её и тем, кто зайдёт позже.
+void sendAvatar() {
+  std::string data = myAvaSet ? std::string((const char*)myAva, mqtt::AVA_BYTES) : std::string();
+  mqWrite(mqtt::publishRetained(roomBase() + "/a/" + toStd(roomId), data));
+}
+
+// Подключиться к серверу и подписаться на комнату. waitMs - сколько ждать сервер на каждом шаге.
+bool mqConnect(int waitMs) {
+  mqDrop();
+  mqLastTry = millis();
+  if (!mqClient.connect(MQTT_HOST, MQTT_PORT, waitMs)) return false;
+  char cid[32];
+  snprintf(cid, sizeof(cid), "dsp-%s-%04x", roomId.c_str(), (unsigned)(esp_random() & 0xFFFF));
+  if (!mqWrite(mqtt::connect(cid, 120))) return false;
+  uint32_t t0 = millis();
+  mqtt::Packet p;
+  bool ack = false;
+  while (millis() - t0 < (uint32_t)waitMs && !ack) {  // ждём подтверждение
+    while (mqClient.available() && mqRx.size() < 512) {
+      uint8_t b[64];
+      int r = mqClient.read(b, sizeof(b));
+      if (r <= 0) break;
+      mqRx.append((const char*)b, (size_t)r);
+    }
+    int k = mqtt::take(mqRx, p, 1500);
+    if (k < 0) break;
+    if (k == 1 && p.type == mqtt::T_CONNACK) ack = p.body.size() >= 2 && p.body[1] == 0;
+    else if (k == 0) delay(20);
+  }
+  if (!ack) {
+    mqClient.stop();
+    return false;
+  }
+  if (!mqWrite(mqtt::subscribe(1, roomBase() + "/#"))) return false;   // чат, присутствие и аватарки комнаты
+  mqWrite(mqtt::subscribe(2, "dspocket/v1/hs/#"));                     // общая таблица рекордов
+  mqUp = true;
+  mqLastPing = millis();
+  roomDirty = true;
+  sendHere(true);
+  sendAvatar();
+  hsPublishAll();
+  return true;
+}
+
+// Принять всё, что пришло; поддерживать связь. Вызывается часто (в том числе с экрана ввода).
+void mqPoll() {
+  if (!mqUp) return;
+  int guard = 0;
+  while (mqClient.available() && guard++ < 40) {
+    uint8_t b[128];
+    int r = mqClient.read(b, sizeof(b));
+    if (r <= 0) break;
+    mqRx.append((const char*)b, (size_t)r);
+    if (mqRx.size() > 6000) mqRx.clear();            // защита от мусора
+  }
+  mqtt::Packet p;
+  std::string base = roomBase();
+  for (;;) {
+    int k = mqtt::take(mqRx, p, 1500);
+    if (k == 0) break;
+    if (k < 0) {
+      mqRx.clear();
+      break;
+    }
+    if (p.type != mqtt::T_PUBLISH) continue;
+    if (p.topic.compare(0, 15, "dspocket/v1/hs/") == 0) {   // чей-то рекорд
+      hsReceive(p.topic.substr(15), p.payload);
+      continue;
+    }
+    if (p.topic == base + "/g") {                    // ход или приглашение в сетевой игре
+      if (netInbox.size() < 30 && p.payload.size() < 120) netInbox.push_back(p.payload);
+      continue;
+    }
+    std::string who;
+    int kind = mqtt::classify(base, p.topic, who);
+    if (kind == 0) {                                 // сообщение чата
+      std::string id, nick, text;
+      if (!mqtt::parseRoomMessage(p.payload, id, nick, text)) continue;   // чужой формат - пропускаем
+      RoomMsg m;
+      m.id = fromStd(id);
+      m.nick = fromStd(nick);
+      m.text = fromStd(text);
+      m.mine = id == toStd(roomId);
+      struct tm t;
+      if (timeNow(t)) {
+        char b[8];
+        snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+        m.time = b;
+      }
+      roomMsgs.push_back(m);
+      if (roomMsgs.size() > ROOM_KEEP) roomMsgs.erase(roomMsgs.begin());
+      if (!m.mine) {
+        bool bot = id.size() > 3 && id.compare(id.size() - 3, 3, "-ai") == 0;   // ответ DeepSeek - не участник
+        if (!bot) {
+          int ui = roomUserIndex(m.id, true);
+          roomUsers[(size_t)ui].nick = m.nick;
+          roomUsers[(size_t)ui].seen = millis();
+        }
+        if (!roomOpen) {                             // комната закрыта - считаем непрочитанные
+          roomUnread++;
+          roomUnreadDirty = true;
+        }
+        sndMessage();
+      }
+      roomDirty = true;
+      if (roomOpen) noteActivity();
+    } else if (kind == 1) {                          // «я здесь» / «я ушёл»
+      std::string id, nick;
+      bool here;
+      if (!mqtt::parsePresence(p.payload, id, nick, here) || id == toStd(roomId)) continue;
+      int ui = roomUserIndex(fromStd(id), here);
+      if (ui < 0) continue;
+      if (!here) {
+        roomUsers.erase(roomUsers.begin() + ui);
+        continue;
+      }
+      bool isNew = roomUsers[(size_t)ui].nick.length() == 0;
+      roomUsers[(size_t)ui].nick = fromStd(nick);
+      roomUsers[(size_t)ui].seen = millis();
+      if (isNew && myAvaSet) avaResendAt = millis() + 1500 + (esp_random() % 2000);   // новичку - свою аватарку (если сервер её не сохранил)
+    } else if (kind == 2) {                          // аватарка участника
+      if (who == toStd(roomId)) continue;
+      int ui = roomUserIndex(fromStd(who), p.payload.size() == mqtt::AVA_BYTES);
+      if (ui < 0) continue;
+      if (p.payload.size() == mqtt::AVA_BYTES) {
+        memcpy(roomUsers[(size_t)ui].ava, p.payload.data(), mqtt::AVA_BYTES);
+        roomUsers[(size_t)ui].hasAva = true;
+      } else {
+        roomUsers[(size_t)ui].hasAva = false;
+      }
+      roomDirty = true;
+    }
+  }
+  if (!mqClient.connected()) {
+    mqDrop();
+    return;
+  }
+  if (millis() - mqLastPing > 40000) {
+    mqLastPing = millis();
+    if (!mqWrite(mqtt::ping())) {
+      mqDrop();
+      return;
+    }
+  }
+  if (millis() - mqLastHere > 60000) sendHere(true);
+  if (avaResendAt && (int32_t)(millis() - avaResendAt) >= 0) {
+    avaResendAt = 0;
+    sendAvatar();
+  }
+  if (hsDirty) hsPublishAll();
+}
+
+// Фоновая работа комнаты: приём сообщений и переподключение.
+// В комнате - раз в 20 секунд; в фоне - раз в минуту и с коротким ожиданием, чтобы не мешать набору текста.
+void roomTick() {
+  bool bg = !inRoom;
+  if (bg && !(cfgRoomBg && cfgNick.length())) return;
+  if (!mqUp) {
+    if (wifiOk() && millis() - mqLastTry > (bg ? 60000UL : 20000UL)) mqConnect(bg ? 3000 : 6000);
+    return;
+  }
+  mqPoll();
+}
+
+void saveRoomSettings() {
+  prefs.begin("dsk", false);
+  prefs.putString("nick", cfgNick);
+  prefs.putString("room", cfgRoom);
+  prefs.putUChar("roombg", (uint8_t)cfgRoomBg);
+  prefs.end();
+}
+
+void loadAvatar() {
+  myAvaSet = false;
+  File f = LittleFS.open("/avatar.bin", "r");
+  if (!f) return;
+  if ((size_t)f.size() == mqtt::AVA_BYTES && f.read(myAva, mqtt::AVA_BYTES) == mqtt::AVA_BYTES) myAvaSet = true;
+  f.close();
+}
+
+// Спросить имя. false - отменено.
+bool askNick() {
+  showMsg(L3("Как вас называть в комнате? Наберите имя и нажмите OK.", "What is your name in the room? Type it and press OK.",
+             "在房间里怎么称呼你？输入名字后按OK。"), C_YELLOW);
+  delay(1500);
+  if (cfgNick.length()) pendingInput = cfgNick;
+  String n = inputText();
+  n.trim();
+  if (!n.length()) return false;
+  cfgNick = fromStd(mqtt::clip(toStd(n), 24));
+  saveRoomSettings();
+  return true;
+}
+
+// Аватарка 24x24: своя картинка или цветной кружок с первой буквой имени.
+void drawAvatar(const uint8_t* ava, const String& id, const String& nick, int x, int y) {
+  if (ava) {
+    for (size_t i = 0; i < mqtt::AVA_BYTES; i++) cbuf[i] = mqtt::from332(ava[i]);
+    blit(x, y, 24, 24);
+    return;
+  }
+  uint16_t col = mqtt::idColor(toStd(id));
+  tft.fillRect(x, y, 24, 24, C_BLACK);
+  tft.fillCircle(x + 12, y + 12, 11, col);
+  std::vector<uint16_t> cps;
+  utf8ToCps(nick.c_str(), cps);
+  if (!cps.empty()) {
+    SmallFont small;
+    drawCp(cps[0], x + 8, y + 4, C_WHITE, col);
+  }
+}
+
+struct RoomLine {
+  std::vector<uint16_t> cps;
+  uint16_t color;
+  int msg;                                           // для строки с именем - номер сообщения, иначе -1
+};
+
+void drawRoom(int back) {
+  std::vector<RoomLine> vl;
+  for (size_t mi = 0; mi < roomMsgs.size(); mi++) {
+    const RoomMsg& m = roomMsgs[mi];
+    std::vector<uint16_t> lab;
+    utf8ToCps(m.nick.c_str(), lab);
+    if (lab.size() > 12) lab.resize(12);
+    vl.push_back({lab, m.mine ? C_YELLOW : (uint16_t)0x07FF, (int)mi});
+    std::vector<uint16_t> cps;
+    utf8ToCps(m.text.c_str(), cps);
+    std::vector<Line> lines;
+    wrapCps(cps, COLS, lines);
+    for (const Line& l : lines)
+      vl.push_back({std::vector<uint16_t>(cps.begin() + l.start, cps.begin() + l.start + l.len), m.mine ? (uint16_t)0xFFF0 : C_WHITE, -1});
+  }
+  const int rows = ROWS - 1;                         // нижняя строка - состояние
+  if (vl.empty()) {
+    std::vector<uint16_t> cps;
+    utf8ToCps(L3("Пока тихо. Нажмите кнопку, чтобы написать. Сообщение увидят все, кто сейчас в этой комнате.",
+                 "Quiet so far. Press the button to write. Everyone in this room right now will see it.",
+                 "现在很安静。按按钮写消息，此刻在这个房间里的人都能看到。"), cps);
+    std::vector<Line> lines;
+    wrapCps(cps, COLS, lines);
+    for (const Line& l : lines) vl.push_back({std::vector<uint16_t>(cps.begin() + l.start, cps.begin() + l.start + l.len), C_LIGHT, -1});
+  }
+  int maxTop = (int)vl.size() > rows ? (int)vl.size() - rows : 0;
+  int top = maxTop - back;
+  if (top < 0) top = 0;
+  for (int r = 0; r < rows; r++) {
+    size_t i = (size_t)(top + r);
+    int y = r * GH;
+    if (i >= vl.size()) {
+      tft.fillRect(0, y, 240, GH, C_BLACK);
+    } else if (vl[i].msg < 0) {
+      drawLine(vl[i].cps.data(), (int)vl[i].cps.size(), y, vl[i].color, C_BLACK);
+    } else {                                         // строка с аватаркой, именем и временем
+      const RoomMsg& m = roomMsgs[(size_t)vl[i].msg];
+      tft.fillRect(24, y, 216, GH, C_BLACK);
+      const uint8_t* ava = nullptr;
+      if (m.mine) {
+        if (myAvaSet) ava = myAva;
+      } else {
+        int ui = roomUserIndex(m.id, false);
+        if (ui >= 0 && roomUsers[(size_t)ui].hasAva) ava = roomUsers[(size_t)ui].ava;
+      }
+      drawAvatar(ava, m.id, m.nick, 0, y);
+      int x = 28;
+      for (uint16_t ch : vl[i].cps) x += drawCp(ch, x, y, vl[i].color, C_BLACK);
+      if (m.time.length()) {
+        SmallFont small;
+        drawUtf8(m.time.c_str(), 240 - 5 * 8 - 2, y + 5, C_GRAY, C_BLACK);
+      }
+    }
+  }
+  SmallFont small;
+  tft.fillRect(0, rows * 24, 240, 240 - rows * 24, C_BLACK);
+  int online = 1;
+  for (const RoomUser& u : roomUsers)
+    if (millis() - u.seen < 150000UL) online++;
+  char st[64];
+  snprintf(st, sizeof(st), "#%s", cfgRoom.c_str());
+  drawUtf8(st, 2, rows * 24 + 5, C_YELLOW, C_BLACK);
+  if (mqUp) snprintf(st, sizeof(st), "%s: %d", L3("в сети", "online", "在线"), online);
+  else snprintf(st, sizeof(st), "%s", L3("нет связи", "offline", "离线"));
+  drawUtf8(st, 240 - textWidth(st) - 2, rows * 24 + 5, mqUp ? C_GREEN : C_RED, C_BLACK);
+}
+
+// Отправить текст в комнату. false - нет связи.
+bool roomSend(const String& text) {
+  return mqUp && mqWrite(mqtt::publish(roomBase(), mqtt::roomMessage(toStd(roomId), toStd(cfgNick), mqtt::clip(toStd(text), 300))));
+}
+
+// «@ai вопрос» - DeepSeek отвечает в комнату (запрос идёт с этого гаджета и его ключа).
+void roomAskAi(const String& text) {
+  std::string q = toStd(text);
+  size_t sp = q.find(' ');
+  if (sp == std::string::npos || sp + 1 >= q.size()) return;
+  showMsg(L3("DeepSeek отвечает в комнату...", "DeepSeek is answering in the room...", "DeepSeek正在房间里回答……"), C_YELLOW);
+  std::vector<ChatMsg> none;
+  String reply;
+  std::string sys = std::string("You are a helpful participant of a small group chat. Answer in ") + T().promptLang +
+                    ", briefly: at most 200 characters, plain text, no markdown.";
+  if (!askWith(sys.c_str(), none, fromStd(q.substr(sp + 1)), 150, reply)) {
+    showMsg(String(T().errPrefix) + reply, C_RED);
+    delay(1800);
+    return;
+  }
+  std::string a = tools::prettify(toStd(reply));
+  for (char& c : a)
+    if (c == '\n' || c == '\t') c = ' ';
+  mqWrite(mqtt::publish(roomBase(), mqtt::roomMessage(toStd(roomId) + "-ai", "DeepSeek", mqtt::clip(a, 300))));
+}
+
+bool pickAvatar();                                   // выбрать картинку из галереи и сделать из неё аватарку
+
+void runRoom() {
+  if (inRoom) {                                      // меню открыли с экрана ввода сообщения
+    showMsg(L3("Вы уже в комнате. Допишите сообщение или сотрите его и нажмите OK.", "You are already in the room.", "你已经在房间里了。"), C_YELLOW);
+    delay(1800);
+    return;
+  }
+  if (!waitWifi(false)) return;
+  if (!cfgNick.length() && !askNick()) return;
+  inRoom = true;
+  roomOpen = true;
+  roomUnread = 0;
+  roomUnreadDirty = true;
+  if (!mqUp) {
+    showMsg(L3("Подключаюсь к комнате...", "Joining the room...", "正在进入房间……"), C_YELLOW);
+    mqConnect(6000);
+  }
+  int back = 0;                                      // на сколько строк прокручено вверх
+  roomDirty = true;
+  for (;;) {
+    wifiTick();
+    roomTick();
+    if (roomDirty) {
+      roomDirty = false;
+      drawRoom(back);
+    }
+    uint8_t j = joyEvent();
+    int d = j == J_UP ? 1 : j == J_DOWN ? -1 : j == J_LEFT ? ROWS - 2 : j == J_RIGHT ? -(ROWS - 2) : 0;
+    if (d) {
+      back += d;
+      if (back < 0) back = 0;
+      if (back > 200) back = 200;
+      roomDirty = true;
+    }
+    BtnEvent e = btnEvent();
+    String out;                                      // что отправить
+    if (e == EV_CLICK) {                             // написать сообщение (приём продолжается и во время набора)
+      out = inputText();
+      out.trim();
+      back = 0;
+      roomDirty = true;
+    }
+    if (e == EV_LONG) {
+      std::vector<String> o = splitBar(L3("Вернуться|Быстрый ответ|Кто в комнате|Аватарка|Другая комната|Общая комната|Сменить имя|Сообщения в фоне|Выйти из комнаты",
+                                          "Return|Quick reply|Who is here|Avatar|Another room|Common room|Change name|Background messages|Leave the room",
+                                          "返回|快捷回复|谁在房间|头像|换房间|公共房间|改名字|后台接收消息|离开房间"));
+      std::vector<String> right(o.size());
+      right[7] = cfgRoomBg ? L3("да", "on", "开") : L3("нет", "off", "关");
+      int k = listScreen((String("#") + cfgRoom + " - " + cfgNick).c_str(), o, right, 0);
+      if (k == 8) break;
+      if (k == 1) {
+        std::vector<String> q = splitBar(L3("ок|да|нет|привет|спасибо|сейчас|+1|не знаю|Назад", "ok|yes|no|hi|thanks|one moment|+1|no idea|Back",
+                                            "好|是|不|你好|谢谢|马上|+1|不知道|返回"));
+        int qi = listScreen(L3("Быстрый ответ", "Quick reply", "快捷回复"), q, std::vector<String>(), 0);
+        if (qi >= 0 && qi < (int)q.size() - 1) out = q[(size_t)qi];
+        back = 0;
+      }
+      if (k == 2) {
+        String list = String(cfgNick) + L3(" (вы)", " (you)", "（你）");
+        for (const RoomUser& u : roomUsers)
+          if (millis() - u.seen < 150000UL && u.nick.length()) list += String("\n") + u.nick;
+        viewAnswer(String(L3("Сейчас в комнате:\n\n", "In the room now:\n\n", "现在在房间里：\n\n")) + list, C_WHITE);
+      }
+      if (k == 3) {
+        if (pickAvatar() && mqUp) sendAvatar();
+      }
+      if (k == 4 || k == 5) {
+        String r = ROOM_DEFAULT;
+        if (k == 4) {
+          showMsg(L3("Название комнаты. У всех участников оно должно быть одинаковым.", "Room name. It must be the same for everyone.",
+                     "房间名称。所有人必须输入相同的名称。"), C_YELLOW);
+          delay(1500);
+          r = inputText();
+          r = fromStd(mqtt::clip(mqtt::cleanRoom(toStd(r)), 40));
+        }
+        if (r.length() && r != cfgRoom) {
+          if (mqUp) sendHere(false);
+          cfgRoom = r;
+          saveRoomSettings();
+          roomMsgs.clear();
+          roomUsers.clear();
+          showMsg(L3("Подключаюсь к комнате...", "Joining the room...", "正在进入房间……"), C_YELLOW);
+          mqConnect(6000);
+        }
+      }
+      if (k == 6) {
+        if (askNick() && mqUp) sendHere(true);
+      }
+      if (k == 7) {
+        cfgRoomBg = !cfgRoomBg;
+        saveRoomSettings();
+      }
+      roomDirty = true;
+    }
+    if (out.length()) {
+      if (!roomSend(out)) {
+        pendingInput = out;                          // не отправилось - текст не пропадёт
+        showMsg(L3("Нет связи с комнатой. Сообщение не отправлено, оно останется в поле ввода.",
+                   "No connection to the room. The message was not sent; it stays in the input field.",
+                   "与房间的连接已断开。消息未发送，仍保留在输入框中。"), C_RED);
+        delay(2000);
+        mqDrop();
+        mqLastTry = 0;
+      } else {
+        std::string lo = toStd(out);
+        if (lo.compare(0, 4, "@ai ") == 0 || lo.compare(0, 4, "@AI ") == 0 || lo.compare(0, 6, "@\xD0\xB8\xD0\xB8 ") == 0) roomAskAi(out);
+      }
+      roomDirty = true;
+    }
+    delay(5);
+  }
+  inRoom = false;
+  roomOpen = false;
+  roomUnread = 0;
+  roomUnreadDirty = true;
+  if (!(cfgRoomBg && cfgNick.length())) {            // фон выключен - уходим из комнаты совсем
+    if (mqUp) sendHere(false);
+    mqDrop();
+  }
+}
+
+// ---------- Меню «Инструменты» ----------
+void runTools() {
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items = splitBar(L3("Калькулятор|Википедия|Картинки|Галерея|Погода|Курсы валют|Часы|Таймер|Секундомер|Назад",
+                                            "Calculator|Wikipedia|Images|Gallery|Weather|Exchange rates|Clock|Timer|Stopwatch|Back",
+                                            "计算器|维基百科|图片|相册|天气|汇率|时钟|计时器|秒表|返回"));
+    sel = listScreen(L3("Инструменты", "Tools", "工具"), items, std::vector<String>(), sel);
+    switch (sel) {
+      case 0: runCalc(); break;
+      case 1: runWiki(); break;
+      case 2: runImages(); break;
+      case 3: runGallery(); break;
+      case 4: runWeather(); break;
+      case 5: runRates(); break;
+      case 6: runClock(); break;
+      case 7: runTimer(); break;
+      case 8: runStopwatch(); break;
+      default: return;
+    }
+  }
+}
+
+// ---------- Меню «Настройки» ----------
+// true - поменялся язык или сеть (нужно перерисовать клавиатуру).
+bool runSettings() {
+  bool changed = false;
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Wi-Fi и ключ|Забыть слова|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Wi-Fi and key|Forget words|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|Wi-Fi和密钥|清除词语|返回"));
+    std::vector<String> right;
+    right.push_back(T().langName);
+    right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
+    right.push_back(cfgSound == 0 ? L3("нет", "off", "关") : cfgSound == 1 ? L3("сигналы", "signals", "提示音") : L3("всё", "all", "全部"));
+    static const char* IDLE_RU[] = {"нет", "30 с", "1 мин", "2 мин", "5 мин"};
+    static const char* IDLE_EN[] = {"never", "30 s", "1 min", "2 min", "5 min"};
+    right.push_back(cfgLang == LANG_RU ? IDLE_RU[cfgIdle] : IDLE_EN[cfgIdle]);
+    right.push_back(cfgSaver ? L3("часы", "clock", "时钟") : L3("нет", "off", "关"));
+    right.push_back(String("UTC") + (cfgTz >= 0 ? "+" : "") + String(cfgTz));
+    right.push_back(String((int)netSsid.size()) + L3(" сет.", " net.", " 个"));
+    sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
+    switch (sel) {
+      case 0:
+        cfgLang = (cfgLang + 1) % N_LANGS;
+        saveLang();
+        changed = true;
+        break;
+      case 1:
+        cfgBright = (cfgBright + 1) % 5;
+        applyBrightness();
+        saveScreenSettings();
+        break;
+      case 2:
+        cfgSound = (cfgSound + 1) % 3;
+        saveScreenSettings();
+        sndOk();                                     // сразу слышно, что выбрано
+        break;
+      case 3:
+        cfgIdle = (cfgIdle + 1) % 5;
+        saveScreenSettings();
+        break;
+      case 4:
+        cfgSaver = !cfgSaver;
+        saveScreenSettings();
+        break;
+      case 5:
+        cfgTz = cfgTz >= 12 ? -11 : cfgTz + 1;
+        saveScreenSettings();
+        if (ntpStarted) startNtp();
+        break;
+      case 6:
+        runPortal();
+        netIdx = 0;
+        wifiStart();
+        return true;
+      case 7:
+        sugg.clearLearned();
+        saveLearned();
+        showMsg(T().forgetDone, C_GREEN);
+        delay(1200);
+        break;
+      default:
+        return changed;
+    }
+  }
+}
+
+// ========================= ПОВТОРИ =========================
+games2::simon::Game smn;
+// Кнопки: 0 вверх (зелёная), 1 вправо (красная), 2 вниз (синяя), 3 влево (жёлтая).
+const uint16_t SIMON_TONE[4] = {392, 330, 262, 196};
+void drawSimonPad(int d, bool lit) {
+  static const uint16_t DIM[4] = {0x0320, 0x6000, 0x000C, 0x6300}, LIT[4] = {0x07E0, 0xF800, 0x441F, 0xFFE0};
+  static const int X[4] = {85, 160, 85, 10}, Y[4] = {30, 100, 170, 100};
+  tft.fillRect(X[d], Y[d], 70, 60, lit ? LIT[d] : DIM[d]);
+}
+
+void drawSimonCenter(const char* s, uint16_t col) {
+  tft.fillRect(85, 100, 70, 60, C_BLACK);
+  drawUtf8(s, 120 - textWidth(s) / 2, 118, col, C_BLACK);
+}
+
+void runSimon() {
+  smn.rnd = gameRandom;
+  for (;;) {
+    smn.reset();
+    tft.fillScreen(C_BLACK);
+    for (int d = 0; d < 4; d++) drawSimonPad(d, false);
+    drawSmallCentered(L3("Запомните и повторите", "Watch and repeat", "记住并重复"), 2, C_LIGHT);
+    bool quit = false;
+    while (!smn.over && !quit) {
+      {                                              // показ последовательности
+        KeepAwake awake;
+        char b[8];
+        snprintf(b, sizeof(b), "%d", smn.len);
+        drawSimonCenter(b, C_WHITE);
+        delay(500);
+        for (int i = 0; i < smn.len; i++) {
+          drawSimonPad(smn.seq[i], true);
+          if (cfgSound >= 1 && !screenAsleep) sndTone(SIMON_TONE[smn.seq[i]]);   // у каждой кнопки своя нота
+          delay((uint32_t)smn.showMs());
+          sndTone(0);
+          drawSimonPad(smn.seq[i], false);
+          delay(120);
+          if (btnEvent() == EV_LONG) return;
+        }
+        while (joyRaw() != J_NONE) delay(5);         // ручка должна вернуться в центр
+      }
+      for (;;) {                                     // ответ игрока
+        if (btnEvent() == EV_LONG) return;
+        uint8_t j = joyEvent();
+        if (j != J_NONE && !g_joyRepeated) {
+          int d = j == J_UP ? 0 : j == J_RIGHT ? 1 : j == J_DOWN ? 2 : 3;
+          drawSimonPad(d, true);
+          if (cfgSound >= 1 && !screenAsleep) sndTone(SIMON_TONE[d]);
+          delay(140);
+          sndTone(0);
+          drawSimonPad(d, false);
+          int r = smn.press(d);
+          if (r == 0 || r == 2) break;
+        }
+        delay(2);
+      }
+      if (!smn.over) {
+        drawSimonCenter("OK", C_GREEN);
+        delay(350);
+      }
+    }
+    saveBestKey("bsimon", (uint32_t)smn.score());
+    char b[48];
+    snprintf(b, sizeof(b), T().gameScore, (unsigned)smn.score());
+    if (!resultBox(T().gameOver, b, C_RED)) return;
+  }
+}
+
+// ========================= САПЁР =========================
+games2::mines::Game mns;
+const int MN_CELL = 22, MN_X0 = 21, MN_Y0 = 20;      // поле 9x9: 198x198
+
+void drawMineCell(int x, int y, bool cur) {
+  int px = MN_X0 + x * MN_CELL, py = MN_Y0 + y * MN_CELL;
+  bool open = mns.open[y][x];
+  uint16_t bg = open ? 0x2104 : 0x6B4D;
+  if (open && mns.num[y][x] == games2::mines::MINE) bg = (x == mns.boomX && y == mns.boomY) ? C_RED : 0x2104;
+  tft.fillRect(px, py, MN_CELL - 1, MN_CELL - 1, bg);
+  if (open) {
+    uint8_t n = mns.num[y][x];
+    if (n == games2::mines::MINE) {
+      tft.fillCircle(px + 10, py + 10, 6, C_BLACK);
+      tft.fillRect(px + 8, py + 7, 2, 2, C_WHITE);
+    } else if (n) {
+      static const uint16_t NC[9] = {0, 0x5D7F, 0x07E0, 0xFA08, 0xA2BF, 0xFC00, 0x07FF, 0xFFFF, 0xAD55};
+      SmallFont small;
+      drawCp((uint16_t)('0' + n), px + 7, py + 3, NC[n], bg);
+    }
+  } else if (mns.flag[y][x]) {
+    tft.fillRect(px + 9, py + 4, 2, 14, C_BLACK);
+    tft.fillTriangle(px + 11, py + 4, px + 11, py + 11, px + 17, py + 7, C_RED);
+  } else if (mns.over && !mns.won && mns.num[y][x] == games2::mines::MINE) {
+    tft.fillCircle(px + 10, py + 10, 5, C_BLACK);     // остальные мины после взрыва
+  }
+  if (cur) {
+    tft.drawRect(px, py, MN_CELL - 1, MN_CELL - 1, C_YELLOW);
+    tft.drawRect(px + 1, py + 1, MN_CELL - 3, MN_CELL - 3, C_YELLOW);
+  }
+}
+
+void drawMineBar(uint32_t secs, bool exitSel) {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), "%s %d", L3("Мины:", "Mines:", "雷："), games2::mines::MINES - mns.flags);
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), "%u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
+  drawUtf8(b, 240 - textWidth(b) - 2, 1, C_YELLOW, C_BLACK);
+  tft.fillRect(0, 220, 240, 20, C_BLACK);
+  const char* ex = L3("[ Выход ]", "[ Exit ]", "[ 退出 ]");
+  int w = textWidth(ex);
+  if (exitSel) tft.fillRect(236 - w - 4, 221, w + 8, 18, C_BLUE);
+  drawUtf8(ex, 236 - w, 222, C_WHITE, exitSel ? C_BLUE : C_BLACK);
+  if (!exitSel) drawUtf8(L3("Держать - флажок", "Hold - flag", "长按：插旗"), 2, 222, C_LIGHT, C_BLACK);
+}
+
+void runMines() {
+  mns.rnd = gameRandom;
+  const int W = games2::mines::W, H = games2::mines::H;
+  for (;;) {
+    mns.reset();
+    int cx = 4, cy = 4;                              // cy == H - курсор на кнопке «Выход»
+    uint32_t t0 = 0, shown = 0;
+    tft.fillScreen(C_BLACK);
+    for (int y = 0; y < H; y++)
+      for (int x = 0; x < W; x++) drawMineCell(x, y, x == cx && y == cy);
+    drawMineBar(0, false);
+    while (!mns.over) {
+      uint8_t j = joyEvent();
+      if (j != J_NONE) {
+        int ox = cx, oy = cy;
+        if (j == J_LEFT) cx = (cx + W - 1) % W;
+        if (j == J_RIGHT) cx = (cx + 1) % W;
+        if (j == J_UP) cy = (cy + H) % (H + 1);
+        if (j == J_DOWN) cy = (cy + 1) % (H + 1);
+        if (oy < H) drawMineCell(ox, oy, false);
+        if (cy < H) drawMineCell(cx, cy, true);
+        if ((oy == H) != (cy == H)) drawMineBar(shown, cy == H);
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_CLICK && cy == H) return;
+      if (e == EV_CLICK && cy < H) {
+        bool wasOpen = mns.open[cy][cx];
+        int n = mns.reveal(cx, cy);
+        if (!t0 && mns.placed) t0 = millis();
+        if (n > 1 || wasOpen || mns.over) {
+          for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) drawMineCell(x, y, x == cx && y == cy);
+        } else {
+          drawMineCell(cx, cy, true);
+        }
+      }
+      if (e == EV_LONG && cy < H) {
+        if (mns.toggleFlag(cx, cy)) {
+          drawMineCell(cx, cy, true);
+          drawMineBar(shown, false);
+        }
+      }
+      if (t0 && (millis() - t0) / 1000 != shown) {
+        shown = (millis() - t0) / 1000;
+        drawMineBar(shown, cy == H);
+      }
+      delay(2);
+    }
+    uint32_t secs = t0 ? (millis() - t0) / 1000 : 0;
+    delay(900);
+    char b[48];
+    snprintf(b, sizeof(b), "%u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
+    if (mns.won) saveMinKey("bmines", secs ? secs : 1);
+    if (!resultBox(mns.won ? L3("Победа!", "You win!", "胜利！") : L3("Взрыв!", "Boom!", "爆炸！"), b, mns.won ? C_GREEN : C_RED)) return;
+  }
+}
+
+// ========================= АРКАНОИД =========================
+games2::breakout::Game brk;
+const int BRK_Y = 20;                                // поле начинается под строкой счёта
+
+void drawBrick(int r, int c) {
+  static const uint16_t COL[6] = {0xF800, 0xFC00, 0xFFE0, 0x07E0, 0x07FF, 0x441F};
+  int x = games2::breakout::Game::brickX(c), y = BRK_Y + games2::breakout::Game::brickY(r);
+  uint8_t v = brk.brick[r][c];
+  tft.fillRect(x, y, games2::breakout::BW, games2::breakout::BH, v == 0 ? C_BLACK : v > 1 ? C_WHITE : COL[r]);
+}
+
+// Мяч стёр кусок кирпича - дорисовать кирпичи, которых коснулся прямоугольник.
+void redrawBricksAt(int x, int y, int w, int h) {
+  using namespace games2::breakout;
+  for (int r = 0; r < NROWS; r++)
+    for (int c = 0; c < NCOLS; c++) {
+      if (!brk.brick[r][c]) continue;
+      int bx = Game::brickX(c), by = Game::brickY(r);
+      if (x + w > bx && x < bx + BW && y + h > by && y < by + BH) drawBrick(r, c);
+    }
+}
+
+void drawBrkBar() {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)brk.score);
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), "%s %d  \xE2\x80\xA2%d", L3("Ур.", "Lv.", "关"), brk.level, brk.lives);
+  drawUtf8(b, 240 - textWidth(b) - 2, 1, C_YELLOW, C_BLACK);
+}
+
+void runBreakout() {
+  using namespace games2::breakout;
+  brk.rnd = gameRandom;
+  for (;;) {
+    brk.reset();
+    bool redraw = true;
+    int opx = 0, obx = 0, oby = 0;
+    bool fire = false;
+    uint32_t next = millis();
+    while (!brk.over) {
+      if (redraw) {
+        tft.fillScreen(C_BLACK);
+        drawBrkBar();
+        for (int r = 0; r < NROWS; r++)
+          for (int c = 0; c < NCOLS; c++) drawBrick(r, c);
+        opx = (int)brk.px;
+        obx = (int)brk.bx;
+        oby = (int)brk.by;
+        tft.fillRect(opx, BRK_Y + PY, PW, PH, C_WHITE);
+        tft.fillRect(obx, BRK_Y + oby, BALL, BALL, C_YELLOW);
+        drawSmallCentered(L3("Нажмите - запуск мяча", "Click to launch", "按下发球"), 150, C_LIGHT);
+        redraw = false;
+        next = millis();
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        saveBestKey("bbrk", brk.score);
+        return;
+      }
+      if (e == EV_CLICK) fire = true;                 // нажатие не потеряется между кадрами
+      if ((int32_t)(millis() - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 16;
+      int dx, dy;
+      joyAnalog(dx, dy);
+      float mv = dx / 1500.0f;
+      if (mv > 1) mv = 1;
+      if (mv < -1) mv = -1;
+      if (mv > -0.25f && mv < 0.25f) mv = 0;
+      bool wasStuck = brk.stuck;
+      int res = brk.step(mv, fire);
+      fire = false;
+      if (wasStuck && !brk.stuck) tft.fillRect(0, 150, 240, 16, C_BLACK);
+      if (res == 1) {
+        drawBrick(brk.hitR, brk.hitC);
+        drawBrkBar();
+        beep(1, 1400 + brk.hitR * 120, 8);
+      }
+      if (res == 2 || res == 3) {
+        drawBrkBar();
+        delay(600);
+        redraw = true;
+        continue;
+      }
+      int npx = (int)brk.px, nbx = (int)brk.bx, nby = (int)brk.by;
+      if (npx != opx) {
+        tft.fillRect(opx, BRK_Y + PY, PW, PH, C_BLACK);
+        tft.fillRect(npx, BRK_Y + PY, PW, PH, C_WHITE);
+        opx = npx;
+      }
+      if (nbx != obx || nby != oby) {
+        tft.fillRect(obx, BRK_Y + oby, BALL, BALL, C_BLACK);
+        redrawBricksAt(obx, oby, BALL, BALL);
+        if (oby + BALL >= PY) tft.fillRect(npx, BRK_Y + PY, PW, PH, C_WHITE);
+        if (BRK_Y + nby + BALL <= 240) tft.fillRect(nbx, BRK_Y + nby, BALL, BALL, C_YELLOW);
+        obx = nbx;
+        oby = nby;
+      }
+    }
+    saveBestKey("bbrk", brk.score);
+    if (!gameOverBox(brk.score)) return;
+  }
+}
+
+// ========================= ПРИШЕЛЬЦЫ =========================
+games2::invaders::Game inv;
+const int INV_Y = 20;
+
+void drawAlien(int x, int y, int row, bool on) {
+  using namespace games2::invaders;
+  static const uint16_t COL[4] = {0xF81F, 0x07FF, 0x07E0, 0xFFE0};
+  y += INV_Y;
+  if (!on) {
+    tft.fillRect(x, y, AW, AH, C_BLACK);
+    return;
+  }
+  uint16_t c = COL[row % 4];
+  tft.fillRect(x + 2, y, AW - 4, AH - 3, c);          // тело
+  tft.fillRect(x, y + 3, AW, 3, c);                   // «руки»
+  tft.fillRect(x + 4, y + 2, 2, 2, C_BLACK);          // глаза
+  tft.fillRect(x + AW - 6, y + 2, 2, 2, C_BLACK);
+  tft.fillRect(x + 2, y + AH - 3, 3, 3, c);           // ноги
+  tft.fillRect(x + AW - 5, y + AH - 3, 3, 3, c);
+}
+
+void drawShip(int x, uint16_t col) {
+  using namespace games2::invaders;
+  tft.fillRect(x, INV_Y + SHIPY + 4, SHIPW, SHIPH - 4, col);
+  tft.fillRect(x + SHIPW / 2 - 2, INV_Y + SHIPY, 4, 4, col);
+}
+
+// После стирания выстрела дорисовать пришельца, которого он задел.
+void redrawAliensAt(int x, int y, int w, int h) {
+  using namespace games2::invaders;
+  for (int r = 0; r < AR; r++)
+    for (int c = 0; c < AC; c++) {
+      if (!inv.alive[r][c]) continue;
+      int ax = inv.alienX(c), ay = inv.alienY(r);
+      if (x + w > ax && x < ax + AW && y + h > ay && y < ay + AH) drawAlien(ax, ay, r, true);
+    }
+}
+
+void drawInvBar() {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, 18, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)inv.score);
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), "%s %d  \xE2\x80\xA2%d", L3("Волна", "Wave", "波"), inv.wave, inv.lives);
+  drawUtf8(b, 240 - textWidth(b) - 2, 1, C_YELLOW, C_BLACK);
+}
+
+void runInvaders() {
+  using namespace games2::invaders;
+  inv.rnd = gameRandom;
+  for (;;) {
+    inv.reset();
+    bool redraw = true;
+    int ogx = 0, ogy = 0, osx = 0;
+    bool wasAlive[AR][AC];
+    Shot oshot = {0, 0, false}, obomb[MAXSHOTS];
+    uint32_t next = millis();
+    bool fireHeld = false;
+    while (!inv.over) {
+      if (redraw) {
+        tft.fillScreen(C_BLACK);
+        drawInvBar();
+        for (int r = 0; r < AR; r++)
+          for (int c = 0; c < AC; c++) {
+            wasAlive[r][c] = inv.alive[r][c];
+            if (inv.alive[r][c]) drawAlien(inv.alienX(c), inv.alienY(r), r, true);
+          }
+        ogx = inv.gx;
+        ogy = inv.gy;
+        osx = inv.shipX;
+        drawShip(osx, C_WHITE);
+        oshot.on = false;
+        for (auto& b : obomb) b.on = false;
+        redraw = false;
+        next = millis();
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        saveBestKey("binv", inv.score);
+        return;
+      }
+      if (e == EV_CLICK) fireHeld = true;             // выстрел не потеряется между кадрами
+      if ((int32_t)(millis() - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 33;                                     // 30 кадров в секунду
+      uint8_t raw = joyRaw();
+      int mv = raw == J_LEFT ? -1 : raw == J_RIGHT ? 1 : 0;
+      int res = inv.step(mv, fireHeld);
+      fireHeld = false;
+      if (res == 3 || (res == 2 && !inv.over)) {
+        if (res == 2) {                               // попали в игрока - мигнуть
+          drawShip(osx, C_RED);
+          delay(500);
+        } else {
+          delay(400);
+        }
+        redraw = true;
+        continue;
+      }
+      // выстрел игрока
+      if (oshot.on) {
+        tft.fillRect(oshot.x, INV_Y + oshot.y, 2, 6, C_BLACK);
+        redrawAliensAt(oshot.x, oshot.y, 2, 6);
+      }
+      // сетка пришельцев
+      if (inv.gridMoved) {
+        for (int r = 0; r < AR; r++)
+          for (int c = 0; c < AC; c++)
+            if (wasAlive[r][c]) drawAlien(ogx + c * ASX, ogy + r * ASY, r, false);
+        for (int r = 0; r < AR; r++)
+          for (int c = 0; c < AC; c++) {
+            wasAlive[r][c] = inv.alive[r][c];
+            if (inv.alive[r][c]) drawAlien(inv.alienX(c), inv.alienY(r), r, true);
+          }
+        ogx = inv.gx;
+        ogy = inv.gy;
+      } else if (res == 1) {
+        for (int r = 0; r < AR; r++)
+          for (int c = 0; c < AC; c++)
+            if (wasAlive[r][c] && !inv.alive[r][c]) {
+              drawAlien(inv.alienX(c), inv.alienY(r), r, false);
+              wasAlive[r][c] = false;
+            }
+      }
+      if (res == 1) {
+        drawInvBar();
+        beep(1, 900, 10);
+      }
+      if (inv.shot.on) tft.fillRect(inv.shot.x, INV_Y + inv.shot.y, 2, 6, C_WHITE);
+      oshot = inv.shot;
+      // бомбы
+      for (int i = 0; i < MAXSHOTS; i++) {
+        if (obomb[i].on) {
+          tft.fillRect(obomb[i].x, INV_Y + obomb[i].y, 2, 6, C_BLACK);
+          redrawAliensAt(obomb[i].x, obomb[i].y, 2, 6);
+        }
+        if (inv.bomb[i].on && INV_Y + inv.bomb[i].y + 6 <= 240) tft.fillRect(inv.bomb[i].x, INV_Y + inv.bomb[i].y, 2, 6, C_RED);
+        obomb[i] = inv.bomb[i];
+      }
+      // корабль
+      if (inv.shipX != osx) {
+        drawShip(osx, C_BLACK);
+        osx = inv.shipX;
+      }
+      drawShip(osx, C_WHITE);
+    }
+    saveBestKey("binv", inv.score);
+    if (!gameOverBox(inv.score)) return;
+  }
+}
+
+// ========================= КРЕСТИКИ-НОЛИКИ =========================
+const int TT_X0 = 24, TT_Y0 = 36, TT_CELL = 64;
+
+void drawTttCell(const uint8_t* b, int i, bool cur, uint16_t markCol) {
+  int x = TT_X0 + (i % 3) * TT_CELL, y = TT_Y0 + (i / 3) * TT_CELL;
+  tft.fillRect(x + 2, y + 2, TT_CELL - 4, TT_CELL - 4, cur ? 0x18C3 : C_BLACK);
+  if (cur) tft.drawRect(x + 2, y + 2, TT_CELL - 4, TT_CELL - 4, C_YELLOW);
+  if (b[i] == 1) {                                    // крестик
+    uint16_t c = markCol ? markCol : 0x5D7F;
+    for (int k = -2; k <= 2; k++) {
+      tft.drawLine(x + 14 + k, y + 14, x + TT_CELL - 14 + k, y + TT_CELL - 14, c);
+      tft.drawLine(x + TT_CELL - 14 + k, y + 14, x + 14 + k, y + TT_CELL - 14, c);
+    }
+  } else if (b[i] == 2) {                             // нолик
+    uint16_t c = markCol ? markCol : 0xFA08;
+    tft.fillCircle(x + TT_CELL / 2, y + TT_CELL / 2, 20, c);
+    tft.fillCircle(x + TT_CELL / 2, y + TT_CELL / 2, 15, cur ? 0x18C3 : C_BLACK);
+  }
+}
+
+void runTtt() {
+  std::vector<String> lv = splitBar(L3("Легко|Нормально|Сложно|Назад", "Easy|Normal|Hard|Back", "简单|普通|困难|返回"));
+  int level = listScreen(L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), lv, std::vector<String>(), 1);
+  if (level < 0 || level > 2) return;
+  int wins = 0, losses = 0;
+  bool playerFirst = true;
+  for (;;) {
+    uint8_t b[9] = {0};
+    int cur = 4;
+    tft.fillScreen(C_BLACK);
+    {
+      SmallFont small;
+      char s[64];
+      snprintf(s, sizeof(s), "%s %d : %d %s", T().pongYou, wins, losses, T().pongCpu);
+      drawUtf8(s, (240 - textWidth(s)) / 2, 4, C_WHITE, C_BLACK);
+    }
+    for (int k = 1; k < 3; k++) {                     // сетка
+      tft.fillRect(TT_X0 + k * TT_CELL - 1, TT_Y0, 3, 3 * TT_CELL, C_LIGHT);
+      tft.fillRect(TT_X0, TT_Y0 + k * TT_CELL - 1, 3 * TT_CELL, 3, C_LIGHT);
+    }
+    if (!playerFirst) b[games2::ttt::cpuMove(b, level, gameRandom)] = 2;
+    for (int i = 0; i < 9; i++) drawTttCell(b, i, i == cur, 0);
+    int w = 0;
+    while (!(w = games2::ttt::winner(b))) {
+      uint8_t j = joyEvent();
+      if (j != J_NONE) {
+        int old = cur, x = cur % 3, y = cur / 3;
+        if (j == J_LEFT) x = (x + 2) % 3;
+        if (j == J_RIGHT) x = (x + 1) % 3;
+        if (j == J_UP) y = (y + 2) % 3;
+        if (j == J_DOWN) y = (y + 1) % 3;
+        cur = y * 3 + x;
+        drawTttCell(b, old, false, 0);
+        drawTttCell(b, cur, true, 0);
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) return;
+      if (e == EV_CLICK && !b[cur]) {
+        b[cur] = 1;
+        drawTttCell(b, cur, true, 0);
+        if (games2::ttt::winner(b)) continue;
+        delay(350);
+        int m = games2::ttt::cpuMove(b, level, gameRandom);
+        b[m] = 2;
+        drawTttCell(b, m, m == cur, 0);
+      }
+      delay(2);
+    }
+    int line[3];
+    if (games2::ttt::winLine(b, line))
+      for (int k = 0; k < 3; k++) drawTttCell(b, line[k], false, C_GREEN);
+    delay(900);
+    if (w == 1) {
+      wins++;
+      saveBestKey("bttt", loadBestKey("bttt") + 1);
+    }
+    if (w == 2) losses++;
+    playerFirst = !playerFirst;
+    const char* title = w == 1 ? T().pongWin : w == 2 ? T().pongLose : L3("Ничья", "Draw", "平局");
+    char s[24];
+    snprintf(s, sizeof(s), "%d : %d", wins, losses);
+    if (!resultBox(title, s, w == 1 ? C_GREEN : w == 2 ? C_RED : C_YELLOW)) return;
+  }
+}
+
+// ========================= РЕКОРДЫ ИГРОКОВ =========================
+// Лучшие результаты хранятся на сервере комнаты («сохраняемые» сообщения), по одному на игрока и игру:
+// dspocket/v1/hs/<игра>/<метка>  =  «имя \t число».
+struct HiScore {
+  String key, id, nick;
+  uint32_t value;
+};
+std::vector<HiScore> hiScores;
+const char* const HS_KEYS[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "bbrk", "binv",
+                               "bmines", "bsimon", "bttt", "bchess", "brider", "bquiz", "bguess"};
+const int HS_COUNT = sizeof(HS_KEYS) / sizeof(HS_KEYS[0]);
+
+bool hsLowerBetter(const String& key) { return key == "bmem" || key == "bmines"; }
+
+// Отправить свои рекорды на сервер (после подключения и когда рекорд обновился).
+void hsPublishAll() {
+  hsDirty = false;
+  if (!mqUp || !cfgNick.length()) return;
+  for (int i = 0; i < HS_COUNT; i++) {
+    uint32_t v = loadBestKey(HS_KEYS[i]);
+    if (!v) continue;
+    char b[16];
+    snprintf(b, sizeof(b), "%u", (unsigned)v);
+    mqWrite(mqtt::publishRetained(std::string("dspocket/v1/hs/") + HS_KEYS[i] + "/" + toStd(roomId), toStd(cfgNick) + "\t" + b));
+  }
+}
+
+// Пришёл чей-то рекорд: «<игра>/<метка>» и «имя \t число».
+void hsReceive(const std::string& rest, const std::string& payload) {
+  size_t sl = rest.find('/'), tab = payload.find('\t');
+  if (sl == std::string::npos || sl == 0 || sl > 10 || rest.size() - sl - 1 > 16 || rest.size() == sl + 1 || tab == std::string::npos) return;
+  String key = fromStd(rest.substr(0, sl)), id = fromStd(rest.substr(sl + 1));
+  uint32_t v = (uint32_t)strtoul(payload.c_str() + tab + 1, nullptr, 10);
+  if (!v) return;
+  String nick = fromStd(mqtt::clip(payload.substr(0, tab), 24));
+  for (HiScore& h : hiScores)
+    if (h.key == key && h.id == id) {
+      h.nick = nick;
+      h.value = v;
+      return;
+    }
+  if (hiScores.size() >= 150) return;                // защита памяти
+  HiScore h;
+  h.key = key;
+  h.id = id;
+  h.nick = nick;
+  h.value = v;
+  hiScores.push_back(h);
+}
+
+const char* gameTitle(const char* key);              // название игры по ключу рекорда
+
+void runHiScores() {
+  if (!waitWifi(false)) return;
+  if (!cfgNick.length() && !askNick()) return;
+  if (!mqUp) {
+    showMsg(L3("Загружаю рекорды...", "Loading records...", "正在加载记录……"), C_YELLOW);
+    mqConnect(6000);
+  }
+  if (!mqUp) {
+    viewAnswer(L3("Нет связи с сервером рекордов. Попробуйте позже.", "No connection to the records server. Try later.", "无法连接记录服务器。请稍后再试。"), C_RED);
+    return;
+  }
+  hsPublishAll();
+  uint32_t t0 = millis();
+  while (millis() - t0 < 1500) {                     // даём серверу прислать сохранённые рекорды
+    mqPoll();
+    delay(20);
+  }
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items, right;
+    for (int i = 0; i < HS_COUNT; i++) {
+      items.push_back(gameTitle(HS_KEYS[i]));
+      int n = 0;
+      for (const HiScore& h : hiScores)
+        if (h.key == HS_KEYS[i]) n++;
+      right.push_back(n ? String(n) : String(""));
+    }
+    items.push_back(T().menuBack);
+    sel = listScreen(L3("Рекорды игроков", "Players' records", "玩家记录"), items, right, sel);
+    if (sel < 0 || sel >= HS_COUNT) return;
+    mqPoll();
+    String key = HS_KEYS[sel];
+    std::vector<int> idx;
+    for (size_t i = 0; i < hiScores.size(); i++)
+      if (hiScores[i].key == key) idx.push_back((int)i);
+    bool low = hsLowerBetter(key);
+    for (size_t a = 1; a < idx.size(); a++)             // сортировка: лучший сверху
+      for (size_t b = a; b > 0; b--) {
+        uint32_t x = hiScores[(size_t)idx[b - 1]].value, y = hiScores[(size_t)idx[b]].value;
+        if (low ? x > y : x < y) std::swap(idx[b - 1], idx[b]);
+        else break;
+      }
+    if (idx.empty()) {
+      viewAnswer(L3("В этой игре рекордов пока нет. Сыграйте - и ваш результат появится здесь.", "No records in this game yet. Play - and your result will appear here.",
+                    "这个游戏还没有记录。玩一局，你的成绩就会出现在这里。"), C_YELLOW);
+      continue;
+    }
+    std::vector<String> rows, vals;
+    for (size_t i = 0; i < idx.size() && i < 20; i++) {
+      const HiScore& h = hiScores[(size_t)idx[i]];
+      rows.push_back(String((int)i + 1) + ". " + h.nick + (h.id == roomId ? " *" : ""));
+      vals.push_back(String((unsigned)h.value));
+    }
+    listScreen(gameTitle(HS_KEYS[sel]), rows, vals, 0);
+  }
+}
+
+// ========================= РАЙДЕР =========================
+rider::Game rdr;
+const uint16_t C_RD_SKY = 0x1926, C_RD_GROUND = 0x3D03;
+const int RD_BIKE_X = 70, RD_TOP = 18;
+
+void drawRiderBar() {
+  SmallFont small;
+  tft.fillRect(0, 0, 240, RD_TOP, C_BLACK);
+  char b[48];
+  snprintf(b, sizeof(b), T().gameScore, (unsigned)rdr.score());
+  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  snprintf(b, sizeof(b), "%d %s", (rdr.timeLeft + rider::FPS - 1) / rider::FPS, L3("с", "s", "秒"));
+  drawUtf8(b, 240 - textWidth(b) - 2, 1, rdr.timeLeft < 10 * rider::FPS ? C_RED : C_YELLOW, C_BLACK);
+}
+
+// Мотоцикл: два колеса, рама и голова гонщика. col = цвет неба - стереть.
+void drawBike(int sx, int sy, float angle, bool erase) {
+  float c = cosf(angle), s = sinf(angle);
+  int wx = (int)(7 * c), wy = (int)(7 * s);              // колёса вдоль наклона
+  int ux = (int)(9 * s), uy = (int)(-9 * c);             // «вверх» от мотоцикла
+  int cy = sy - 4;                                        // центр колёс чуть выше земли
+  if (cy - 16 < RD_TOP) return;                           // под строкой счёта не рисуем
+  if (erase) {
+    tft.fillRect(sx - 14, cy - 16, 29, 30, C_RD_SKY);
+    return;
+  }
+  tft.fillCircle(sx - wx, cy - wy, 4, C_WHITE);
+  tft.fillCircle(sx + wx, cy + wy, 4, C_WHITE);
+  tft.fillCircle(sx - wx, cy - wy, 2, C_BLACK);
+  tft.fillCircle(sx + wx, cy + wy, 2, C_BLACK);
+  tft.drawLine(sx - wx, cy - wy, sx + wx, cy + wy, C_YELLOW);
+  tft.drawLine(sx - wx, cy - wy, sx + ux / 2, cy + uy / 2, C_YELLOW);
+  tft.drawLine(sx + wx, cy + wy, sx + ux / 2, cy + uy / 2, C_YELLOW);
+  tft.fillCircle(sx + ux, cy + uy, 3, C_RED);
+}
+
+void runRider() {
+  static int16_t col[240];                             // высота земли в каждом столбце экрана
+  rdr.best = loadBestKey("brider");
+  for (;;) {
+    rdr.reset();
+    tft.fillScreen(C_RD_SKY);
+    float camX = rdr.x - RD_BIKE_X;
+    for (int sx = 0; sx < 240; sx++) {
+      int gy = (int)rider::ground(camX + sx);
+      col[sx] = (int16_t)gy;
+      tft.fillRect(sx, gy, 1, 240 - gy, C_RD_GROUND);
+    }
+    drawRiderBar();
+    drawSmallCenteredBg(L3("Ручку в сторону - газ", "Push the stick - gas", "推摇杆：油门"), 26, C_WHITE, C_RD_SKY);
+    drawSmallCenteredBg(L3("В воздухе газ = сальто", "In the air gas = flip", "空中油门=翻转"), 44, C_WHITE, C_RD_SKY);
+    int obx = RD_BIKE_X, oby = (int)rdr.y;
+    float oang = rdr.angle;
+    drawBike(obx, oby, oang, false);
+    while (joyRaw() == J_NONE) {                        // старт по первому движению ручки
+      if (btnEvent() == EV_LONG) return;
+      delay(5);
+    }
+    tft.fillRect(0, 26, 240, 36, C_RD_SKY);
+    uint32_t next = millis();
+    int frame = 0, msgFrames = 0;
+    while (!rdr.over) {
+      if (btnEvent() == EV_LONG) {
+        saveBestKey("brider", rdr.best);
+        return;
+      }
+      if ((int32_t)(millis() - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 1000 / rider::FPS;
+      int dx, dy;
+      joyAnalog(dx, dy);
+      bool gas = dx > 900 || dx < -900 || dy > 900 || dy < -900;
+      int res = rdr.step(gas);
+      if (res == 1) beep(1, 1000, 6);
+      if (res == 2) beep(1, rdr.lastFlips ? 1700 : 500, rdr.lastFlips ? 40 : 8);
+      // стереть мотоцикл, сдвинуть землю, нарисовать мотоцикл
+      drawBike(obx, oby, oang, true);
+      camX = rdr.x - RD_BIKE_X;
+      for (int sx = 0; sx < 240; sx++) {
+        int gy = (int)rider::ground(camX + sx);
+        int py = col[sx];
+        bool inBike = sx >= obx - 14 && sx <= obx + 14;   // здесь только что стирали - дорисовать землю целиком
+        if (inBike) {
+          int top = gy < oby - 20 ? oby - 20 : gy;
+          if (top < oby + 10) tft.fillRect(sx, top, 1, oby + 10 - top, C_RD_GROUND);
+        }
+        if (gy < py) tft.fillRect(sx, gy, 1, py - gy, C_RD_GROUND);
+        else if (gy > py) tft.fillRect(sx, py, 1, gy - py, C_RD_SKY);
+        col[sx] = (int16_t)gy;
+      }
+      obx = RD_BIKE_X;
+      oby = (int)rdr.y;
+      oang = rdr.angle;
+      drawBike(obx, oby, oang, false);
+      if (res == 2 && rdr.lastFlips) {
+        char b[32];
+        snprintf(b, sizeof(b), "%s x%d  +2 %s", L3("Сальто", "Flip", "翻转"), rdr.lastFlips, L3("с", "s", "秒"));
+        drawSmallCenteredBg(b, 26, C_YELLOW, C_RD_SKY);
+        msgFrames = rider::FPS;
+      } else if (msgFrames && --msgFrames == 0) {
+        tft.fillRect(0, 26, 240, 16, C_RD_SKY);
+      }
+      if (++frame % 6 == 0) drawRiderBar();
+    }
+    saveBestKey("brider", rdr.best);
+    drawRiderBar();
+    delay(500);
+    char b[48];
+    snprintf(b, sizeof(b), T().gameScore, (unsigned)rdr.score());
+    if (!resultBox(rdr.crashed ? L3("Авария!", "Crash!", "摔车！") : L3("Время вышло", "Time is up", "时间到"), b, rdr.crashed ? C_RED : C_YELLOW)) return;
+  }
+}
+
+// ========================= КРЕСТИКИ-НОЛИКИ ПО СЕТИ =========================
+// Два гаджета в одной комнате находят друг друга сами. Сообщения идут в <комната>/g:
+// «метка \t имя \t ttt \t команда \t кому \t число».
+void netSend(const String& body) {
+  mqWrite(mqtt::publish(roomBase() + "/g", toStd(roomId) + "\t" + toStd(cfgNick) + "\t" + toStd(body)));
+}
+
+// Разобрать очередное сообщение игры. false - очередь пуста.
+bool netNext(String& id, String& nick, String& game, String& cmd, String& peer, int& arg) {
+  while (!netInbox.empty()) {
+    std::string m = netInbox.front();
+    netInbox.erase(netInbox.begin());
+    std::vector<std::string> f;
+    size_t p = 0;
+    for (;;) {
+      size_t e = m.find('\t', p);
+      f.push_back(m.substr(p, e == std::string::npos ? std::string::npos : e - p));
+      if (e == std::string::npos) break;
+      p = e + 1;
+    }
+    if (f.size() < 4 || f[0].empty() || f[0].size() > 16 || f[0] == toStd(roomId)) continue;
+    id = fromStd(f[0]);
+    nick = fromStd(mqtt::clip(f[1], 24));
+    game = fromStd(f[2]);
+    cmd = fromStd(f[3]);
+    peer = f.size() > 4 ? fromStd(f[4]) : String("");
+    arg = f.size() > 5 ? atoi(f[5].c_str()) : -1;
+    return true;
+  }
+  return false;
+}
+
+void runTttNet() {
+  if (inRoom) return;
+  if (!waitWifi(false)) return;
+  if (!cfgNick.length() && !askNick()) return;
+  if (!mqUp) {
+    showMsg(L3("Подключаюсь...", "Connecting...", "正在连接……"), C_YELLOW);
+    mqConnect(6000);
+  }
+  inRoom = true;                                     // связь поддерживается, пока идёт игра
+  struct Leave {
+    ~Leave() {
+      inRoom = false;
+      if (!(cfgRoomBg && cfgNick.length())) mqDrop();
+    }
+  } leave;
+  int wins = 0, losses = 0, round = 0;
+  for (;;) {
+    // --- поиск соперника ---
+    String peer, peerNick;
+    bool host = false, iAmX = true;
+    netInbox.clear();
+    showMsg(String(L3("Ищу соперника в комнате #", "Looking for an opponent in room #", "正在房间里寻找对手 #")) + cfgRoom +
+            L3(". Пусть друг тоже откроет «Крестики по сети». Держать - выход.", ". Ask a friend to open Tic-tac-toe online too. Hold - exit.",
+               "。请朋友也打开“联网井字棋”。长按：退出。"), C_YELLOW);
+    uint32_t lastSeek = 0;
+    while (!peer.length()) {
+      if (btnEvent() == EV_LONG) return;
+      wifiTick();
+      roomTick();
+      if (mqUp && millis() - lastSeek > 2000) {
+        lastSeek = millis();
+        netSend("ttt\tseek");
+      }
+      String id, nick, game, cmd, to;
+      int arg;
+      while (netNext(id, nick, game, cmd, to, arg)) {
+        if (game != "ttt") continue;
+        if (cmd == "seek" && strcmp(roomId.c_str(), id.c_str()) < 0) {   // у кого метка меньше - тот начинает игру
+          peer = id;
+          peerNick = nick;
+          host = true;
+          iAmX = round % 2 == 0;                     // право первого хода чередуется
+          netSend(String("ttt\tstart\t") + peer + "\t" + (iAmX ? "1" : "0"));
+          break;
+        }
+        if (cmd == "start" && to == roomId) {
+          peer = id;
+          peerNick = nick;
+          iAmX = arg == 0;
+          break;
+        }
+      }
+      delay(10);
+    }
+    sndOk();
+    // --- партия ---
+    uint8_t b[9] = {0};
+    int cur = 4, mine = iAmX ? 1 : 2;
+    bool myTurn = iAmX;
+    uint32_t lastHeard = millis();
+    auto status = [&]() {
+      SmallFont small;
+      tft.fillRect(0, 0, 240, 30, C_BLACK);
+      char s[80];
+      snprintf(s, sizeof(s), "%s %d : %d %s", cfgNick.c_str(), wins, losses, peerNick.c_str());
+      drawUtf8(s, (240 - textWidth(s)) / 2 < 0 ? 0 : (240 - textWidth(s)) / 2, 0, C_WHITE, C_BLACK);
+      const char* t = myTurn ? L3("Ваш ход", "Your move", "轮到你") : L3("Ход соперника...", "Opponent's move...", "对手走棋……");
+      drawUtf8(t, (240 - textWidth(t)) / 2, 16, myTurn ? C_GREEN : C_YELLOW, C_BLACK);
+    };
+    tft.fillScreen(C_BLACK);
+    for (int k = 1; k < 3; k++) {
+      tft.fillRect(TT_X0 + k * TT_CELL - 1, TT_Y0, 3, 3 * TT_CELL, C_LIGHT);
+      tft.fillRect(TT_X0, TT_Y0 + k * TT_CELL - 1, 3 * TT_CELL, 3, C_LIGHT);
+    }
+    for (int i = 0; i < 9; i++) drawTttCell(b, i, i == cur, 0);
+    status();
+    int w = 0;
+    bool gone = false;
+    while (!(w = games2::ttt::winner(b)) && !gone) {
+      wifiTick();
+      roomTick();
+      String id, nick, game, cmd, to;
+      int arg;
+      while (netNext(id, nick, game, cmd, to, arg)) {
+        if (game != "ttt" || id != peer) continue;
+        lastHeard = millis();
+        if (cmd == "bye") gone = true;
+        if (cmd == "move" && to == roomId && !myTurn && arg >= 0 && arg < 9 && !b[arg]) {
+          b[arg] = (uint8_t)(3 - mine);
+          drawTttCell(b, arg, arg == cur, 0);
+          myTurn = true;
+          beep(1, 700, 40);
+          status();
+        }
+      }
+      if (millis() - lastHeard > 120000UL || (!mqUp && millis() - lastHeard > 30000UL)) gone = true;
+      uint8_t j = joyEvent();
+      if (j != J_NONE) {
+        int old = cur, x = cur % 3, y = cur / 3;
+        if (j == J_LEFT) x = (x + 2) % 3;
+        if (j == J_RIGHT) x = (x + 1) % 3;
+        if (j == J_UP) y = (y + 2) % 3;
+        if (j == J_DOWN) y = (y + 1) % 3;
+        cur = y * 3 + x;
+        drawTttCell(b, old, false, 0);
+        drawTttCell(b, cur, true, 0);
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        netSend(String("ttt\tbye\t") + peer);
+        return;
+      }
+      if (e == EV_CLICK && myTurn && !b[cur]) {
+        b[cur] = (uint8_t)mine;
+        drawTttCell(b, cur, true, 0);
+        netSend(String("ttt\tmove\t") + peer + "\t" + String(cur));
+        myTurn = false;
+        lastHeard = millis();
+        status();
+      }
+      delay(5);
+    }
+    round++;
+    if (gone) {
+      showMsg(L3("Соперник вышел из игры.", "The opponent has left.", "对手已离开。"), C_YELLOW);
+      delay(1800);
+      continue;
+    }
+    int line[3];
+    if (games2::ttt::winLine(b, line))
+      for (int k = 0; k < 3; k++) drawTttCell(b, line[k], false, C_GREEN);
+    delay(900);
+    bool won = w == mine, draw = w == 3;
+    if (won) wins++;
+    else if (!draw) losses++;
+    char s[24];
+    snprintf(s, sizeof(s), "%d : %d", wins, losses);
+    if (!resultBox(won ? T().pongWin : draw ? L3("Ничья", "Draw", "平局") : T().pongLose, s, won ? C_GREEN : draw ? C_YELLOW : C_RED)) {
+      netSend(String("ttt\tbye\t") + peer);
+      return;
+    }
+  }
+}
+
+// ========================= ШАХМАТЫ =========================
+// Игрок - белые (внизу). Соперник - DeepSeek (если есть интернет) или сама плата.
+chess::Board chs;
+chess::Engine chsEng;
+const int CH_CELL = 27, CH_X0 = 16;                 // доска 216x216, слева цифры рядов
+const uint16_t C_SQ_LIGHT = 0xEE54, C_SQ_DARK = 0x7CAB, C_SQ_LAST = 0xCE60;
+
+void chessPause() { delay(1); }
+
+// Клетка: фон, отметки, фигура. mark: 0 - нет, 1 - сюда можно пойти, 2 - курсор, 4 - выбрана, 8 - последний ход.
+void drawChessSquare(int s, int mark) {
+  int r = s >> 3, f = s & 7;
+  int x = CH_X0 + f * CH_CELL, y = (7 - r) * CH_CELL;
+  uint16_t bg = (mark & 8) ? C_SQ_LAST : ((r + f) & 1) ? C_SQ_LIGHT : C_SQ_DARK;
+  tft.fillRect(x, y, CH_CELL, CH_CELL, bg);
+  int8_t p = chs.sq[s];
+  if (p) {
+    int a = (p < 0 ? -p : p) - 1;
+    uint16_t fill = p > 0 ? C_WHITE : C_BLACK, edge = p > 0 ? C_BLACK : 0xAD55;
+    for (int row = 0; row < 24; row++) {
+      uint32_t fm = ((uint32_t)pgm_read_byte(&CHESS_FILL[a][row * 3]) << 16) | ((uint32_t)pgm_read_byte(&CHESS_FILL[a][row * 3 + 1]) << 8) |
+                    pgm_read_byte(&CHESS_FILL[a][row * 3 + 2]);
+      uint32_t om = ((uint32_t)pgm_read_byte(&CHESS_OUTLINE[a][row * 3]) << 16) |
+                    ((uint32_t)pgm_read_byte(&CHESS_OUTLINE[a][row * 3 + 1]) << 8) | pgm_read_byte(&CHESS_OUTLINE[a][row * 3 + 2]);
+      for (int c = 0; c < 24; c++) {
+        uint32_t bit = 0x800000UL >> c;
+        cbuf[row * 24 + c] = (fm & bit) ? fill : (om & bit) ? edge : bg;
+      }
+    }
+    blit(x + 1, y + 2, 24, 24);
+  }
+  if (mark & 1) {
+    if (p) {
+      tft.drawRect(x + 1, y + 1, CH_CELL - 2, CH_CELL - 2, C_RED);
+      tft.drawRect(x + 2, y + 2, CH_CELL - 4, CH_CELL - 4, C_RED);
+    } else {
+      tft.fillCircle(x + CH_CELL / 2, y + CH_CELL / 2, 4, 0x39E7);
+    }
+  }
+  if (mark & 6) {
+    uint16_t c = (mark & 2) ? C_YELLOW : 0x07E0;
+    tft.drawRect(x, y, CH_CELL, CH_CELL, c);
+    tft.drawRect(x + 1, y + 1, CH_CELL - 2, CH_CELL - 2, c);
+    if ((mark & 6) == 6) tft.drawRect(x + 2, y + 2, CH_CELL - 4, CH_CELL - 4, 0x07E0);
+  }
+}
+
+void chessStatus(const String& s, uint16_t col) {
+  SmallFont small;
+  tft.fillRect(0, 216, 240, 24, C_BLACK);
+  drawUtf8(s.c_str(), 2, 221, col, C_BLACK);
+}
+
+void saveChess(int opp) {
+  prefs.begin("dsk", false);
+  prefs.putString("chfen", fromStd(chs.fen()));
+  prefs.putUChar("chopp", (uint8_t)opp);
+  prefs.end();
+}
+
+void clearChess() {
+  prefs.begin("dsk", false);
+  prefs.remove("chfen");
+  prefs.end();
+}
+
+// Ход соперника. opp: 0 - DeepSeek, 1..3 - плата (легко, нормально, сложно). say - что показать в строке внизу.
+chess::Move chessOpponentMove(int opp, String& say) {
+  chess::Move list[chess::MAX_MOVES];
+  int n = chs.legal(list);
+  if (!n) return 0;
+  chsEng.pause = chessPause;
+  chsEng.rnd = gameRandom;
+  if (opp == 0 && wifiOk() && cfgKey.length()) {
+    chessStatus(L3("DeepSeek думает...", "DeepSeek is thinking...", "DeepSeek思考中……"), C_YELLOW);
+    std::string sys = std::string("You are playing chess as Black against a human. You get the position in FEN and the list of "
+                                  "legal moves. Choose a strong move. Reply in exactly this format:\nMOVE: one move copied from "
+                                  "the list\nSAY: a short remark about your move in ") + T().promptLang + ", at most 20 characters\nNo other text.";
+    std::string q = "FEN: " + chs.fen() + "\nLegal moves:";
+    for (int i = 0; i < n; i++) q += " " + chess::moveStr(list[i]);
+    std::vector<ChatMsg> none;
+    for (int attempt = 0; attempt < 2; attempt++) {
+      String reply;
+      if (!askWith(sys.c_str(), none, fromStd(q), 60, reply)) break;
+      std::string r = toStd(reply);
+      size_t sp = r.find("SAY");
+      chess::Move m = chess::findMove(sp == std::string::npos ? r : r.substr(0, sp), list, n);
+      if (m) {
+        std::string remark;
+        if (sp != std::string::npos) {
+          size_t a = sp + 3;
+          while (a < r.size() && (r[a] == ':' || r[a] == ' ')) a++;
+          size_t e = r.find('\n', a);
+          remark = r.substr(a, e == std::string::npos ? std::string::npos : e - a);
+        }
+        say = String("DS ") + chess::moveStr(m).c_str() + (remark.empty() ? "" : ": ") + remark.c_str();
+        noteActivity();
+        return m;
+      }
+      q += "\nYour previous answer did not contain a legal move. Copy one move exactly from the list.";
+    }
+    say = L3("DeepSeek молчит - ходит плата", "DeepSeek failed, board moves", "DeepSeek没有回应，由设备走棋");
+  } else if (opp == 0) {
+    say = L3("Нет интернета - ходит плата", "No internet, board moves", "没有网络，由设备走棋");
+  }
+  if (opp != 0) chessStatus(L3("Плата думает...", "The board is thinking...", "设备思考中……"), C_YELLOW);
+  int level = opp == 0 ? 2 : opp;
+  chess::Move m = chsEng.best(chs, level, level == 1 ? 60 : 10);
+  if (opp != 0) say = String(L3("Плата: ", "Board: ", "设备：")) + chess::moveStr(m).c_str();
+  noteActivity();
+  return m;
+}
+
+void runChess() {
+  int opp = 2;
+  prefs.begin("dsk", true);
+  String saved = prefs.getString("chfen", "");
+  opp = prefs.getUChar("chopp", 2);
+  prefs.end();
+  bool cont = false;
+  if (saved.length() && chs.setFen(toStd(saved)) && chs.white && chs.result() == chess::PLAYING) {
+    std::vector<String> o = splitBar(L3("Продолжить партию|Новая партия|Назад", "Continue the game|New game|Back", "继续对局|新对局|返回"));
+    int k = choiceScreen(L3("Шахматы", "Chess", "国际象棋"), o);
+    if (k < 0 || k == 2) return;
+    cont = k == 0;
+  }
+  for (;;) {                                         // одна партия
+    if (!cont) {
+      std::vector<String> o = splitBar(L3("DeepSeek|Плата: легко|Плата: нормально|Плата: сложно|Назад",
+                                          "DeepSeek|Board: easy|Board: normal|Board: hard|Back", "DeepSeek|设备：简单|设备：普通|设备：困难|返回"));
+      int k = listScreen(L3("Соперник", "Opponent", "对手"), o, std::vector<String>(), opp);
+      if (k < 0 || k > 3) return;
+      opp = k;
+      chs.reset();
+      saveChess(opp);
+    }
+    cont = false;
+    int cur = 12, sel = -1, lastFrom = -1, lastTo = -1;   // курсор на e2
+    uint64_t targets = 0;
+    chess::Move legal[chess::MAX_MOVES];
+    int nLegal = chs.legal(legal);
+    auto markOf = [&](int s) {
+      return ((targets >> s) & 1 ? 1 : 0) | (s == cur ? 2 : 0) | (s == sel ? 4 : 0) | ((s == lastFrom || s == lastTo) ? 8 : 0);
+    };
+    auto drawAll = [&]() {
+      tft.fillRect(0, 0, CH_X0, 216, C_BLACK);
+      tft.fillRect(CH_X0 + 216, 0, 240 - CH_X0 - 216, 216, C_BLACK);
+      {
+        SmallFont small;
+        for (int r = 0; r < 8; r++) drawCp((uint16_t)('1' + r), 4, (7 - r) * CH_CELL + 6, C_LIGHT, C_BLACK);
+      }
+      for (int s = 0; s < 64; s++) drawChessSquare(s, markOf(s));
+    };
+    auto yourTurn = [&]() {
+      if (chs.inCheck(true)) chessStatus(L3("Вам шах!", "You are in check!", "将军！"), C_RED);
+    };
+    tft.fillScreen(C_BLACK);
+    drawAll();
+    chessStatus(L3("Ваш ход. Держать - меню", "Your move. Hold - menu", "轮到你。长按：菜单"), C_LIGHT);
+    yourTurn();
+    chess::Result res = chs.result();
+    bool again = false;
+    while (res == chess::PLAYING) {
+      uint8_t j = joyEvent();
+      if (j != J_NONE) {
+        int old = cur, r = cur >> 3, f = cur & 7;
+        if (j == J_LEFT) f = (f + 7) % 8;
+        if (j == J_RIGHT) f = (f + 1) % 8;
+        if (j == J_UP) r = (r + 1) % 8;
+        if (j == J_DOWN) r = (r + 7) % 8;
+        cur = r * 8 + f;
+        drawChessSquare(old, markOf(old));
+        drawChessSquare(cur, markOf(cur));
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        std::vector<String> o = splitBar(L3("Продолжить|Новая партия|Выйти (партия сохранится)", "Continue|New game|Exit (the game is saved)",
+                                            "继续|新对局|退出（对局已保存）"));
+        int k = choiceScreen(L3("Шахматы", "Chess", "国际象棋"), o);
+        if (k == 2) return;
+        if (k == 1) {
+          again = true;
+          break;
+        }
+        tft.fillScreen(C_BLACK);
+        drawAll();
+        chessStatus(L3("Ваш ход (белые)", "Your move (White)", "轮到你（白方）"), C_LIGHT);
+        yourTurn();
+      }
+      if (e == EV_CLICK) {
+        if (sel >= 0 && ((targets >> cur) & 1)) {      // ход игрока
+          chess::Move mv = 0;
+          for (int i = 0; i < nLegal; i++)
+            if (chess::mFrom(legal[i]) == sel && chess::mTo(legal[i]) == cur &&
+                (!chess::mPromo(legal[i]) || chess::mPromo(legal[i]) == chess::QUEEN))
+              mv = legal[i];
+          chess::Undo u;
+          chs.make(mv, u);
+          lastFrom = sel;
+          lastTo = cur;
+          sel = -1;
+          targets = 0;
+          drawAll();
+          res = chs.result();
+          if (res != chess::PLAYING) break;
+          String say;
+          chess::Move om = chessOpponentMove(opp, say);  // ответ соперника
+          if (om) {
+            chs.make(om, u);
+            lastFrom = chess::mFrom(om);
+            lastTo = chess::mTo(om);
+          }
+          saveChess(opp);
+          nLegal = chs.legal(legal);
+          drawAll();
+          chessStatus(say, 0x07FF);
+          beep(1, 700, 40);
+          res = chs.result();
+          if (res == chess::PLAYING && chs.inCheck(true)) {
+            delay(900);
+            yourTurn();
+          }
+          while (btnEvent() != EV_NONE) delay(5);         // нажатия во время раздумий не считаются
+        } else if (chs.sq[cur] > 0 && cur != sel) {     // выбрать свою фигуру
+          uint64_t t = 0;
+          for (int i = 0; i < nLegal; i++)
+            if (chess::mFrom(legal[i]) == cur) t |= 1ULL << chess::mTo(legal[i]);
+          if (t) {
+            sel = cur;
+            targets = t;
+            drawAll();
+          } else {
+            chessStatus(L3("Этой фигурой сейчас не пойти", "This piece cannot move now", "这个棋子现在不能走"), C_YELLOW);
+          }
+        } else if (sel >= 0) {                          // снять выбор
+          sel = -1;
+          targets = 0;
+          drawAll();
+        }
+      }
+      delay(2);
+    }
+    if (again) {
+      clearChess();
+      continue;
+    }
+    clearChess();
+    delay(700);
+    const char* title;
+    uint16_t col = C_YELLOW;
+    if (res == chess::MATE_WHITE_WINS) {
+      title = L3("Мат! Вы победили", "Checkmate! You win", "将死！你赢了");
+      col = C_GREEN;
+      saveBestKey("bchess", loadBestKey("bchess") + 1);
+    } else if (res == chess::MATE_BLACK_WINS) {
+      title = L3("Вам мат", "Checkmate. You lose", "你被将死了");
+      col = C_RED;
+    } else if (res == chess::STALEMATE) {
+      title = L3("Пат - ничья", "Stalemate - draw", "逼和");
+    } else {
+      title = L3("Ничья", "Draw", "和棋");
+    }
+    char b[32];
+    snprintf(b, sizeof(b), "%s %u", L3("Ходов:", "Moves:", "回合："), (unsigned)chs.full);
+    if (!resultBox(title, b, col)) return;
+  }
+}
+
+// ========================= ИГРЫ С DEEPSEEK =========================
+
+// Тема/жанр/категория: из списка или своя (набрать на клавиатуре). Пустая строка - выход.
+String chooseTopic(const char* title, const char* list) {
+  std::vector<String> items = splitBar(list);
+  int k = listScreen(title, items, std::vector<String>(), 0);
+  if (k < 0) return "";
+  if (k == (int)items.size() - 1) {                  // «Своя тема...»
+    showMsg(T().typeTopic, C_YELLOW);
+    delay(1200);
+    String t = inputText();
+    t.trim();
+    return t;
+  }
+  return items[(size_t)k];
+}
+
+// Запрос с одной повторной попыткой, если DeepSeek ответил не по формату.
+// parse(reply) возвращает true, если ответ подходит. false - ошибка (уже показана).
+bool askGame(const std::string& system, const std::vector<ChatMsg>& history, const String& q, int maxTokens,
+             String& reply, std::function<bool(const std::string&)> parse) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (!waitWifi(false)) return false;
+    showMsg(T().thinking, C_YELLOW);
+    if (!askWith(system.c_str(), history, q, maxTokens, reply)) {
+      viewAnswer(String(T().errPrefix) + reply, C_RED);
+      return false;
+    }
+    if (parse(toStd(reply))) return true;
+  }
+  viewAnswer(T().aiBadFormat, C_RED);
+  return false;
+}
+
+void keepLast(std::vector<ChatMsg>& h, size_t n) {
+  while (h.size() > n) h.erase(h.begin(), h.begin() + 2);
+}
+
+// ---------- Викторина: 10 вопросов на выбранную тему ----------
+void runQuiz() {
+  if (!waitWifi(false)) return;                       // без связи эти игры не работают
+  String topic = chooseTopic(T().topicTitle, T().quizTopics);
+  if (!topic.length()) return;
+  std::string sys = aigames::quizSystem(T().promptLang, toStd(topic));
+  for (;;) {                                         // один раунд
+    std::vector<ChatMsg> hist;
+    int score = 0;
+    for (int qn = 1; qn <= 10; qn++) {
+      aigames::Quiz q;
+      String reply;
+      if (!askGame(sys, hist, "Next question.", 350, reply, [&](const std::string& r) { return aigames::parseQuiz(r, q); }))
+        return;
+      hist.push_back({true, "Next question."});
+      hist.push_back({false, reply});
+      keepLast(hist, 16);
+      char head[48];
+      snprintf(head, sizeof(head), T().quizNum, qn);
+      std::vector<String> opts;
+      for (int i = 0; i < 4; i++) opts.push_back(String((char)('A' + i)) + ") " + fromStd(q.option[i]));
+      int k = choiceScreen(String(head) + "\n" + fromStd(q.question), opts);
+      if (k < 0) return;
+      bool ok = k == q.answer;
+      if (ok) score++;
+      String msg = ok ? String(T().right) : String(T().wrongIs) + String((char)('A' + q.answer)) + ") " +
+                                                fromStd(q.option[q.answer]);
+      if (q.why.size()) msg += "\n\n" + fromStd(q.why);
+      viewAnswer(msg, ok ? C_GREEN : C_RED);
+    }
+    saveBestKey("bquiz", (uint32_t)score);
+    char b[48];
+    snprintf(b, sizeof(b), T().quizResult, score);
+    if (!resultBox(T().gQuiz, b, score >= 7 ? C_GREEN : C_YELLOW)) return;
+  }
+}
+
+// ---------- Приключение: DeepSeek ведёт историю, вы выбираете действия ----------
+void runStory() {
+  if (!waitWifi(false)) return;                       // без связи эти игры не работают
+  String genre = chooseTopic(T().genreTitle, T().storyGenres);
+  if (!genre.length()) return;
+  std::string sys = aigames::storySystem(T().promptLang, toStd(genre));
+  for (;;) {                                         // одна история
+    std::vector<ChatMsg> hist;
+    String say = "Start the story.";
+    for (;;) {
+      aigames::StoryTurn t;
+      String reply;
+      if (!askGame(sys, hist, say, 450, reply, [&](const std::string& r) { return aigames::parseStory(r, t); }))
+        return;
+      hist.push_back({true, say});
+      hist.push_back({false, reply});
+      keepLast(hist, 20);
+      viewAnswer(fromStd(t.story), C_WHITE);
+      if (t.end) {
+        if (!resultBox(T().storyEnd, T().gStory, C_GREEN)) return;
+        break;
+      }
+      std::vector<String> opts;
+      for (size_t i = 0; i < t.choices.size(); i++) opts.push_back(String((int)(i + 1)) + ") " + fromStd(t.choices[i]));
+      int k = choiceScreen(T().storyWhat, opts);
+      if (k < 0) return;
+      say = fromStd(t.choices[(size_t)k]);
+    }
+  }
+}
+
+// ---------- «Угадай, кто я»: 5 раундов, чем меньше подсказок - тем больше очков ----------
+void runGuess() {
+  if (!waitWifi(false)) return;                       // без связи эти игры не работают
+  String cat = chooseTopic(T().guessTitle, T().guessCats);
+  if (!cat.length()) return;
+  std::string sys = aigames::guessSystem(T().promptLang, toStd(cat));
+  for (;;) {                                         // одна игра
+    int total = 0;
+    String used;                                     // что уже загадывали - чтобы не повторялось
+    for (int round = 1; round <= 5; round++) {
+      aigames::Guess g;
+      String reply;
+      String q = "New round.";
+      if (used.length()) q += " Do not pick any of: " + used;
+      if (!askGame(sys, std::vector<ChatMsg>(), q, 400, reply,
+                   [&](const std::string& r) { return aigames::parseGuess(r, g, (unsigned)gameRandom()); }))
+        return;
+      used += (used.length() ? ", " : "") + fromStd(g.secret);
+      int shown = 1;
+      for (;;) {
+        char head[48];
+        snprintf(head, sizeof(head), T().guessRound, round);
+        String h = head;
+        for (int i = 0; i < shown; i++) h += "\n" + String(i + 1) + ". " + fromStd(g.hints[(size_t)i]);
+        std::vector<String> opts;
+        for (const std::string& o : g.options) opts.push_back(fromStd(o));
+        bool more = shown < (int)g.hints.size();
+        if (more) opts.push_back(T().guessMore);
+        int k = choiceScreen(h, opts);
+        if (k < 0) return;
+        if (more && k == (int)opts.size() - 1) {
+          shown++;
+          continue;
+        }
+        bool ok = k == g.answer;
+        int pts = aigames::guessPoints(shown, ok);
+        total += pts;
+        char b[48];
+        snprintf(b, sizeof(b), T().guessRight, pts);
+        viewAnswer(ok ? String(b) : String(T().wrongIs) + fromStd(g.secret), ok ? C_GREEN : C_RED);
+        break;
+      }
+    }
+    saveBestKey("bguess", (uint32_t)total);
+    char b[48];
+    snprintf(b, sizeof(b), T().guessTotal, total);
+    if (!resultBox(T().gGuess, b, C_GREEN)) return;
+  }
+}
+
+// ========================= МЕНЮ ИГР =========================
+// Игры по порядку меню: ключ рекорда (или "") и название.
+const char* gameTitle(const char* key) {
+  static String keep;
+  String k = key;
+  if (k == "best") return T().gBlocks;
+  if (k == "b2048") return "2048";
+  if (k == "bsnake") return T().gSnake;
+  if (k == "bfall") return T().gFall;
+  if (k == "bmaze") return T().gMaze;
+  if (k == "bmem") return T().gMemory;
+  if (k == "bpong") return T().gPong;
+  if (k == "bflap") return T().gFlappy;
+  if (k == "brace") return T().gRace;
+  if (k == "bbrk") return L3("Арканоид", "Breakout", "打砖块");
+  if (k == "binv") return L3("Пришельцы", "Invaders", "太空侵略者");
+  if (k == "bmines") return L3("Сапёр", "Minesweeper", "扫雷");
+  if (k == "bsimon") return L3("Повтори", "Repeat", "记忆重复");
+  if (k == "bttt") return L3("Крестики-нолики", "Tic-tac-toe", "井字棋");
+  if (k == "bchess") return L3("Шахматы", "Chess", "国际象棋");
+  if (k == "brider") return L3("Райдер", "Rider", "摩托骑手");
+  if (k == "bquiz") return T().gQuiz;
+  if (k == "bguess") return T().gGuess;
+  return key;
+}
+
+void runGamesMenu() {
+  int sel = 0;
+  for (;;) {
+    std::vector<String> names = {T().gBlocks, "2048", T().gSnake, T().gFall, T().gMaze, T().gMemory,
+                                 T().gPong, T().gFlappy, T().gRace, L3("Райдер", "Rider", "摩托骑手"),
+                                 L3("Арканоид", "Breakout", "打砖块"), L3("Пришельцы", "Invaders", "太空侵略者"),
+                                 L3("Сапёр", "Minesweeper", "扫雷"), L3("Повтори", "Repeat", "记忆重复"),
+                                 L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), L3("Крестики по сети", "Tic-tac-toe online", "联网井字棋"),
+                                 L3("Шахматы", "Chess", "国际象棋"),
+                                 T().gQuiz, T().gStory, T().gGuess, L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
+    const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "bchess", "bquiz", "", "bguess", "", ""};
+    std::vector<String> right;
+    for (size_t i = 0; i < names.size(); i++) {
+      uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
+      right.push_back(v ? String((unsigned)v) : String(""));
+    }
+    sel = listScreen(T().menuGames, names, right, sel);
+    switch (sel) {
+      case 0: runGame(); break;
+      case 1: run2048(); break;
+      case 2: runSnake(); break;
+      case 3: runFalling(); break;
+      case 4: runMaze(); break;
+      case 5: runMemory(); break;
+      case 6: runPong(); break;
+      case 7: runFlappy(); break;
+      case 8: runRace(); break;
+      case 9: runRider(); break;
+      case 10: runBreakout(); break;
+      case 11: runInvaders(); break;
+      case 12: runMines(); break;
+      case 13: runSimon(); break;
+      case 14: runTtt(); break;
+      case 15: runTttNet(); break;
+      case 16: runChess(); break;
+      case 17: runQuiz(); break;
+      case 18: runStory(); break;
+      case 19: runGuess(); break;
+      case 20: runHiScores(); break;
+      default: return;                               // «Назад» или удержание
+    }
+  }
+}
+
+// ========================= ОСНОВНАЯ ПРОГРАММА =========================
+void setup() {
+  Serial.begin(115200);
+  delay(3000);                       // время на USB и питание
+  Serial.println("1: start");
+  loadSettings();
+  pinMode(PIN_BLK, OUTPUT);
+  applyBrightness();                 // подсветка с выбранной яркостью
+  soundInit();                       // после подсветки: у пищалки свой канал
+  g_bgTick = roomTick;               // комната принимает сообщения в фоне, пока вы на экране ввода
+  noteActivity();
+
+  SPI.begin(PIN_SCK, -1, PIN_MOSI, -1);
+  tft.init(240, 240, SPI_MODE3);     // модули без CS работают в режиме 3
+  tft.setRotation(TFT_ROTATION);
+  tft.setSPISpeed(TFT_SPI_HZ);       // быстрее шина - быстрее экран (особенно в гонке)
+  tft.fillScreen(C_BLACK);
+  showMsg(T().starting, C_YELLOW);
+  Serial.println("2: display ok");
+
+  analogReadResolution(12);
+  if (BATTERY_ENABLED) analogSetPinAttenuation(PIN_BAT, ADC_11db);
+  pinMode(PIN_SW, INPUT_PULLUP);
+  joyCalibrate();
+  Serial.printf("3: joystick center %d / %d\n", joyCx, joyCy);
+
+  sugg.addDict(DICT_RU);
+  sugg.addDict(DICT_EN);
+  if (LittleFS.begin(true)) {                // true = отформатировать при первом запуске
+    loadLearned();
+    loadAvatar();
+  }
+  Serial.printf("4: learned words: %u\n", (unsigned)sugg.learnedCount());
+
+  if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
+  wifiStart();                                       // дальше Wi-Fi подключается в фоне
+  Serial.println("5: ready (Wi-Fi in background)");
+}
+
+void loop() {
+  String q = inputText();
+  q.trim();
+  if (q.length() == 0) return;
+  if (!waitWifi(true)) {                             // нет связи - вопрос вернётся в поле ввода
+    pendingInput = q;
+    return;
+  }
+  int maxTokens = MAX_TOKENS;
+  bool learn = true;
+  for (;;) {                                         // вопрос, затем сколько угодно «по шагам» / «проще»
+    Serial.print("Q: ");
+    Serial.println(q);
+    showMsg(T().thinking, C_YELLOW);
+    String result;
+    bool ok = askLen(q, maxTokens, result);
+    if (ok) {
+      Serial.println("answer ok");
+      sndOk();
+    } else {
+      sndError();
+      Serial.print("error: ");
+      Serial.println(result);
+    }
+    if (learn) {                                     // учим подсказки: слова вопроса весят больше, чем слова ответа
+      sugg.learnText(q.c_str());
+      sugg.learnText(q.c_str());
+    }
+    if (ok) sugg.learnText(result.c_str());
+    saveLearned();
+    if (!ok) {
+      viewAnswer(String(T().errPrefix) + result, C_RED);
+      return;
+    }
+    chat.push_back({true, q});
+    chat.push_back({false, result});
+    trimHistory();
+    int act = viewChat();
+    if (act == 0) return;
+    if (!waitWifi(false)) return;
+    q = act == 1 ? L3("Распиши решение по шагам, подробно, с пояснением каждого шага.", "Show the solution step by step, explaining every step.",
+                      "请一步一步详细解答，并解释每一步。")
+                 : L3("Объясни это проще и короче, как новичку, с примером.", "Explain this more simply and briefly, as to a beginner, with an example.",
+                      "请用更简单简短的方式解释，像对初学者一样，并举例。");
+    maxTokens = act == 1 ? 900 : MAX_TOKENS;
+    learn = false;                                   // служебные фразы в подсказки не добавляем
+  }
+}
