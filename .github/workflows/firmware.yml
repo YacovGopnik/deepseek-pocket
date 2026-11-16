@@ -1,0 +1,59 @@
+# Собирает прошивку при каждом изменении исходников и кладёт её в firmware/.
+# Гаджет находит её сам: Настройки -> Обновление -> Проверить в интернете.
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'firmware/**'
+      - '**.md'
+      - 'room.html'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install the ESP32 core and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.12
+          arduino-cli lib install "Adafruit ST7735 and ST7789 Library" "Adafruit GFX Library" "ArduinoJson" "TJpg_Decoder"
+
+      - name: Build
+        run: |
+          VER=$((100 + GITHUB_RUN_NUMBER))
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          mkdir -p build/deepseek_c3
+          cp *.ino *.h *.cpp build/deepseek_c3/
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32c3:PartitionScheme=min_spiffs" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER" \
+            --output-dir out build/deepseek_c3
+          ls -la out
+
+      - name: Publish firmware
+        run: |
+          mkdir -p firmware
+          cp out/deepseek_c3.ino.bin firmware/firmware.bin
+          echo "$VER" > firmware/version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware
+          git commit -m "Firmware build $VER [skip ci]"
+          git pull --rebase
+          git push

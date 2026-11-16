@@ -54,7 +54,7 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 const $ = id => document.getElementById(id);
 let ws = null, rx = new Uint8Array(0), pingTimer = null, wantOpen = false;
 const users = {};          // id -> { nick, seen, ava (Uint8Array 576) }
-let myAva = null, hereTimer = null;
+let myAva = null, hereTimer = null, lastRx = 0;
 let myId = "";
 try { myId = localStorage.getItem("dsp_id") || ""; } catch (e) {}
 if (!myId) { myId = "w" + Math.random().toString(16).slice(2, 7); try { localStorage.setItem("dsp_id", myId); } catch (e) {} }
@@ -162,10 +162,15 @@ function connect() {
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     ws.send(pktConnect("dspweb-" + myId + "-" + Math.random().toString(16).slice(2, 6)));
-    pingTimer = setInterval(() => { if (ws && ws.readyState === 1) ws.send(Uint8Array.of(0xC0, 0)); }, 30000);
+    lastRx = Date.now();
+    pingTimer = setInterval(() => {                  // «пинг»; если сервер молчит 100 секунд - связь зависла, переподключаемся
+      if (!ws || ws.readyState !== 1) return;
+      if (Date.now() - lastRx > 100000) { try { ws.close(); } catch (e) {} return; }
+      ws.send(Uint8Array.of(0xC0, 0));
+    }, 30000);
     hereTimer = setInterval(() => { sendHere(true); showState(); }, 60000);
   };
-  ws.onmessage = ev => { rx = cat(rx, new Uint8Array(ev.data)); let p; while ((p = take())) onPacket(p); };
+  ws.onmessage = ev => { lastRx = Date.now(); rx = cat(rx, new Uint8Array(ev.data)); let p; while ((p = take())) onPacket(p); };
   ws.onerror = () => setState("нет связи с сервером", false);
   ws.onclose = () => { clearInterval(pingTimer); clearInterval(hereTimer); setState("нет связи", false); if (wantOpen) setTimeout(connect, 5000); };
 }

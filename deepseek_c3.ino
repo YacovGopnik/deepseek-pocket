@@ -27,6 +27,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -38,9 +39,18 @@
 #include <LittleFS.h>
 
 #include "font8x16.h"
+// Китайский язык и иероглифы: 1 - есть, 0 - нет (экономит около 730 КБ; без этого прошивка
+// не помещается в половину памяти, а это нужно для обновления по воздуху).
+#ifndef ENABLE_CJK
+#define ENABLE_CJK 0
+#endif
+#if ENABLE_CJK
 #include "font_cjk.h"
+#endif
 #include "font12x24.h"
+#if ENABLE_CJK
 #include "font_cjk24.h"
+#endif
 #include "textutil.h"
 #include "suggest.h"
 #include "dict_words.h"
@@ -60,6 +70,8 @@
 #include "reference.h"
 #include "mqtt_lite.h"
 #include "rider_game.h"
+#include "shooter3d.h"
+#include "ir_remote.h"
 #include <time.h>
 
 // Поиск картинок (Wikimedia Commons). Нужна библиотека TJpg_Decoder (Менеджер библиотек, автор Bodmer).
@@ -110,6 +122,31 @@ const bool BATTERY_ENABLED = true;
 // Если пищалки нет - ничего менять не нужно: звук просто не будет слышен.
 const int PIN_BUZ = 20;
 const bool BUZZER_ACTIVE = false;
+
+// ИК-светодиод для «Пульта» (необязательно): GPIO8 -> база транзистора (S9014 и подобные, NPN),
+// коллектор -> 5V, эмиттер -> «+» светодиода (длинная ножка), «-» светодиода -> резистор 33-68 Ом -> GND.
+// Если светодиода нет - ничего менять не нужно. На GPIO8 сидит и синий огонёк платы: при отправке он мигает.
+const int PIN_IR = 8;
+const int IR_TRIM_US = 3;          // поправка на время работы самих команд, мкс (подстройка несущей частоты)
+#define IR_DB_REPO "logickworkshop/Flipper-IRDB"   // база пультов на GitHub
+#define IR_DB_BRANCH "main"
+
+// Обновление по воздуху. FW_VERSION - номер этой прошивки: увеличивайте на 1 в каждой новой версии.
+// Гаджет сравнивает его с числом в файле firmware/version.txt вашего репозитория и, если там больше,
+// скачивает firmware/firmware.bin. Нужна разметка памяти «Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)».
+#ifndef FW_VERSION
+#define FW_VERSION 1                // при сборке на GitHub номер подставляется сам
+#endif
+#define OTA_REPO "YacovGopnik/deepseek-pocket"
+#define OTA_BRANCH "main"
+
+// Фонарик (необязательно): белый светодиод, включается в Настройках.
+// GPIO2 -> резистор 22 кОм -> база NPN-транзистора (S9014); ещё один резистор 4,7 кОм с GPIO2 на 3V3
+// (он нужен, чтобы плата нормально запускалась: при включении на GPIO2 должно быть «высокое» напряжение).
+// Эмиттер -> GND, коллектор -> «-» светодиода, «+» светодиода -> резистор 47 Ом -> 5V.
+// При включении платы светодиод на мгновение вспыхивает - это нормально.
+const int PIN_LED = 2;
+bool torchOn = false;
 
 const int PIN_SCK = 4, PIN_MOSI = 6, PIN_DC = 5, PIN_BLK = 10;
 const int PIN_RST = BATTERY_ENABLED ? 21 : 3;   // сброс экрана: GPIO21 (после перепайки под батарею) или GPIO3
@@ -676,14 +713,26 @@ uint8_t cfgLang = LANG_RU;
 const Texts& T() { return TEXTS[cfgLang]; }
 
 // Короткая надпись на текущем языке (для новых экранов).
+#if ENABLE_CJK
 const char* L3(const char* ru, const char* en, const char* zh) {
   return cfgLang == LANG_RU ? ru : cfgLang == LANG_ZH ? zh : en;
 }
+#else
+const char* L2(const char* ru, const char* en) { return cfgLang == LANG_RU ? ru : en; }
+#define L3(ru, en, zh) L2(ru, en)                    // китайские надписи в прошивку не попадают
+#endif
 
 const char* APP_UA = "DeepSeekPocket/1.0 (ESP32-C3 hobby device)";   // так устройство представляется сайтам
 int cfgBright = 4;        // яркость: 0..4 (8, 25, 50, 75, 100 %)
 int cfgSound = 1;         // звук: 0 - нет, 1 - только сигналы, 2 - сигналы и щелчки клавиш
 int cfgIdle = 2;          // гасить экран: 0 - нет, 1 - 30 с, 2 - 1 мин, 3 - 2 мин, 4 - 5 мин
+int cfgJoy = 2;           // чувствительность ручки: 0 (надо отклонять до упора) .. 4 (хватает лёгкого наклона)
+// Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
+int joyThr() {
+  static const int PCT[5] = {150, 125, 100, 70, 45};
+  int t = JOY_THRESHOLD * PCT[cfgJoy] / 100;
+  return t > 1850 ? 1850 : t < 250 ? 250 : t;
+}
 int cfgTz = 3;            // часовой пояс, часов от UTC (Москва +3)
 String cfgCity;           // город для погоды
 float cfgLat = 0, cfgLon = 0;
@@ -732,12 +781,14 @@ void loadSettings() {
   cfgSound = (int)prefs.getUChar("snd", 1);
   if (cfgSound < 0 || cfgSound > 2) cfgSound = 1;
   cfgIdle = (int)prefs.getUChar("idle", 2);
+  cfgJoy = (int)prefs.getUChar("joy", 2);
+  if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
   cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
   cfgCity = prefs.getString("city", "");
   cfgLat = prefs.getString("lat", "0").toFloat();
   cfgLon = prefs.getString("lon", "0").toFloat();
   prefs.end();
-  if (cfgLang >= N_LANGS) cfgLang = LANG_RU;
+  if (cfgLang >= N_LANGS || (!ENABLE_CJK && cfgLang == LANG_ZH)) cfgLang = LANG_RU;
   if (cfgBright < 0 || cfgBright > 4) cfgBright = 4;
   if (cfgIdle < 0 || cfgIdle > 4) cfgIdle = 2;
   if (cfgTz < -12 || cfgTz > 14) cfgTz = 3;
@@ -749,6 +800,7 @@ void saveScreenSettings() {
   prefs.putUChar("snd", (uint8_t)cfgSound);
   prefs.putUChar("bri", (uint8_t)cfgBright);
   prefs.putUChar("idle", (uint8_t)cfgIdle);
+  prefs.putUChar("joy", (uint8_t)cfgJoy);
   prefs.putUChar("tz", (uint8_t)(cfgTz + 12));
   prefs.end();
 }
@@ -839,6 +891,10 @@ static uint16_t cbuf[24 * 24];
 
 // Номер иероглифа в font_cjk.h (двоичный поиск) или -1.
 int cjkIndex(uint16_t cp) {
+#if !ENABLE_CJK
+  (void)cp;
+  return -1;
+#else
   int lo = 0, hi = CJK_COUNT - 1;
   while (lo <= hi) {
     int mid = (lo + hi) / 2;
@@ -848,6 +904,7 @@ int cjkIndex(uint16_t cp) {
     else hi = mid - 1;
   }
   return -1;
+#endif
 }
 
 void blit(int x, int y, int w, int h) {
@@ -861,6 +918,7 @@ void blit(int x, int y, int w, int h) {
 int drawCp(uint16_t cp, int x, int y, uint16_t fg, uint16_t bg) {
   if (isWide(cp)) {
     int idx = cjkIndex(cp);
+#if ENABLE_CJK
     if (idx >= 0) {
       if (g_big) {                            // иероглиф 24x24: 3 байта на строку
         const uint8_t* g = &CJK24_BITMAPS[idx * 72];
@@ -880,6 +938,8 @@ int drawCp(uint16_t cp, int x, int y, uint16_t fg, uint16_t bg) {
       blit(x, y, 16, 16);
       return 16;
     }
+#endif
+    (void)idx;
     drawCp('?', x, y, fg, bg);            // нет в шрифте: знак вопроса на 2 позиции
     tft.fillRect(x + GW, y, GW, GH, bg);
     return 2 * GW;
@@ -1095,7 +1155,8 @@ void joyAnalog(int& dx, int& dy) {
   if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
   if (JOY_INVERT_X) dx = -dx;
   if (JOY_INVERT_Y) dy = -dy;
-  if (dx > JOY_THRESHOLD / 2 || dx < -JOY_THRESHOLD / 2 || dy > JOY_THRESHOLD / 2 || dy < -JOY_THRESHOLD / 2) {
+  int half = joyThr() / 2;
+  if (dx > half || dx < -half || dy > half || dy < -half) {
     if (screenAsleep) wakeScreen();
     noteActivity();
   }
@@ -1109,7 +1170,7 @@ uint8_t joyRawDir() {
   if (JOY_INVERT_X) dx = -dx;
   if (JOY_INVERT_Y) dy = -dy;
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-  if (ax < JOY_THRESHOLD && ay < JOY_THRESHOLD) return J_NONE;
+  if (ax < joyThr() && ay < joyThr()) return J_NONE;
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
   return dy > 0 ? J_DOWN : J_UP;
 }
@@ -1361,6 +1422,144 @@ void handlePicDone() {
   picOk = false;
 }
 
+// ---------- ИК-пульты: файлы .ir в памяти платы ----------
+// Формат файлов - как у Flipper Zero (база Flipper-IRDB). Первой строкой дописываем название: «# title: ...».
+const int IR_SLOTS = 12;
+const size_t IR_MAX_BYTES = 150000;
+
+String irPath(int i) {
+  char b[16];
+  snprintf(b, sizeof(b), "/ir%02d.ir", i);
+  return String(b);
+}
+
+int irCount() {
+  int n = 0;
+  for (int i = 0; i < IR_SLOTS; i++)
+    if (LittleFS.exists(irPath(i).c_str())) n++;
+  return n;
+}
+
+int irFreeSlot() {
+  for (int i = 0; i < IR_SLOTS; i++)
+    if (!LittleFS.exists(irPath(i).c_str())) return i;
+  return -1;
+}
+
+bool irRoom() { return LittleFS.totalBytes() - LittleFS.usedBytes() > 40000; }
+
+String irTitle(int slot) {
+  File f = LittleFS.open(irPath(slot).c_str(), "r");
+  if (!f) return "";
+  uint8_t b[80];
+  size_t n = f.read(b, sizeof(b) - 1);
+  f.close();
+  std::string s((const char*)b, n);
+  size_t nl = s.find('\n');
+  if (nl != std::string::npos) s.erase(nl);
+  if (s.compare(0, 9, "# title: ") != 0) return String("?");
+  return fromStd(ir::trim(s.substr(9)));
+}
+
+// Похоже ли начало файла на файл пульта.
+bool irLooksValid(const uint8_t* b, size_t n) {
+  if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+    b += 3;
+    n -= 3;
+  }
+  return n >= 12 && memcmp(b, "Filetype: IR", 12) == 0;
+}
+
+// Приёмник: пишет скачиваемый файл сразу в память платы.
+class IrFileSink : public Stream {
+ public:
+  File f;
+  size_t n = 0;
+  bool tooBig = false, failed = false, badType = false;
+  size_t write(uint8_t c) override { return write(&c, 1); }
+  size_t write(const uint8_t* b, size_t len) override {
+    if (n == 0 && !irLooksValid(b, len)) badType = true;
+    n += len;
+    if (n > IR_MAX_BYTES) tooBig = true;
+    if (!badType && !tooBig && !failed && f.write(b, len) != len) failed = true;
+    return len;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+};
+
+// Приём файла пульта с телефона по кусочкам.
+File irUpFile;
+String irUpPath, irUpErr;
+size_t irUpSize = 0;
+bool irUpOk = false;
+
+void irUpAbort(const char* why) {
+  if (irUpFile) irUpFile.close();
+  if (irUpPath.length()) LittleFS.remove(irUpPath.c_str());
+  irUpPath = "";
+  irUpErr = why;
+}
+
+void handleIrUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    irUpOk = false;
+    irUpSize = 0;
+    irUpErr = "";
+    irUpPath = "";
+    int slot = irFreeSlot();
+    if (slot < 0) {
+      irUpErr = L3("уже 12 пультов. Удалите лишний на устройстве.", "12 remotes already. Delete one on the device.", "已有12个遥控器，请先删除。");
+    } else if (!irRoom()) {
+      irUpErr = L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
+    } else {
+      irUpPath = irPath(slot);
+      irUpFile = LittleFS.open(irUpPath.c_str(), "w");
+      if (!irUpFile) {
+        irUpAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
+      } else {
+        std::string head = "# title: " + ir::titleFromPath(toStd(up.filename)) + "\n";
+        irUpFile.write((const uint8_t*)head.data(), head.size());
+      }
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!irUpPath.length()) return;                   // уже отказали
+    if (irUpSize == 0 && !irLooksValid(up.buf, up.currentSize)) {
+      irUpAbort(L3("это не файл пульта (.ir)", "this is not a remote file (.ir)", "这不是遥控器文件（.ir）"));
+      return;
+    }
+    irUpSize += up.currentSize;
+    if (irUpSize > IR_MAX_BYTES) {
+      irUpAbort(L3("файл слишком большой", "the file is too big", "文件太大"));
+      return;
+    }
+    if (irUpFile.write(up.buf, up.currentSize) != up.currentSize) irUpAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!irUpPath.length()) return;
+    irUpFile.close();
+    if (irUpSize < 30) irUpAbort(L3("файл пустой", "the file is empty", "文件为空"));
+    else irUpOk = true;
+  } else {
+    if (irUpPath.length()) irUpAbort(L3("загрузка прервана", "the upload was interrupted", "上传中断"));
+  }
+}
+
+void handleIrDone() {
+  if (irUpOk) {
+    String t = String(L3("Пульт сохранён. Всего пультов: ", "Remote saved. Remotes: ", "遥控器已保存。总数：")) + String(irCount());
+    server.send(200, "text/plain; charset=utf-8", t);
+    portalNote = t;
+  } else {
+    server.send(200, "text/plain; charset=utf-8", String(L3("Ошибка: ", "Error: ", "错误：")) + (irUpErr.length() ? irUpErr : String("?")));
+  }
+  irUpOk = false;
+}
+
+void handleFwDone();                                 // обновление прошивки с телефона - определено ниже
+void handleFwUpload();
+
 void handleRoot() {
   String h = pageHead();
   h += "<h2>"; h += T().webTitle; h += "</h2><form method='post' action='/save'>";
@@ -1421,7 +1620,22 @@ void handleRoot() {
        "var fd=new FormData();fd.append('f',b,'p.jpg');var r=await fetch('/pic',{method:'POST',body:fd});var t=await r.text();"
        "if(t.indexOf('OK')==0)ok++;else{s.textContent=T3+t;this.value='';return}"
        "}catch(e){s.textContent=T3+e;this.value='';return}}"
-       "s.textContent=T2+ok;this.value=''};</script></body></html>";
+       "s.textContent=T2+ok;this.value=''};</script>";
+  h += "<h3>"; h += L3("Пульты (.ir)", "Remotes (.ir)", "遥控器（.ir）"); h += "</h3><p><small>";
+  h += L3("Файл пульта из базы Flipper-IRDB (github.com/" IR_DB_REPO "): скачайте нужный .ir на телефон и выберите его здесь.",
+          "A remote file from Flipper-IRDB (github.com/" IR_DB_REPO "): download the .ir file to your phone and pick it here.",
+          "来自Flipper-IRDB的遥控器文件（github.com/" IR_DB_REPO "）：先把.ir文件下载到手机，再在这里选择。");
+  h += "</small></p><input type='file' id='rf'><p><small id='rs'>";
+  h += L3("Пультов: ", "Remotes: ", "遥控器："); h += String(irCount()); h += " / 12</small></p>";
+  h += "<script>document.getElementById('rf').onchange=async function(){var s=document.getElementById('rs'),f=this.files[0];if(!f)return;"
+       "s.textContent='...';try{var fd=new FormData();fd.append('f',f,f.name);var r=await fetch('/ir',{method:'POST',body:fd});"
+       "s.textContent=await r.text()}catch(e){s.textContent=''+e}this.value=''};</script>";
+  h += "<h3>"; h += L3("Обновление прошивки", "Firmware update", "固件更新"); h += "</h3><p><small>";
+  h += L3("Файл прошивки .bin. Сейчас стоит версия ", "Firmware .bin file. Installed version: ", "固件.bin文件。当前版本："); h += String(FW_VERSION);
+  h += "</small></p><input type='file' id='ff'><p><small id='fs'></small></p>";
+  h += "<script>document.getElementById('ff').onchange=async function(){var s=document.getElementById('fs'),f=this.files[0];if(!f)return;"
+       "s.textContent='...';try{var fd=new FormData();fd.append('f',f,f.name);var r=await fetch('/fw',{method:'POST',body:fd});"
+       "s.textContent=await r.text()}catch(e){s.textContent=''+e}this.value=''};</script></body></html>";
   server.send(200, "text/html; charset=utf-8", h);
 }
 
@@ -1513,6 +1727,8 @@ void runPortal() {
     server.on("/save", HTTP_POST, handleSave);
     server.on("/note", HTTP_POST, handleNote);
     server.on("/pic", HTTP_POST, handlePicDone, handlePicUpload);
+    server.on("/ir", HTTP_POST, handleIrDone, handleIrUpload);
+    server.on("/fw", HTTP_POST, handleFwDone, handleFwUpload);
     server.onNotFound(handleRedirect);   // открывает страницу сама (captive portal)
     serverReady = true;
   }
@@ -3100,7 +3316,7 @@ void runRace() {
       if (dx > 300 || dx < -300) steer = (float)dx / 1500.0f;   // плавный руль: чем сильнее наклон, тем круче
       if (steer > 1) steer = 1;
       if (steer < -1) steer = -1;
-      bool brake = dy > JOY_THRESHOLD;
+      bool brake = dy > joyThr();
       bool check = false;
       while (acc >= STEP_MS) {
         if (rg->step(steer, brake)) check = true;
@@ -5074,6 +5290,10 @@ WiFiClient mqClient;
 std::string mqRx;                                    // принятые, ещё не разобранные байты
 bool mqUp = false;
 uint32_t mqLastPing = 0, mqLastTry = 0, mqLastHere = 0, avaResendAt = 0;
+uint32_t mqLastRx = 0;                               // когда сервер последний раз что-то прислал
+uint32_t ownEchoes = 0;                              // сколько своих сообщений вернулось от сервера (значит, доставлены)
+int hsNext = 0;                                      // очередь отправки рекордов (по одному, чтобы не засыпать сервер)
+uint32_t hsLastSend = 0;
 String cfgNick, cfgRoom, roomId;
 int cfgRoomBg = 1;                                   // принимать сообщения, когда комната закрыта (счётчик на главном экране)
 struct RoomMsg {
@@ -5090,6 +5310,8 @@ std::vector<RoomMsg> roomMsgs;
 std::vector<RoomUser> roomUsers;                     // кого видели в комнате (до 10)
 std::vector<std::string> netInbox;                   // сообщения сетевых игр (<комната>/g), ждут разбора
 bool hsDirty = false;
+extern const int HS_COUNT_FWD;
+void hsSendNext();
 void hsPublishAll();
 void hsReceive(const std::string& rest, const std::string& payload);
 uint8_t myAva[mqtt::AVA_BYTES];
@@ -5171,10 +5393,11 @@ bool mqConnect(int waitMs) {
   mqWrite(mqtt::subscribe(2, "dspocket/v1/hs/#"));                     // общая таблица рекордов
   mqUp = true;
   mqLastPing = millis();
+  mqLastRx = millis();
   roomDirty = true;
   sendHere(true);
   sendAvatar();
-  hsPublishAll();
+  hsDirty = true;                                    // свои рекорды уйдут по одному, без спешки
   return true;
 }
 
@@ -5186,8 +5409,13 @@ void mqPoll() {
     uint8_t b[128];
     int r = mqClient.read(b, sizeof(b));
     if (r <= 0) break;
+    mqLastRx = millis();
     mqRx.append((const char*)b, (size_t)r);
-    if (mqRx.size() > 6000) mqRx.clear();            // защита от мусора
+    if (mqRx.size() > 6000) {                        // мусор или сбой разбора - проще переподключиться, чем гадать
+      mqDrop();
+      mqLastTry = millis() - 15000;
+      return;
+    }
   }
   mqtt::Packet p;
   std::string base = roomBase();
@@ -5217,6 +5445,7 @@ void mqPoll() {
       m.nick = fromStd(nick);
       m.text = fromStd(text);
       m.mine = id == toStd(roomId);
+      if (m.mine) ownEchoes++;
       struct tm t;
       if (timeNow(t)) {
         char b[8];
@@ -5271,6 +5500,14 @@ void mqPoll() {
     mqDrop();
     return;
   }
+  // Связь может «зависнуть» молча (сменилась сеть, роутер забыл соединение): плата думает, что подключена,
+  // а сообщения никуда не доходят. Раз в 40 секунд мы спрашиваем сервер; если он молчит 100 секунд - переподключаемся.
+  if (millis() - mqLastRx > 100000UL) {
+    Serial.println("[room] server is silent - reconnecting");
+    mqDrop();
+    mqLastTry = millis() - 15000;                    // новая попытка уже через 5 секунд
+    return;
+  }
   if (millis() - mqLastPing > 40000) {
     mqLastPing = millis();
     if (!mqWrite(mqtt::ping())) {
@@ -5283,7 +5520,11 @@ void mqPoll() {
     avaResendAt = 0;
     sendAvatar();
   }
-  if (hsDirty) hsPublishAll();
+  if (hsDirty) {                                     // начать отправку рекордов с начала списка
+    hsDirty = false;
+    hsNext = 0;
+  }
+  if (hsNext < HS_COUNT_FWD && millis() - hsLastSend > 500) hsSendNext();
 }
 
 // Фоновая работа комнаты: приём сообщений и переподключение.
@@ -5465,9 +5706,24 @@ void runRoom() {
   }
   int back = 0;                                      // на сколько строк прокручено вверх
   roomDirty = true;
+  String sentText;                                   // последнее отправленное: ждём, что сервер вернёт его нам же
+  uint32_t sentWant = 0, sentDeadline = 0;
   for (;;) {
     wifiTick();
     roomTick();
+    if (sentDeadline) {
+      if (ownEchoes >= sentWant) {
+        sentDeadline = 0;                            // доставлено
+      } else if ((int32_t)(millis() - sentDeadline) >= 0) {   // сервер не вернул сообщение - связь зависла
+        sentDeadline = 0;
+        showMsg(L3("Сообщение не доставлено: связь с комнатой зависла. Переподключаюсь, текст вернётся в поле ввода.",
+                   "The message was not delivered: the connection hung. Reconnecting; the text returns to the input field.",
+                   "消息未送达：连接已卡住。正在重新连接，文字会回到输入框。"), C_RED);
+        pendingInput = sentText;
+        mqConnect(6000);
+        roomDirty = true;
+      }
+    }
     if (roomDirty) {
       roomDirty = false;
       drawRoom(back);
@@ -5550,6 +5806,9 @@ void runRoom() {
         mqDrop();
         mqLastTry = 0;
       } else {
+        sentText = out;
+        sentWant = ownEchoes + 1;
+        sentDeadline = millis() + 8000;
         std::string lo = toStd(out);
         if (lo.compare(0, 4, "@ai ") == 0 || lo.compare(0, 4, "@AI ") == 0 || lo.compare(0, 6, "@\xD0\xB8\xD0\xB8 ") == 0) roomAskAi(out);
       }
@@ -5568,12 +5827,304 @@ void runRoom() {
 }
 
 // ---------- Меню «Инструменты» ----------
+// ---------- Пульт: ИК-светодиод на PIN_IR ----------
+static std::vector<uint32_t> irLastSent;                 // что отправили в последний раз (для проверки)
+static uint32_t irLastFreq = 0;
+
+// Один кадр: чётные отрезки - вспышка (мигаем с несущей частотой), нечётные - пауза.
+void irSendOnce(const std::vector<uint32_t>& t, uint32_t freq) {
+  uint32_t period = 1000000 / freq, on = period / 3;
+  int off = (int)period - (int)on - IR_TRIM_US;
+  if (off < 1) off = 1;
+  for (size_t i = 0; i < t.size(); i++) {
+    if (i & 1) {
+      digitalWrite(PIN_IR, LOW);
+      if (t[i] > 12000) {
+        delay(t[i] / 1000);
+        delayMicroseconds(t[i] % 1000);
+      } else {
+        delayMicroseconds(t[i]);
+      }
+    } else {
+      uint32_t t0 = micros();
+      while (micros() - t0 < t[i]) {
+        digitalWrite(PIN_IR, HIGH);
+        delayMicroseconds(on);
+        digitalWrite(PIN_IR, LOW);
+        delayMicroseconds((uint32_t)off);
+      }
+    }
+  }
+  digitalWrite(PIN_IR, LOW);
+}
+
+// Отправить команду. false - такой вид сигнала не поддерживается.
+bool irSend(const ir::Signal& s) {
+  ir::Frame f;
+  if (!ir::encode(s, f)) return false;
+  irLastSent = f.t;
+  irLastFreq = f.freq;
+  pinMode(PIN_IR, OUTPUT);
+  for (int r = 0; r < f.repeats; r++) {
+    uint32_t t0 = millis();
+    irSendOnce(f.t, f.freq);
+    if (r + 1 < f.repeats) {
+      uint32_t need = f.period / 1000, spent = millis() - t0;
+      delay(spent < need ? need - spent : 5);
+    }
+  }
+  pinMode(PIN_IR, INPUT);                               // в покое ножка свободна: не мешает запуску платы и не светит диодом на плате
+  return true;
+}
+
+// Читает файл по строкам. Строка может быть длинной (сырые данные кнопки).
+// Возвращает false в конце файла. start - место начала строки в файле.
+bool irReadLine(File& f, std::string& line, uint32_t& start) {
+  line.clear();
+  start = (uint32_t)f.position();
+  bool any = false;
+  uint8_t c;
+  while (f.read(&c, 1) == 1) {
+    any = true;
+    if (c == '\n') return true;
+    if (c != '\r' && line.size() < 20000) line += (char)c;
+  }
+  return any;
+}
+
+// Кнопки пульта: названия и места в файле.
+void irLoadButtons(int slot, std::vector<String>& names, std::vector<uint32_t>& offs) {
+  names.clear();
+  offs.clear();
+  File f = LittleFS.open(irPath(slot).c_str(), "r");
+  if (!f) return;
+  std::string line, k, v;
+  uint32_t start = 0;
+  while (names.size() < 150 && irReadLine(f, line, start)) {
+    if (line.size() > 200 || line.compare(0, 5, "name:") != 0) continue;
+    if (!ir::splitLine(line, k, v)) continue;
+    for (char& ch : v)
+      if (ch == '_') ch = ' ';
+    names.push_back(fromStd(v));
+    offs.push_back(start);
+  }
+  f.close();
+}
+
+bool irLoadSignal(int slot, uint32_t off, ir::Signal& s) {
+  File f = LittleFS.open(irPath(slot).c_str(), "r");
+  if (!f) return false;
+  f.seek(off);
+  std::string line;
+  uint32_t start = 0;
+  bool first = true;
+  while (irReadLine(f, line, start)) {
+    if (!first && (line.compare(0, 1, "#") == 0 || line.compare(0, 5, "name:") == 0)) break;
+    ir::feedLine(s, line);
+    first = false;
+  }
+  f.close();
+  return s.hasType;
+}
+
+void runRemoteButtons(int slot) {
+  String title = irTitle(slot);
+  std::vector<String> names;
+  std::vector<uint32_t> offs;
+  irLoadButtons(slot, names, offs);
+  int n = (int)names.size(), sel = 0;
+  for (;;) {
+    std::vector<String> items = names;
+    items.push_back(L3("Удалить пульт", "Delete the remote", "删除遥控器"));
+    items.push_back(T().menuBack);
+    sel = listScreen(title.c_str(), items, std::vector<String>(), sel);
+    if (sel >= 0 && sel < n) {
+      ir::Signal s;
+      bool ok = irLoadSignal(slot, offs[(size_t)sel], s) && irSend(s);
+      if (ok) {
+        beep(1, 2400, 15);
+      } else {
+        showMsg(String(L3("Этот вид сигнала пока не поддерживается: ", "This kind of signal is not supported yet: ", "暂不支持这种信号：")) + fromStd(s.protocol), C_RED);
+        delay(1800);
+      }
+      continue;
+    }
+    if (sel == n) {
+      std::vector<String> yn = splitBar(L3("Оставить|Удалить", "Keep|Delete", "保留|删除"));
+      if (choiceScreen(String(L3("Удалить пульт «", "Delete the remote \"", "删除遥控器“")) + title + L3("»?", "\"?", "”？"), yn) == 1) {
+        LittleFS.remove(irPath(slot).c_str());
+        return;
+      }
+      continue;
+    }
+    return;
+  }
+}
+
+// Приёмник списка папки с GitHub.
+class IrDirSink : public Stream {
+ public:
+  ir::DirScan scan;
+  size_t write(uint8_t c) override {
+    scan.feed((char)c);
+    return 1;
+  }
+  size_t write(const uint8_t* b, size_t len) override {
+    for (size_t i = 0; i < len; i++) scan.feed((char)b[i]);
+    return len;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+};
+
+// GET с выдачей ответа в приёмник. Возвращает код HTTP; при обрыве посреди ответа - -1000.
+int httpGetSink(const String& url, Stream* sink) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+  HTTPClient http;
+  http.setUserAgent(APP_UA);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return -100;
+  int code = http.GET();
+  if (code == 200 && http.writeToStream(sink) < 0) code = -1000;
+  http.end();
+  Serial.printf("[ir] GET %d\n", code);
+  return code;
+}
+
+String irNetErr(int code) {
+  if (code == 403 || code == 429)
+    return L3("GitHub временно ограничил запросы с вашего адреса (не больше 60 в час). Попробуйте позже или загрузите файл с телефона.",
+              "GitHub has temporarily limited requests from your address (60 per hour). Try later or upload the file from your phone.",
+              "GitHub暂时限制了请求（每小时60次）。请稍后再试，或从手机上传文件。");
+  if (code == 404) return L3("Не найдено (404).", "Not found (404).", "未找到（404）。");
+  return String(L3("Не удалось связаться с GitHub (код ", "Cannot reach GitHub (code ", "无法连接GitHub（代码 ")) + String(code) +
+         L3("). Если не выходит - загрузите файл с телефона.", "). If it keeps failing, upload the file from your phone.", "）。如果一直失败，请从手机上传文件。");
+}
+
+// Скачать файл пульта из базы. Пустая строка - успех.
+String irDownload(const std::string& path) {
+  int slot = irFreeSlot();
+  if (slot < 0) return L3("Уже 12 пультов. Удалите лишний.", "12 remotes already. Delete one.", "已有12个遥控器，请先删除。");
+  if (!irRoom()) return L3("В памяти платы нет места.", "No free memory on the device.", "设备存储空间不足。");
+  IrFileSink sink;
+  sink.f = LittleFS.open(irPath(slot).c_str(), "w");
+  if (!sink.f) return L3("Не удалось записать файл.", "Cannot write the file.", "无法写入文件。");
+  std::string head = "# title: " + ir::titleFromPath(path) + "\n";
+  sink.f.write((const uint8_t*)head.data(), head.size());
+  String url = String("https://raw.githubusercontent.com/") + IR_DB_REPO + "/" + IR_DB_BRANCH + "/" + fromStd(ir::urlPath(path));
+  int code = httpGetSink(url, &sink);
+  sink.f.close();
+  String err;
+  if (code != 200) err = irNetErr(code);
+  else if (sink.badType || sink.n < 30) err = L3("Это не файл пульта.", "This is not a remote file.", "这不是遥控器文件。");
+  else if (sink.tooBig) err = L3("Файл слишком большой.", "The file is too big.", "文件太大。");
+  else if (sink.failed) err = L3("Не удалось записать файл.", "Cannot write the file.", "无法写入文件。");
+  if (err.length()) LittleFS.remove(irPath(slot).c_str());
+  return err;
+}
+
+// Выбор пульта в базе: тип техники -> марка -> файл. true - пульт скачан.
+bool runRemoteDownload() {
+  if (!waitWifi(false)) return false;
+  std::vector<std::string> pathParts;
+  std::vector<std::vector<String>> lists;                // уже полученные списки по уровням (чтобы не запрашивать заново)
+  std::vector<int> sels;
+  for (;;) {
+    std::string path;
+    for (size_t i = 0; i < pathParts.size(); i++) path += (i ? "/" : "") + pathParts[i];
+    if (lists.size() <= pathParts.size()) {
+      showMsg(L3("Загружаю список...", "Loading the list...", "正在加载列表……"), C_YELLOW);
+      IrDirSink sink;
+      int code = httpGetSink(String("https://api.github.com/repos/") + IR_DB_REPO + "/contents/" + fromStd(ir::urlPath(path)) + "?ref=" + IR_DB_BRANCH, &sink);
+      sink.scan.finish();
+      if (code != 200) {
+        viewAnswer(irNetErr(code), C_RED);
+        if (pathParts.empty()) return false;
+        pathParts.pop_back();
+        continue;
+      }
+      std::vector<String> items;
+      for (const std::string& it : sink.scan.items) items.push_back(fromStd(it));
+      lists.push_back(items);
+      sels.push_back(0);
+    }
+    std::vector<String> items = lists.back();
+    int n = (int)items.size();
+    items.push_back(T().menuBack);
+    String title = pathParts.empty() ? String(L3("База пультов", "Remote database", "遥控器数据库")) : fromStd(pathParts.back());
+    int k = listScreen(title.c_str(), items, std::vector<String>(), sels.back());
+    if (k < 0 || k >= n) {                               // назад на уровень выше
+      if (pathParts.empty()) return false;
+      pathParts.pop_back();
+      lists.pop_back();
+      sels.pop_back();
+      continue;
+    }
+    sels.back() = k;
+    std::string name = toStd(items[(size_t)k]);
+    if (!name.empty() && name.back() == '/') {
+      name.pop_back();
+      pathParts.push_back(name);
+      continue;
+    }
+    showMsg(L3("Скачиваю пульт...", "Downloading the remote...", "正在下载遥控器……"), C_YELLOW);
+    String err = irDownload(path.empty() ? name : path + "/" + name);
+    if (err.length()) {
+      viewAnswer(err, C_RED);
+      continue;
+    }
+    sndOk();
+    showMsg(String(L3("Пульт сохранён: ", "Remote saved: ", "遥控器已保存：")) + fromStd(ir::titleFromPath(name)), C_GREEN);
+    delay(1200);
+    return true;
+  }
+}
+
+void runRemote() {
+  int sel = 0;
+  for (;;) {
+    std::vector<int> slots;
+    std::vector<String> items;
+    for (int i = 0; i < IR_SLOTS; i++)
+      if (LittleFS.exists(irPath(i).c_str())) {
+        slots.push_back(i);
+        items.push_back(irTitle(i));
+      }
+    int n = (int)slots.size();
+    items.push_back(L3("+ Скачать из интернета", "+ Download from the internet", "+ 从网上下载"));
+    items.push_back(L3("+ Загрузить с телефона", "+ Upload from phone", "+ 从手机上传"));
+    items.push_back(T().menuBack);
+    sel = listScreen(L3("Пульт", "Remote", "遥控器"), items, std::vector<String>(), sel);
+    if (sel >= 0 && sel < n) {
+      runRemoteButtons(slots[(size_t)sel]);
+    } else if (sel == n) {
+      if (runRemoteDownload()) sel = irCount() - 1;
+    } else if (sel == n + 1) {
+      viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет раздел «Пульты (.ir)» - выберите там файл. "
+                    "Когда закончите - нажмите кнопку на устройстве.",
+                    "The device will now create a Wi-Fi network. Join it from your phone; the \"Remotes (.ir)\" section is at the bottom of the page. "
+                    "Press the button on the device when done.",
+                    "设备将创建Wi-Fi网络。用手机连接，页面底部有“遥控器（.ir）”部分，在那里选择文件。完成后按设备上的按钮。"), C_WHITE);
+      runPortal();
+      netIdx = 0;
+      wifiStart();
+    } else {
+      return;
+    }
+  }
+}
+
 void runTools() {
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Калькулятор|Википедия|Картинки|Галерея|Погода|Курсы валют|Часы|Таймер|Секундомер|Назад",
-                                            "Calculator|Wikipedia|Images|Gallery|Weather|Exchange rates|Clock|Timer|Stopwatch|Back",
-                                            "计算器|维基百科|图片|相册|天气|汇率|时钟|计时器|秒表|返回"));
+    std::vector<String> items = splitBar(L3("Калькулятор|Википедия|Картинки|Галерея|Погода|Курсы валют|Часы|Таймер|Секундомер|Пульт|Назад",
+                                            "Calculator|Wikipedia|Images|Gallery|Weather|Exchange rates|Clock|Timer|Stopwatch|Remote|Back",
+                                            "计算器|维基百科|图片|相册|天气|汇率|时钟|计时器|秒表|遥控器|返回"));
     sel = listScreen(L3("Инструменты", "Tools", "工具"), items, std::vector<String>(), sel);
     switch (sel) {
       case 0: runCalc(); break;
@@ -5585,7 +6136,174 @@ void runTools() {
       case 6: runClock(); break;
       case 7: runTimer(); break;
       case 8: runStopwatch(); break;
+      case 9: runRemote(); break;
       default: return;
+    }
+  }
+}
+
+// ---------- Обновление прошивки по воздуху ----------
+// Из интернета: в репозитории OTA_REPO лежат firmware/version.txt (номер версии) и firmware/firmware.bin.
+// С телефона: файл .bin загружается через страницу гаджета (без интернета).
+void otaBar(size_t done, size_t total) {
+  static int shown = -1;
+  int pct = total ? (int)((uint64_t)done * 100 / total) : (int)((done / 20000) % 101);
+  if (pct == shown) return;
+  shown = pct;
+  tft.drawRect(20, 150, 200, 16, C_WHITE);
+  tft.fillRect(22, 152, pct * 196 / 100, 12, C_GREEN);
+}
+
+// Приёмник: скачиваемая прошивка сразу пишется во вторую половину памяти.
+class OtaSink : public Stream {
+ public:
+  size_t n = 0, total = 0;
+  bool failed = false, badType = false;
+  size_t write(uint8_t c) override { return write(&c, 1); }
+  size_t write(const uint8_t* b, size_t len) override {
+    if (n == 0 && (len == 0 || b[0] != 0xE9)) badType = true;      // прошивка ESP32 начинается с байта E9
+    if (!badType && !failed && Update.write((uint8_t*)b, len) != len) failed = true;
+    n += len;
+    otaBar(n, total);
+    return len;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+};
+
+// Проверить и поставить обновление из интернета. Возвращает текст для показа (при успехе плата перезапускается).
+String otaFromInternet() {
+  if (!waitWifi(false)) return "";
+  showMsg(L3("Проверяю обновление...", "Checking for an update...", "正在检查更新……"), C_YELLOW);
+  String base = String("https://raw.githubusercontent.com/") + OTA_REPO + "/" + OTA_BRANCH + "/firmware/";
+  String body;
+  int code = httpGetText(base + "version.txt", body);
+  if (code != 200)
+    return String(L3("Не удалось проверить (код ", "Cannot check (code ", "无法检查（代码 ")) + String(code) +
+           L3("). Можно обновиться с телефона.", "). You can update from your phone.", "）。可以从手机更新。");
+  body.trim();
+  int remote = atoi(body.c_str());
+  if (remote <= FW_VERSION)
+    return String(L3("У вас последняя версия: ", "You have the latest version: ", "已是最新版本：")) + String(FW_VERSION);
+  std::vector<String> yn = splitBar(L3("Обновить|Не сейчас", "Update|Not now", "更新|以后再说"));
+  if (choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
+                   L3("). Не выключайте гаджет, пока идёт обновление.", "). Do not switch the device off during the update.", "）。更新时请勿关机。"), yn) != 0)
+    return "";
+  showMsg(L3("Скачиваю прошивку...", "Downloading the firmware...", "正在下载固件……"), C_YELLOW);
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+  HTTPClient http;
+  http.setUserAgent(APP_UA);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, base + "firmware.bin")) return "begin";
+  code = http.GET();
+  int len = http.getSize();
+  if (code != 200 || len < 100000) {
+    http.end();
+    return String(L3("Файл прошивки не найден (код ", "Firmware file not found (code ", "找不到固件文件（代码 ")) + String(code) + ")";
+  }
+  if (!Update.begin((size_t)len)) {
+    http.end();
+    return String(L3("Прошивка не помещается: ", "The firmware does not fit: ", "固件放不下：")) + Update.errorString();
+  }
+  OtaSink sink;
+  sink.total = (size_t)len;
+  int got = http.writeToStream(&sink);
+  http.end();
+  if (got < 0 || sink.failed || sink.badType || sink.n != (size_t)len || !Update.end(true)) {
+    Update.abort();
+    return sink.badType ? String(L3("Это не файл прошивки.", "This is not a firmware file.", "这不是固件文件。"))
+                        : String(L3("Обновление не удалось (связь оборвалась?). Старая прошивка осталась на месте.",
+                                    "The update failed (connection lost?). The old firmware is still in place.", "更新失败（连接中断？）。旧固件仍然保留。"));
+  }
+  showMsg(L3("Готово! Перезапускаюсь...", "Done! Restarting...", "完成！正在重启……"), C_GREEN);
+  delay(1500);
+  ESP.restart();
+  return "";
+}
+
+// Приём прошивки с телефона.
+bool otaUpOk = false, otaUpStarted = false;
+String otaUpErr;
+size_t otaUpSize = 0;
+
+void handleFwUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    otaUpOk = false;
+    otaUpErr = "";
+    otaUpSize = 0;
+    otaUpStarted = Update.begin(UPDATE_SIZE_UNKNOWN);
+    if (!otaUpStarted) otaUpErr = Update.errorString();
+    showMsg(L3("Принимаю прошивку с телефона...", "Receiving the firmware...", "正在接收固件……"), C_YELLOW);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!otaUpStarted) return;
+    if (otaUpSize == 0 && (up.currentSize == 0 || up.buf[0] != 0xE9)) {
+      Update.abort();
+      otaUpStarted = false;
+      otaUpErr = L3("это не файл прошивки (.bin)", "this is not a firmware file (.bin)", "这不是固件文件（.bin）");
+      return;
+    }
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+      otaUpErr = Update.errorString();
+      Update.abort();
+      otaUpStarted = false;
+      return;
+    }
+    otaUpSize += up.currentSize;
+    otaBar(otaUpSize, 0);
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!otaUpStarted) return;
+    otaUpStarted = false;
+    if (otaUpSize < 100000) {
+      Update.abort();
+      otaUpErr = L3("файл слишком маленький", "the file is too small", "文件太小");
+    } else if (Update.end(true)) {
+      otaUpOk = true;
+    } else {
+      otaUpErr = Update.errorString();
+    }
+  } else if (otaUpStarted) {
+    Update.abort();
+    otaUpStarted = false;
+    otaUpErr = L3("загрузка прервана", "the upload was interrupted", "上传中断");
+  }
+}
+
+void handleFwDone() {
+  if (!otaUpOk) {
+    server.send(200, "text/plain; charset=utf-8", String(L3("Ошибка: ", "Error: ", "错误：")) + (otaUpErr.length() ? otaUpErr : String("?")));
+    showMsg(String(L3("Обновление не удалось: ", "The update failed: ", "更新失败：")) + otaUpErr, C_RED);
+    return;
+  }
+  server.send(200, "text/plain; charset=utf-8", L3("Прошивка принята. Гаджет перезапускается.", "Firmware received. The device is restarting.", "固件已接收。设备正在重启。"));
+  showMsg(L3("Готово! Перезапускаюсь...", "Done! Restarting...", "完成！正在重启……"), C_GREEN);
+  delay(1500);
+  ESP.restart();
+}
+
+void runUpdate() {
+  for (;;) {
+    std::vector<String> o = splitBar(L3("Проверить в интернете|С телефона (файл .bin)|Назад", "Check online|From phone (.bin file)|Back", "联网检查|从手机（.bin文件）|返回"));
+    int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION), o);
+    if (k == 0) {
+      String msg = otaFromInternet();
+      if (msg.length()) viewAnswer(msg, C_WHITE);
+    } else if (k == 1) {
+      viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет раздел «Обновление прошивки» - выберите там файл .bin. "
+                    "Чтобы отменить - нажмите кнопку на устройстве.",
+                    "The device will now create a Wi-Fi network. Join it from your phone; the \"Firmware update\" section is at the bottom of the page. "
+                    "Press the button on the device to cancel.",
+                    "设备将创建Wi-Fi网络。用手机连接，页面底部有“固件更新”部分，在那里选择.bin文件。按设备上的按钮可取消。"), C_WHITE);
+      runPortal();
+      netIdx = 0;
+      wifiStart();
+    } else {
+      return;
     }
   }
 }
@@ -5596,9 +6314,9 @@ bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Wi-Fi и ключ|Забыть слова|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Wi-Fi and key|Forget words|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|Wi-Fi和密钥|清除词语|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -5608,11 +6326,13 @@ bool runSettings() {
     right.push_back(cfgLang == LANG_RU ? IDLE_RU[cfgIdle] : IDLE_EN[cfgIdle]);
     right.push_back(cfgSaver ? L3("часы", "clock", "时钟") : L3("нет", "off", "关"));
     right.push_back(String("UTC") + (cfgTz >= 0 ? "+" : "") + String(cfgTz));
+    right.push_back(String(L3("чувств. ", "sens. ", "灵敏度 ")) + String(cfgJoy + 1) + "/5");
+    right.push_back(torchOn ? L3("вкл", "on", "开") : L3("выкл", "off", "关"));
     right.push_back(String((int)netSsid.size()) + L3(" сет.", " net.", " 个"));
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
-        cfgLang = (cfgLang + 1) % N_LANGS;
+        cfgLang = (cfgLang + 1) % (ENABLE_CJK ? N_LANGS : 2);
         saveLang();
         changed = true;
         break;
@@ -5640,15 +6360,26 @@ bool runSettings() {
         if (ntpStarted) startNtp();
         break;
       case 6:
+        cfgJoy = (cfgJoy + 1) % 5;                   // 1 - отклонять до упора, 5 - хватает лёгкого наклона
+        saveScreenSettings();
+        break;
+      case 7:
+        torchOn = !torchOn;                          // после перезапуска фонарик всегда выключен
+        digitalWrite(PIN_LED, torchOn ? HIGH : LOW);
+        break;
+      case 8:
         runPortal();
         netIdx = 0;
         wifiStart();
         return true;
-      case 7:
+      case 9:
         sugg.clearLearned();
         saveLearned();
         showMsg(T().forgetDone, C_GREEN);
         delay(1200);
+        break;
+      case 10:
+        runUpdate();
         break;
       default:
         return changed;
@@ -6185,22 +6916,43 @@ struct HiScore {
 };
 std::vector<HiScore> hiScores;
 const char* const HS_KEYS[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "bbrk", "binv",
-                               "bmines", "bsimon", "bttt", "bchess", "brider", "bquiz", "bguess"};
+                               "bmines", "bsimon", "bttt", "bchess", "brider", "bfps", "bquiz", "bguess"};
 const int HS_COUNT = sizeof(HS_KEYS) / sizeof(HS_KEYS[0]);
 
 bool hsLowerBetter(const String& key) { return key == "bmem" || key == "bmines"; }
 
-// Отправить свои рекорды на сервер (после подключения и когда рекорд обновился).
-void hsPublishAll() {
-  hsDirty = false;
-  if (!mqUp || !cfgNick.length()) return;
-  for (int i = 0; i < HS_COUNT; i++) {
+const int HS_COUNT_FWD = HS_COUNT;
+uint32_t hsSent[HS_COUNT];                           // что уже отправлено серверу в этом подключении
+String hsSentNick;
+
+// Отправить очередной свой рекорд (если он изменился). По одному за вызов - сервер не любит залпы.
+void hsSendNext() {
+  if (!mqUp || !cfgNick.length()) {
+    hsNext = HS_COUNT;
+    return;
+  }
+  if (hsSentNick != cfgNick) {                       // сменилось имя - отправить всё заново
+    hsSentNick = cfgNick;
+    for (int i = 0; i < HS_COUNT; i++) hsSent[i] = 0;
+  }
+  while (hsNext < HS_COUNT) {
+    int i = hsNext++;
     uint32_t v = loadBestKey(HS_KEYS[i]);
-    if (!v) continue;
+    if (!v || v == hsSent[i]) continue;
     char b[16];
     snprintf(b, sizeof(b), "%u", (unsigned)v);
     mqWrite(mqtt::publishRetained(std::string("dspocket/v1/hs/") + HS_KEYS[i] + "/" + toStd(roomId), toStd(cfgNick) + "\t" + b));
+    hsSent[i] = v;
+    hsLastSend = millis();
+    return;
   }
+}
+
+// Отправить все свои рекорды сразу (перед показом таблицы).
+void hsPublishAll() {
+  hsDirty = false;
+  hsNext = 0;
+  while (hsNext < HS_COUNT) hsSendNext();
 }
 
 // Пришёл чей-то рекорд: «<игра>/<метка>» и «имя \t число».
@@ -6286,59 +7038,147 @@ void runHiScores() {
 }
 
 // ========================= РАЙДЕР =========================
+// Рисование без мерцания: любой кусок экрана сначала целиком собирается в памяти
+// (небо, земля, мотоцикл), а потом одним махом уходит на экран. Земля не пересчитывается
+// каждый кадр: столбцы просто сдвигаются, считаются только новые справа.
 rider::Game rdr;
 const uint16_t C_RD_SKY = 0x1926, C_RD_GROUND = 0x3D03;
 const int RD_BIKE_X = 70, RD_TOP = 18;
+const int RD_BUF = 1536;
+static uint16_t rdBuf[RD_BUF];
+static int16_t rdCol[240];                               // высота земли в каждом столбце экрана
+static int rdRX, rdRY, rdRW, rdRH;                       // кусок, который сейчас собирается
+static int rdBikeY, rdWx, rdWy, rdUx, rdUy;              // мотоцикл: центр колёс и наклон
+static long rdBarScore = -1;
+static int rdBarSec = -1, rdBarW = 0;
 
-void drawRiderBar() {
-  SmallFont small;
-  tft.fillRect(0, 0, 240, RD_TOP, C_BLACK);
-  char b[48];
-  snprintf(b, sizeof(b), T().gameScore, (unsigned)rdr.score());
-  drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
-  snprintf(b, sizeof(b), "%d %s", (rdr.timeLeft + rider::FPS - 1) / rider::FPS, L3("с", "s", "秒"));
-  drawUtf8(b, 240 - textWidth(b) - 2, 1, rdr.timeLeft < 10 * rider::FPS ? C_RED : C_YELLOW, C_BLACK);
+void rdPlot(int x, int y, uint16_t c) {
+  x -= rdRX;
+  y -= rdRY;
+  if (x >= 0 && x < rdRW && y >= 0 && y < rdRH) rdBuf[y * rdRW + x] = c;
 }
 
-// Мотоцикл: два колеса, рама и голова гонщика. col = цвет неба - стереть.
-void drawBike(int sx, int sy, float angle, bool erase) {
-  float c = cosf(angle), s = sinf(angle);
-  int wx = (int)(7 * c), wy = (int)(7 * s);              // колёса вдоль наклона
-  int ux = (int)(9 * s), uy = (int)(-9 * c);             // «вверх» от мотоцикла
-  int cy = sy - 4;                                        // центр колёс чуть выше земли
-  if (cy - 16 < RD_TOP) return;                           // под строкой счёта не рисуем
-  if (erase) {
-    tft.fillRect(sx - 14, cy - 16, 29, 30, C_RD_SKY);
-    return;
+void rdDisc(int cx, int cy, int r, uint16_t c) {
+  for (int y = -r; y <= r; y++)
+    for (int x = -r; x <= r; x++)
+      if (x * x + y * y <= r * r) rdPlot(cx + x, cy + y, c);
+}
+
+void rdLine(int x0, int y0, int x1, int y1, uint16_t c) {
+  int dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;
+  int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, e = dx + dy;
+  for (;;) {
+    rdPlot(x0, y0, c);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * e;
+    if (e2 >= dy) {
+      e += dy;
+      x0 += sx;
+    }
+    if (e2 <= dx) {
+      e += dx;
+      y0 += sy;
+    }
   }
-  tft.fillCircle(sx - wx, cy - wy, 4, C_WHITE);
-  tft.fillCircle(sx + wx, cy + wy, 4, C_WHITE);
-  tft.fillCircle(sx - wx, cy - wy, 2, C_BLACK);
-  tft.fillCircle(sx + wx, cy + wy, 2, C_BLACK);
-  tft.drawLine(sx - wx, cy - wy, sx + wx, cy + wy, C_YELLOW);
-  tft.drawLine(sx - wx, cy - wy, sx + ux / 2, cy + uy / 2, C_YELLOW);
-  tft.drawLine(sx + wx, cy + wy, sx + ux / 2, cy + uy / 2, C_YELLOW);
-  tft.fillCircle(sx + ux, cy + uy, 3, C_RED);
+}
+
+void rdSetBike(int sy, float angle) {
+  float c = cosf(angle), s = sinf(angle);
+  rdWx = (int)(7 * c);                                   // колёса вдоль наклона
+  rdWy = (int)(7 * s);
+  rdUx = (int)(9 * s);                                   // «вверх» от мотоцикла
+  rdUy = (int)(-9 * c);
+  rdBikeY = sy - 4;                                      // центр колёс чуть выше земли
+}
+
+// Собрать кусок экрана в памяти и вывести. Строку счёта не трогает.
+void rdRegion(int x0, int y0, int w, int h) {
+  if (x0 < 0) {
+    w += x0;
+    x0 = 0;
+  }
+  if (y0 < RD_TOP) {
+    h -= RD_TOP - y0;
+    y0 = RD_TOP;
+  }
+  if (x0 + w > 240) w = 240 - x0;
+  if (y0 + h > 240) h = 240 - y0;
+  if (w <= 0 || h <= 0 || w > RD_BUF) return;
+  int rows = RD_BUF / w;
+  for (int y = y0; y < y0 + h; y += rows) {
+    int n = y0 + h - y < rows ? y0 + h - y : rows;
+    rdRX = x0;
+    rdRY = y;
+    rdRW = w;
+    rdRH = n;
+    for (int i = 0; i < w; i++) {
+      int g = rdCol[x0 + i] - y;                         // с какой строки куска начинается земля
+      uint16_t* p = rdBuf + i;
+      for (int r = 0; r < n; r++, p += w) *p = r >= g ? C_RD_GROUND : C_RD_SKY;
+    }
+    const int sx = RD_BIKE_X, cy = rdBikeY;
+    if (x0 <= sx + 14 && x0 + w > sx - 14 && y <= cy + 13 && y + n > cy - 16) {
+      rdDisc(sx - rdWx, cy - rdWy, 4, C_WHITE);
+      rdDisc(sx + rdWx, cy + rdWy, 4, C_WHITE);
+      rdDisc(sx - rdWx, cy - rdWy, 2, C_BLACK);
+      rdDisc(sx + rdWx, cy + rdWy, 2, C_BLACK);
+      rdLine(sx - rdWx, cy - rdWy, sx + rdWx, cy + rdWy, C_YELLOW);
+      rdLine(sx - rdWx, cy - rdWy, sx + rdUx / 2, cy + rdUy / 2, C_YELLOW);
+      rdLine(sx + rdWx, cy + rdWy, sx + rdUx / 2, cy + rdUy / 2, C_YELLOW);
+      rdDisc(sx + rdUx, cy + rdUy, 3, C_RED);
+    }
+    tft.startWrite();
+    tft.setAddrWindow(x0, y, w, n);
+    tft.writePixels(rdBuf, (uint32_t)(w * n));
+    tft.endWrite();
+  }
+}
+
+// Строка счёта: перерисовывается только то, что изменилось (full - целиком).
+void drawRiderBar(bool full) {
+  SmallFont small;
+  if (full) {
+    tft.fillRect(0, 0, 240, RD_TOP, C_BLACK);
+    rdBarScore = -1;
+    rdBarSec = -1;
+    rdBarW = 0;
+  }
+  char b[48];
+  long sc = (long)rdr.score();
+  if (sc != rdBarScore) {
+    rdBarScore = sc;
+    snprintf(b, sizeof(b), T().gameScore, (unsigned)sc);
+    drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
+  }
+  int sec = (rdr.timeLeft + rider::FPS - 1) / rider::FPS;
+  bool red = rdr.timeLeft < 10 * rider::FPS;
+  if (sec * 2 + (red ? 1 : 0) != rdBarSec) {
+    rdBarSec = sec * 2 + (red ? 1 : 0);
+    snprintf(b, sizeof(b), "%d %s", sec, L3("с", "s", "秒"));
+    int w = textWidth(b);
+    if (w < rdBarW) tft.fillRect(238 - rdBarW, 0, rdBarW - w, RD_TOP, C_BLACK);   // число стало короче
+    rdBarW = w;
+    drawUtf8(b, 238 - w, 1, red ? C_RED : C_YELLOW, C_BLACK);
+  }
 }
 
 void runRider() {
-  static int16_t col[240];                             // высота земли в каждом столбце экрана
   rdr.best = loadBestKey("brider");
   for (;;) {
     rdr.reset();
     tft.fillScreen(C_RD_SKY);
-    float camX = rdr.x - RD_BIKE_X;
+    int cam = (int)rdr.x - RD_BIKE_X;                    // камера двигается целыми точками
     for (int sx = 0; sx < 240; sx++) {
-      int gy = (int)rider::ground(camX + sx);
-      col[sx] = (int16_t)gy;
+      int gy = (int)rider::ground((float)(cam + sx));
+      rdCol[sx] = (int16_t)gy;
       tft.fillRect(sx, gy, 1, 240 - gy, C_RD_GROUND);
     }
-    drawRiderBar();
+    drawRiderBar(true);
     drawSmallCenteredBg(L3("Ручку в сторону - газ", "Push the stick - gas", "推摇杆：油门"), 26, C_WHITE, C_RD_SKY);
     drawSmallCenteredBg(L3("В воздухе газ = сальто", "In the air gas = flip", "空中油门=翻转"), 44, C_WHITE, C_RD_SKY);
-    int obx = RD_BIKE_X, oby = (int)rdr.y;
-    float oang = rdr.angle;
-    drawBike(obx, oby, oang, false);
+    rdSetBike((int)rdr.y, rdr.angle);
+    int oby = rdBikeY;
+    rdRegion(RD_BIKE_X - 14, oby - 16, 29, 30);
     while (joyRaw() == J_NONE) {                        // старт по первому движению ручки
       if (btnEvent() == EV_LONG) return;
       delay(5);
@@ -6351,36 +7191,44 @@ void runRider() {
         saveBestKey("brider", rdr.best);
         return;
       }
-      if ((int32_t)(millis() - next) < 0) {
+      int32_t late = (int32_t)(millis() - next);
+      if (late < 0) {
         delay(1);
         continue;
       }
+      if (late > 100) next = millis();                  // сильно отстали - не догоняем рывком
       next += 1000 / rider::FPS;
       int dx, dy;
       joyAnalog(dx, dy);
-      bool gas = dx > 900 || dx < -900 || dy > 900 || dy < -900;
+      int gt = joyThr() * 4 / 5;
+      bool gas = dx > gt || dx < -gt || dy > gt || dy < -gt;
       int res = rdr.step(gas);
       if (res == 1) beep(1, 1000, 6);
       if (res == 2) beep(1, rdr.lastFlips ? 1700 : 500, rdr.lastFlips ? 40 : 8);
-      // стереть мотоцикл, сдвинуть землю, нарисовать мотоцикл
-      drawBike(obx, oby, oang, true);
-      camX = rdr.x - RD_BIKE_X;
-      for (int sx = 0; sx < 240; sx++) {
-        int gy = (int)rider::ground(camX + sx);
-        int py = col[sx];
-        bool inBike = sx >= obx - 14 && sx <= obx + 14;   // здесь только что стирали - дорисовать землю целиком
-        if (inBike) {
-          int top = gy < oby - 20 ? oby - 20 : gy;
-          if (top < oby + 10) tft.fillRect(sx, top, 1, oby + 10 - top, C_RD_GROUND);
+      // земля: сдвигаем столбцы, считаем только новые справа, перерисовываем узкие полоски, где что-то изменилось
+      int ncam = (int)rdr.x - RD_BIKE_X;
+      int shift = ncam - cam;
+      cam = ncam;
+      rdSetBike((int)rdr.y, rdr.angle);
+      if (shift < 0 || shift > 240) shift = 240;
+      for (int cx = 0; cx < 240; cx += 8) {
+        int lo = 999, hi = -1;
+        for (int sx = cx; sx < cx + 8; sx++) {
+          int py = rdCol[sx];
+          int gy = sx + shift < 240 ? rdCol[sx + shift] : (int)rider::ground((float)(cam + sx));
+          if (gy != py) {
+            int a = gy < py ? gy : py, b2 = gy < py ? py : gy;
+            if (a < lo) lo = a;
+            if (b2 > hi) hi = b2;
+            rdCol[sx] = (int16_t)gy;
+          }
         }
-        if (gy < py) tft.fillRect(sx, gy, 1, py - gy, C_RD_GROUND);
-        else if (gy > py) tft.fillRect(sx, py, 1, gy - py, C_RD_SKY);
-        col[sx] = (int16_t)gy;
+        if (hi > lo) rdRegion(cx, lo, 8, hi - lo);
       }
-      obx = RD_BIKE_X;
-      oby = (int)rdr.y;
-      oang = rdr.angle;
-      drawBike(obx, oby, oang, false);
+      // мотоцикл: один кусок, накрывающий и старое место, и новое
+      int top = (oby < rdBikeY ? oby : rdBikeY) - 16, bot = (oby > rdBikeY ? oby : rdBikeY) + 14;
+      rdRegion(RD_BIKE_X - 14, top, 29, bot - top);
+      oby = rdBikeY;
       if (res == 2 && rdr.lastFlips) {
         char b[32];
         snprintf(b, sizeof(b), "%s x%d  +2 %s", L3("Сальто", "Flip", "翻转"), rdr.lastFlips, L3("с", "s", "秒"));
@@ -6389,14 +7237,292 @@ void runRider() {
       } else if (msgFrames && --msgFrames == 0) {
         tft.fillRect(0, 26, 240, 16, C_RD_SKY);
       }
-      if (++frame % 6 == 0) drawRiderBar();
+      if (++frame % 6 == 0) drawRiderBar(false);
     }
     saveBestKey("brider", rdr.best);
-    drawRiderBar();
+    drawRiderBar(false);
     delay(500);
     char b[48];
     snprintf(b, sizeof(b), T().gameScore, (unsigned)rdr.score());
     if (!resultBox(rdr.crashed ? L3("Авария!", "Crash!", "摔车！") : L3("Время вышло", "Time is up", "时间到"), b, rdr.crashed ? C_RED : C_YELLOW)) return;
+  }
+}
+
+// ========================= ПОДЗЕМЕЛЬЕ 3D =========================
+// Стрелялка от первого лица. Картинка собирается в памяти полосками по 8 точек и сразу уходит на экран.
+fps3d::Game f3;
+const int F3_W = 240, F3_H = 180, F3_RAYS = 120, F3_SPR = 24;
+static uint16_t f3Tex[3][2][256];                        // рисунки стен: 3 вида, светлая и тёмная грань
+static uint16_t f3Row[F3_H];                             // цвет потолка и пола по строкам
+static int32_t f3Dist[F3_RAYS];
+static int16_t f3LineH[F3_RAYS];
+static uint8_t f3Kind[F3_RAYS], f3U[F3_RAYS];
+static int16_t f3SprLeft[F3_SPR], f3SprTop[F3_SPR], f3SprSize[F3_SPR];
+static int32_t f3SprDepth[F3_SPR];
+static const char* const* f3SprArt[F3_SPR];
+static bool f3SprWhite[F3_SPR];
+static uint8_t f3SprOrder[F3_SPR];
+static int f3SprN = 0;
+static uint32_t f3Frame = 0;
+static bool f3Walking = false;
+static int f3HudHp = -1, f3HudAmmo = -1;
+static long f3HudInfo = -1;
+
+void f3Init() {
+  for (int t = 0; t < 3; t++)
+    for (int v = 0; v < 16; v++)
+      for (int u = 0; u < 16; u++) {
+        uint16_t c = fps3d::wallTexel(t + 1, u, v);
+        f3Tex[t][0][v * 16 + u] = c;
+        f3Tex[t][1][v * 16 + u] = (uint16_t)(((c >> 1) & 0x7BEF) + ((c >> 2) & 0x39E7));   // 3/4 яркости
+      }
+  for (int y = 0; y < F3_H; y++) {
+    int d = y < F3_H / 2 ? F3_H / 2 - y : y - F3_H / 2 + 1;    // чем дальше от горизонта, тем светлее
+    int k = 6 + d * 20 / (F3_H / 2);                            // 6..26
+    if (y < F3_H / 2) f3Row[y] = (uint16_t)(((k / 3) << 11) | ((k * 2 / 3) << 5) | (k / 2));            // потолок: серо-синий
+    else f3Row[y] = (uint16_t)(((k * 2 / 3) << 11) | ((k * 3 / 4) << 5) | (k / 4));                     // пол: бурый
+  }
+}
+
+// Посчитать лучи и то, что видно (враги, вещи).
+void f3Cast() {
+  float c = cosf(f3.pa), s = sinf(f3.pa);
+  float plx = -s * 0.66f, ply = c * 0.66f;
+  int32_t px = (int32_t)(f3.px * 65536.0f), py = (int32_t)(f3.py * 65536.0f);
+  int32_t dirX = (int32_t)(c * 65536.0f), dirY = (int32_t)(s * 65536.0f);
+  int32_t plX = (int32_t)(plx * 65536.0f), plY = (int32_t)(ply * 65536.0f);
+  fps3d::Hit h;
+  for (int r = 0; r < F3_RAYS; r++) {
+    int32_t cam = ((2 * r + 1 - F3_RAYS) * 65536) / F3_RAYS;
+    int32_t rdx = dirX + (int32_t)(((int64_t)plX * cam) >> 16), rdy = dirY + (int32_t)(((int64_t)plY * cam) >> 16);
+    fps3d::castRay(f3.map, px, py, rdx, rdy, h);
+    f3Dist[r] = h.dist;
+    int lh = (int)((((int64_t)F3_H) << 16) / h.dist);
+    f3LineH[r] = (int16_t)(lh > 2000 ? 2000 : lh < 1 ? 1 : lh);
+    f3Kind[r] = (uint8_t)((h.type - 1) * 2 + h.side);
+    f3U[r] = h.u;
+  }
+  f3SprN = 0;
+  for (int i = 0; i < f3.nThings && f3SprN < F3_SPR; i++) {
+    const fps3d::Thing& t = f3.things[i];
+    bool enemy = t.kind <= fps3d::K_MAGE;
+    if (!t.alive && !(enemy && t.deadT)) continue;
+    float rx = t.x - f3.px, ry = t.y - f3.py;
+    float tx = (s * rx - c * ry) / -0.66f;
+    float ty = (-ply * rx + plx * ry) / -0.66f;          // глубина
+    if (ty < 0.2f) continue;
+    float full = F3_H / ty;
+    float k = enemy ? 0.78f : t.kind == fps3d::K_EXIT ? 0.8f : 0.42f;
+    int size = (int)(full * k);
+    if (size < 2) continue;
+    if (size > 500) size = 500;
+    int cx = (int)((F3_W / 2) * (1.0f + tx / ty));
+    int bottom = F3_H / 2 + (int)(full / 2);
+    if (t.kind == fps3d::K_MAGE && t.alive) bottom -= (int)(full * 0.12f);   // колдун парит
+    if (t.kind == fps3d::K_EXIT) bottom -= (int)(full * 0.08f);
+    int left = cx - size / 2;
+    if (left >= F3_W || left + size <= 0) continue;
+    int n = f3SprN++;
+    f3SprLeft[n] = (int16_t)left;
+    f3SprTop[n] = (int16_t)(bottom - size);
+    f3SprSize[n] = (int16_t)size;
+    f3SprDepth[n] = (int32_t)(ty * 65536.0f);
+    f3SprWhite[n] = enemy && t.alive && (t.hurt > 0 || t.attack > 3);
+    f3SprArt[n] = !t.alive ? fps3d::ART_SPLAT : t.kind == fps3d::K_GRUNT ? fps3d::ART_GRUNT : t.kind == fps3d::K_MAGE ? fps3d::ART_MAGE
+                  : t.kind == fps3d::K_MED ? fps3d::ART_MED : t.kind == fps3d::K_AMMO ? fps3d::ART_AMMO : fps3d::ART_EXIT;
+  }
+  for (int i = 0; i < f3SprN; i++) f3SprOrder[i] = (uint8_t)i;
+  for (int i = 1; i < f3SprN; i++)                       // дальние рисуются первыми
+    for (int j = i; j > 0 && f3SprDepth[f3SprOrder[j]] > f3SprDepth[f3SprOrder[j - 1]]; j--) {
+      uint8_t t = f3SprOrder[j];
+      f3SprOrder[j] = f3SprOrder[j - 1];
+      f3SprOrder[j - 1] = t;
+    }
+}
+
+// Столбец картинки 16x16, растянутый на size точек, в полоску (шаг по памяти 8).
+void f3ArtColumn(const char* const* art, int tx, int top, int size, bool white, uint16_t* col) {
+  uint16_t pal[16];
+  for (int v = 0; v < 16; v++) {
+    uint16_t c = fps3d::artColor(art[v][tx]);
+    pal[v] = c && white ? 0xFFFF : c;
+  }
+  int y0 = top < 0 ? 0 : top, y1 = top + size > F3_H ? F3_H : top + size;
+  uint32_t st = (16u << 16) / (uint32_t)size, tp = (uint32_t)(y0 - top) * st;
+  uint16_t* p = col + y0 * 8;
+  for (int y = y0; y < y1; y++, p += 8, tp += st) {
+    uint16_t c = pal[(tp >> 16) & 15];
+    if (c) *p = c;
+  }
+}
+
+void f3Draw() {
+  f3Cast();
+  int gunY = F3_H - 64 + (f3.shotFlash ? 8 : 0) + (f3Walking && ((f3Frame >> 2) & 1) ? 3 : 0);
+  for (int sx0 = 0; sx0 < F3_W; sx0 += 8) {
+    for (int i = 0; i < 8; i += 2) {                     // стены, потолок, пол: луч на две точки
+      int r = (sx0 + i) / 2;
+      int h = f3LineH[r], top = (F3_H - h) / 2;
+      const uint16_t* tex = f3Tex[f3Kind[r] >> 1][f3Kind[r] & 1] + f3U[r];
+      bool farWall = f3Dist[r] > (6 << 16);
+      uint32_t st = (16u << 16) / (uint32_t)h, tp = top < 0 ? (uint32_t)(-top) * st : 0;
+      int y0 = top < 0 ? 0 : top, y1 = top + h > F3_H ? F3_H : top + h;
+      uint16_t* p = rdBuf + i;
+      int y = 0;
+      for (; y < y0; y++, p += 8) p[0] = p[1] = f3Row[y];
+      for (; y < y1; y++, p += 8, tp += st) {
+        uint16_t c = tex[((tp >> 16) & 15) << 4];
+        if (farWall) c = (c >> 1) & 0x7BEF;
+        p[0] = p[1] = c;
+      }
+      for (; y < F3_H; y++, p += 8) p[0] = p[1] = f3Row[y];
+    }
+    for (int i = 0; i < 8; i++) {
+      int x = sx0 + i;
+      for (int k = 0; k < f3SprN; k++) {                 // враги и вещи, если не за стеной
+        int n = f3SprOrder[k];
+        int rel = x - f3SprLeft[n];
+        if (rel < 0 || rel >= f3SprSize[n] || f3SprDepth[n] >= f3Dist[x / 2]) continue;
+        f3ArtColumn(f3SprArt[n], rel * 16 / f3SprSize[n], f3SprTop[n], f3SprSize[n], f3SprWhite[n], rdBuf + i);
+      }
+      if (x >= 88 && x < 152) {                          // оружие
+        if (f3.shotFlash == 2) {                         // вспышка выстрела
+          int dx = x - 120;
+          for (int dy = -9; dy <= 9; dy++) {
+            int yy = gunY + 8 + dy;
+            if (dx * dx + dy * dy <= 81 && yy >= 0 && yy < F3_H) rdBuf[yy * 8 + i] = dx * dx + dy * dy < 25 ? 0xFFFF : 0xFFE0;
+          }
+        }
+        f3ArtColumn(fps3d::ART_GUN, (x - 88) / 4, gunY, 64, false, rdBuf + i);
+      }
+      if (x >= 116 && x <= 123) {                        // прицел
+        if (x == 119 || x == 120) {
+          rdBuf[86 * 8 + i] = rdBuf[87 * 8 + i] = rdBuf[92 * 8 + i] = rdBuf[93 * 8 + i] = 0xFFFF;
+        } else if (x <= 117 || x >= 122) {
+          rdBuf[89 * 8 + i] = rdBuf[90 * 8 + i] = 0xFFFF;
+        }
+      }
+    }
+    if (f3.hurtFlash)                                    // ранили - экран краснеет
+      for (int k = 0; k < 8 * F3_H; k++) rdBuf[k] = (uint16_t)(((rdBuf[k] >> 1) & 0x7BEF) + 0x7800);
+    tft.startWrite();
+    tft.setAddrWindow(sx0, 0, 8, F3_H);
+    tft.writePixels(rdBuf, (uint32_t)(8 * F3_H));
+    tft.endWrite();
+  }
+  f3Frame++;
+}
+
+// Нижняя панель: здоровье, патроны, уровень и счёт. Рисуется только изменившееся.
+void f3Hud(bool full) {
+  if (full) {
+    tft.fillRect(0, F3_H, 240, 240 - F3_H, C_BLACK);
+    tft.fillRect(0, F3_H, 240, 2, 0x4208);
+    f3HudHp = f3HudAmmo = -1;
+    f3HudInfo = -1;
+  }
+  char b[64];
+  if (f3.hp != f3HudHp) {
+    f3HudHp = f3.hp;
+    tft.fillRect(0, F3_H + 5, 118, 26, C_BLACK);
+    snprintf(b, sizeof(b), "%s %d", L3("Жизнь", "HP", "生命"), f3.hp);
+    drawUtf8(b, 4, F3_H + 6, f3.hp < 30 ? C_RED : C_GREEN, C_BLACK);
+  }
+  if (f3.ammo != f3HudAmmo) {
+    f3HudAmmo = f3.ammo;
+    tft.fillRect(118, F3_H + 5, 122, 26, C_BLACK);
+    snprintf(b, sizeof(b), "%s %d", L3("Патр.", "Ammo", "子弹"), f3.ammo);
+    drawUtf8(b, 236 - textWidth(b), F3_H + 6, f3.ammo ? C_YELLOW : C_RED, C_BLACK);
+  }
+  long info = (long)f3.score * 100 + f3.level;
+  if (info != f3HudInfo) {
+    f3HudInfo = info;
+    SmallFont small;
+    tft.fillRect(0, F3_H + 36, 240, 18, C_BLACK);
+    snprintf(b, sizeof(b), "%s %d", L3("Уровень", "Level", "关卡"), f3.level + 1);
+    drawUtf8(b, 4, F3_H + 38, C_WHITE, C_BLACK);
+    snprintf(b, sizeof(b), T().gameScore, (unsigned)f3.score);
+    drawUtf8(b, 236 - textWidth(b), F3_H + 38, C_WHITE, C_BLACK);
+  }
+}
+
+void runFps3d() {
+  static bool inited = false;
+  if (!inited) {
+    f3Init();
+    inited = true;
+  }
+  f3.best = loadBestKey("bfps");
+  for (;;) {
+    f3.reset(millis() | 1);
+    f3Walking = false;
+    f3Hud(true);
+    f3Draw();
+    drawSmallCenteredBg(L3("Ручка: идти и поворачивать", "Stick: walk and turn", "摇杆：移动和转向"), 30, C_WHITE, C_BLACK);
+    drawSmallCenteredBg(L3("Кнопка: выстрел", "Button: shoot", "按键：射击"), 50, C_WHITE, C_BLACK);
+    drawSmallCenteredBg(L3("Найдите синий портал", "Find the blue portal", "找到蓝色传送门"), 70, C_YELLOW, C_BLACK);
+    drawSmallCenteredBg(L3("Держать кнопку: выход", "Hold the button: exit", "长按：退出"), 90, 0xAD55, C_BLACK);
+    for (;;) {                                           // старт по ручке или кнопке
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) return;
+      if (e == EV_CLICK || joyRaw() != J_NONE) break;
+      delay(5);
+    }
+    const uint32_t TICK = 1000 / fps3d::TICKS;
+    uint32_t last = millis();
+    bool wasDown = false, fire = false;
+    while (!f3.over) {
+      if (btnEvent() == EV_LONG) {
+        saveBestKey("bfps", f3.best);
+        return;
+      }
+      bool down = digitalRead(PIN_SW) == LOW;            // выстрел сразу по нажатию, не дожидаясь отпускания
+      if (down && !wasDown) fire = true;
+      wasDown = down;
+      uint32_t behind = millis() - last;
+      if (behind < TICK) {
+        delay(1);
+        continue;
+      }
+      int steps = (int)(behind / TICK);
+      if (steps > 3) {                                   // экран не успевает - не копим долг
+        steps = 3;
+        last = millis() - 3 * TICK;
+      }
+      last += (uint32_t)steps * TICK;
+      int dx, dy;
+      joyAnalog(dx, dy);
+      int dead = joyThr() / 4, lim = joyThr();
+      float turn = dx > dead ? (float)(dx - dead) / (lim - dead) : dx < -dead ? (float)(dx + dead) / (lim - dead) : 0;
+      float fwd = dy < -dead ? (float)(-dy - dead) / (lim - dead) : dy > dead ? -(float)(dy - dead) / (lim - dead) : 0;
+      if (turn > 1) turn = 1;
+      if (turn < -1) turn = -1;
+      if (fwd > 1) fwd = 1;
+      if (fwd < -1) fwd = -1;
+      f3Walking = fwd > 0.3f || fwd < -0.3f;
+      int ev = 0;
+      for (int i = 0; i < steps && !f3.over; i++) {
+        ev |= f3.step(fwd, turn, fire);
+        fire = false;
+      }
+      if (ev & fps3d::EV_LEVEL) {
+        saveBestKey("bfps", f3.best);
+        sndWin();
+        last = millis();
+      } else if (ev & fps3d::EV_HURT) beep(1, 220, 14);
+      else if (ev & fps3d::EV_KILL) beep(1, 1900, 10);
+      else if (ev & fps3d::EV_SHOT) beep(1, 700, 5);
+      else if (ev & fps3d::EV_EMPTY) beep(1, 300, 4);
+      else if (ev & fps3d::EV_PICK) beep(1, 1500, 10);
+      f3Hud(false);
+      f3Draw();
+    }
+    saveBestKey("bfps", f3.best);
+    sndLose();
+    delay(600);
+    char b[48];
+    snprintf(b, sizeof(b), T().gameScore, (unsigned)f3.score);
+    if (!resultBox(L3("Вы погибли", "You died", "你死了"), b, C_RED)) return;
   }
 }
 
@@ -7021,6 +8147,7 @@ const char* gameTitle(const char* key) {
   if (k == "bttt") return L3("Крестики-нолики", "Tic-tac-toe", "井字棋");
   if (k == "bchess") return L3("Шахматы", "Chess", "国际象棋");
   if (k == "brider") return L3("Райдер", "Rider", "摩托骑手");
+  if (k == "bfps") return L3("Подземелье 3D", "Dungeon 3D", "地牢3D");
   if (k == "bquiz") return T().gQuiz;
   if (k == "bguess") return T().gGuess;
   return key;
@@ -7035,9 +8162,10 @@ void runGamesMenu() {
                                  L3("Сапёр", "Minesweeper", "扫雷"), L3("Повтори", "Repeat", "记忆重复"),
                                  L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), L3("Крестики по сети", "Tic-tac-toe online", "联网井字棋"),
                                  L3("Шахматы", "Chess", "国际象棋"),
-                                 T().gQuiz, T().gStory, T().gGuess, L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
+                                 T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
+                                 L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "bchess", "bquiz", "", "bguess", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "bchess", "bquiz", "", "bguess", "bfps", "", ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
@@ -7065,7 +8193,8 @@ void runGamesMenu() {
       case 17: runQuiz(); break;
       case 18: runStory(); break;
       case 19: runGuess(); break;
-      case 20: runHiScores(); break;
+      case 20: runFps3d(); break;
+      case 21: runHiScores(); break;
       default: return;                               // «Назад» или удержание
     }
   }
@@ -7073,6 +8202,8 @@ void runGamesMenu() {
 
 // ========================= ОСНОВНАЯ ПРОГРАММА =========================
 void setup() {
+  pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик
+  digitalWrite(PIN_LED, LOW);
   Serial.begin(115200);
   delay(3000);                       // время на USB и питание
   Serial.println("1: start");
