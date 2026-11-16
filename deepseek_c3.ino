@@ -28,6 +28,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include "driver/gpio.h"
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -111,11 +112,16 @@ const uint32_t LONG_PRESS_MS = 700;
 #define LOW_TX_POWER 1          // 1 = занизить мощность Wi-Fi (помогает платам Super Mini)
 
 // Пины
-// Индикатор батареи. Включайте (true) ТОЛЬКО после перепайки:
-// RES экрана перенести с GPIO3 на GPIO21 (на плате подписан 21 или TX), а на GPIO3 повесить делитель 100к/100к
-// от вывода 5V. Оставлять RES на 3V3 нельзя: экрану без вывода CS нужен настоящий сброс, иначе он не запускается.
-// false - старая схема: RES экрана на GPIO3, процентов батареи нет.
-const bool BATTERY_ENABLED = true;
+// Сброс экрана (RES) и индикатор батареи. Прошивка одна для обеих схем и разбирается сама:
+//  - старая схема: RES экрана на GPIO3, процентов батареи нет;
+//  - схема с батареей: RES экрана на GPIO21 (на плате подписан 21 или TX), а на GPIO3 - делитель 100к/100к от вывода 5V.
+// При включении сброс подаётся на обе ножки, потом по напряжению на GPIO3 видно, есть ли там делитель.
+// Оставлять RES на 3V3 нельзя: экрану без вывода CS нужен настоящий сброс, иначе он не запускается.
+// BATTERY_MODE: -1 - определять самой (обычно так), 0 - батареи нет, 1 - батарея есть (если определяется неверно).
+#ifndef BATTERY_MODE
+#define BATTERY_MODE -1
+#endif
+bool BATTERY_ENABLED = false;      // выясняется при включении
 
 // Пищалка (необязательно): «+» на GPIO20 (на плате подписан 20 или RX), «-» на GND.
 // Пассивная (пьезо, умеет разные ноты) - false; активная (со своим генератором, только «бип») - true.
@@ -149,7 +155,7 @@ const int PIN_LED = 2;
 bool torchOn = false;
 
 const int PIN_SCK = 4, PIN_MOSI = 6, PIN_DC = 5, PIN_BLK = 10;
-const int PIN_RST = BATTERY_ENABLED ? 21 : 3;   // сброс экрана: GPIO21 (после перепайки под батарею) или GPIO3
+const int PIN_RST_A = 21, PIN_RST_B = 3;        // сброс экрана: GPIO21 (схема с батареей) или GPIO3 (старая схема)
 const int PIN_BAT = 3;                          // середина делителя напряжения батареи
 
 // Батарея
@@ -886,7 +892,7 @@ struct SmallFont {
   ~SmallFont() { g_big = prev; }
 };
 
-Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, -1, PIN_DC, PIN_RST);  // -1 = без CS
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, -1, PIN_DC, -1);  // без CS; сброс делаем сами (displayReset)
 static uint16_t cbuf[24 * 24];
 
 // Номер иероглифа в font_cjk.h (двоичный поиск) или -1.
@@ -1882,6 +1888,46 @@ bool waitWifi(bool allowGames) {
 }
 
 // ========================= БАТАРЕЯ =========================
+// Сброс экрана и определение схемы. Сброс подаём сразу на GPIO21 и GPIO3: к какой бы ножке ни был припаян RES,
+// экран его получит. Потом смотрим на GPIO3 со слабой подтяжкой к земле: делитель батареи (100к/100к) даёт
+// при этом 0,5-1,6 В; свободная ножка или RES экрана - около нуля либо около 3 В.
+void displayReset() {
+  pinMode(PIN_RST_A, OUTPUT);
+  pinMode(PIN_RST_B, OUTPUT);
+  digitalWrite(PIN_RST_A, HIGH);
+  digitalWrite(PIN_RST_B, HIGH);
+  delay(100);
+  digitalWrite(PIN_RST_A, LOW);
+  digitalWrite(PIN_RST_B, LOW);
+  delay(100);
+  digitalWrite(PIN_RST_A, HIGH);     // GPIO21 так и остаётся выходом с «1»
+  digitalWrite(PIN_RST_B, HIGH);
+  delay(20);
+  bool bat = BATTERY_MODE == 1;
+  uint32_t mv = 0;
+  if (BATTERY_MODE < 0) {
+    pinMode(PIN_RST_B, INPUT);
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_BAT, ADC_11db);
+    analogReadMilliVolts(PIN_BAT);                   // первое чтение переключает ножку в режим измерения
+    gpio_pulldown_en((gpio_num_t)PIN_BAT);
+    delay(30);
+    for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BAT);
+    mv /= 8;
+    gpio_pulldown_dis((gpio_num_t)PIN_BAT);
+    bat = mv >= 450 && mv <= 1600;
+  }
+  BATTERY_ENABLED = bat;
+  if (bat) {
+    pinMode(PIN_RST_B, INPUT);                       // GPIO3 меряет батарею
+  } else {
+    pinMode(PIN_RST_B, OUTPUT);                      // GPIO3 держит RES экрана в «1»
+    digitalWrite(PIN_RST_B, HIGH);
+  }
+  delay(200);                                        // экрану нужно время после сброса
+  Serial.printf("reset done, GPIO3 with pull-down: %u mV, battery %d\n", (unsigned)mv, (int)bat);
+}
+
 float batVolts = 0;          // сглаженное напряжение
 uint32_t batNextMs = 0;
 int batShownPct = -2;        // что сейчас нарисовано (-1 = USB)
@@ -8214,6 +8260,7 @@ void setup() {
   g_bgTick = roomTick;               // комната принимает сообщения в фоне, пока вы на экране ввода
   noteActivity();
 
+  displayReset();                    // сброс экрана на обеих ножках + есть ли батарея
   SPI.begin(PIN_SCK, -1, PIN_MOSI, -1);
   tft.init(240, 240, SPI_MODE3);     // модули без CS работают в режиме 3
   tft.setRotation(TFT_ROTATION);
