@@ -18,6 +18,8 @@ class Parser {
  public:
   bool degrees = true;   // углы в градусах
   double ans = 0;        // результат прошлого вычисления
+  bool allowX = false;   // разрешена переменная x (графики, уравнения, пределы)
+  double x = 0;          // её значение
 
   double eval(const std::string& s, Err& err) {
     src = s;
@@ -225,6 +227,10 @@ class Parser {
     }
     if (eat("\xCF\x80") || eat("pi")) return M_PI;               // π
     if (eat("Ans")) return ans;
+    if (allowX && at("x")) {
+      p += 1;
+      return x;
+    }
     if (eat("\xE2\x88\x9A")) {                                   // √
       double v = arg();
       if (v < 0) fail(E_MATH);
