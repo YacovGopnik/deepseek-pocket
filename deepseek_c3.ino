@@ -1731,6 +1731,7 @@ void buildScanList() {
   WiFi.scanDelete();
 }
 
+void viewAnswer(const String& utf8, uint16_t fg);
 // Точка доступа + страница настройки. Возвращается при отмене кнопкой,
 // после сохранения перезапускает плату.
 void runPortal() {
@@ -1740,9 +1741,35 @@ void runPortal() {
   delay(300);
   WiFi.mode(WIFI_AP_STA);
   delay(200);
+#if LOW_TX_POWER
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
   buildScanList();
-  WiFi.softAP(AP_NAME);
+  // Точка доступа: открытая сеть на канале 1. Если не включилась - пробуем ещё раз.
+  bool apOk = false;
+  for (int attempt = 0; attempt < 3 && !apOk; attempt++) {
+    apOk = WiFi.softAP(AP_NAME, nullptr, 1, 0, 4);
+    if (!apOk) {
+      WiFi.mode(WIFI_OFF);
+      delay(300);
+      WiFi.mode(WIFI_AP_STA);
+      delay(300);
+    }
+  }
+#if LOW_TX_POWER
+  // У плат Super Mini на полной мощности точку доступа часто не видно: мощность ставим после запуска точки,
+  // иначе запуск её снова поднимает.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
   delay(300);
+  Serial.printf("Wi-Fi setup: access point %s %s, IP %s\n", AP_NAME, apOk ? "started" : "FAILED", WiFi.softAPIP().toString().c_str());
+  if (!apOk) {
+    viewAnswer(L3("Не удалось включить сеть для настройки. Перезапустите гаджет и попробуйте ещё раз.",
+                  "Could not start the setup network. Restart the device and try again.", "无法启动设置网络。请重启设备后重试。"),
+               C_RED);
+    WiFi.mode(WIFI_STA);
+    return;
+  }
   dns.start(53, "*", WiFi.softAPIP());
   if (!serverReady) {
     server.on("/", HTTP_GET, handleRoot);
