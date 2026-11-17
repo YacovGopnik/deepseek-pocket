@@ -1377,7 +1377,8 @@ int picFreeSlot() {
   return -1;
 }
 
-bool picRoom() { return LittleFS.totalBytes() - LittleFS.usedBytes() > 60000; }   // оставляем запас памяти
+// Хватит ли места на картинку размером n байт (с запасом на служебные данные файловой системы).
+bool picRoomFor(size_t n) { return LittleFS.totalBytes() - LittleFS.usedBytes() > n + 12000; }
 
 // Сохранить готовый JPEG из памяти (например, найденную в интернете картинку). Пустая строка - успех, иначе причина.
 String savePic(const uint8_t* data, size_t n) {
@@ -1385,7 +1386,7 @@ String savePic(const uint8_t* data, size_t n) {
   if (n > MAX_PIC_BYTES) return L3("файл слишком большой", "the file is too big", "文件太大");
   int slot = picFreeSlot();
   if (slot < 0) return L3("галерея заполнена (30)", "the gallery is full (30)", "相册已满（30）");
-  if (!picRoom()) return L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
+  if (!picRoomFor(n)) return L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
   File f = LittleFS.open(picPath(slot).c_str(), "w");
   if (!f) return L3("не удалось записать", "cannot write the file", "无法写入");
   size_t w = f.write(data, n);
@@ -1420,7 +1421,7 @@ void handlePicUpload() {
     int slot = picFreeSlot();
     if (slot < 0) {
       picErr = L3("галерея заполнена (30). Удалите лишнее на устройстве.", "the gallery is full (30)", "相册已满（30）");
-    } else if (!picRoom()) {
+    } else if (!picRoomFor(16000)) {                 // с телефона приходит до ~14 КБ
       picErr = L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
     } else {
       picFilePath = picPath(slot);
@@ -1653,7 +1654,7 @@ void handleRoot() {
        "var im=await new Promise(function(res,rej){var m=new Image();m.onload=function(){res(m)};m.onerror=function(){rej('image')};m.src=URL.createObjectURL(fs[i])});"
        "var k=Math.min(240/im.width,200/im.height,1),w=Math.max(8,Math.round(im.width*k)),hh=Math.max(8,Math.round(im.height*k));"
        "var c=document.createElement('canvas');c.width=w;c.height=hh;var g=c.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,w,hh);g.drawImage(im,0,0,w,hh);"
-       "var q=0.85,b;do{b=await new Promise(function(r){c.toBlob(r,'image/jpeg',q)});q-=0.15}while(b&&b.size>30000&&q>0.2);"
+       "var q=0.8,b;do{b=await new Promise(function(r){c.toBlob(r,'image/jpeg',q)});q-=0.1}while(b&&b.size>14000&&q>0.25);"
        "var fd=new FormData();fd.append('f',b,'p.jpg');var r=await fetch('/pic',{method:'POST',body:fd});var t=await r.text();"
        "if(t.indexOf('OK')==0)ok++;else{s.textContent=T3+t;this.value='';return}"
        "}catch(e){s.textContent=T3+e;this.value='';return}}"
@@ -4668,6 +4669,24 @@ int httpGetText(const String& url, String& body) {
   body = code > 0 ? http.getString() : HTTPClient::errorToString(code);
   http.end();
   Serial.printf("[get] %d, %u bytes\n", code, (unsigned)body.length());
+  if (code < 0) {
+    Serial.printf("[get] %s failed, heap %u, largest block %u\n", url.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    // Погода (Open-Meteo) отвечает и без шифрования: если защищённое соединение не установилось
+    // (сеть не пускает или не хватило памяти) - пробуем обычное. Ключей и личных данных в этих адресах нет.
+    if (url.startsWith("https://") && url.indexOf("open-meteo.com/") > 0) {
+      WiFiClient plain;
+      HTTPClient h2;
+      h2.setUserAgent(APP_UA);
+      h2.setConnectTimeout(15000);
+      h2.setTimeout(15000);
+      if (h2.begin(plain, String("http://") + url.substring(8))) {
+        code = h2.GET();
+        body = code > 0 ? h2.getString() : HTTPClient::errorToString(code);
+        h2.end();
+        Serial.printf("[get] plain http: %d, %u bytes\n", code, (unsigned)body.length());
+      }
+    }
+  }
   return code;
 }
 
