@@ -17,6 +17,7 @@
 // Экран: RES подключить к 3V3 (сброс программный), GPIO3 занят измерением батареи.
 // Батарея: плюс (после выключателя) - 100 кОм - GPIO3 - 100 кОм - GND.
 //
+// Калькулятор: 2nd - вторая страница клавиш; переменная x, график y(x), решение уравнений x=? (см. README).
 // Чат помнит последние сообщения (DeepSeek видит переписку). Меню - «Новый чат».
 // Меню «Игры»: Блоки, 2048, Змейка, Падающие блоки, Лабиринт, Память, Пинг-понг, Летящая птичка
 // псевдо-3D Гонка и игры с DeepSeek: Викторина, Приключение, «Угадай, кто я». Рекорды сохраняются,
@@ -64,6 +65,7 @@
 #include "race_game.h"
 #include "pixabay.h"
 #include "calc.h"
+#include "calc_solve.h"
 #include "tools.h"
 #include "games2.h"
 #include "chess.h"
@@ -73,7 +75,6 @@
 #include "rider_game.h"
 #include "shooter3d.h"
 #include "ir_remote.h"
-#include "math_tools.h"
 #include <time.h>
 
 // Поиск картинок (Wikimedia Commons). Нужна библиотека TJpg_Decoder (Менеджер библиотек, автор Bodmer).
@@ -4676,38 +4677,39 @@ struct CalcKey {
   const char* label;     // что написано на клавише
   const char* ins;       // что вставить (nullptr - особое действие по label)
 };
-const CalcKey CALC_KEYS[6][6] = {
-  {{"sin", "sin("}, {"cos", "cos("}, {"tan", "tan("}, {"(", "("}, {")", ")"}, {"<-", nullptr}},
-  {{"asin", "asin("}, {"acos", "acos("}, {"atan", "atan("}, {"x\xC2\xB2", "\xC2\xB2"}, {"^", "^"}, {"C", nullptr}},
-  {{"ln", "ln("}, {"log", "log("}, {"7", "7"}, {"8", "8"}, {"9", "9"}, {"\xC3\xB7", "\xC3\xB7"}},
-  {{"\xE2\x88\x9A", "\xE2\x88\x9A("}, {"x!", "!"}, {"4", "4"}, {"5", "5"}, {"6", "6"}, {"\xC3\x97", "\xC3\x97"}},
-  {{"\xCF\x80", "\xCF\x80"}, {"e", "e"}, {"1", "1"}, {"2", "2"}, {"3", "3"}, {"-", "-"}},
-  {{"DEG", nullptr}, {"Ans", "Ans"}, {"0", "0"}, {".", "."}, {"=", nullptr}, {"+", "+"}},
+// Страница 1 - обычная, страница 2 («2nd») - гиперболические функции, график y(x), решение x=? и др.
+const CalcKey CALC_KEYS[2][6][6] = {
+  {
+    {{"sin", "sin("}, {"cos", "cos("}, {"tan", "tan("}, {"(", "("}, {")", ")"}, {"<-", nullptr}},
+    {{"asin", "asin("}, {"acos", "acos("}, {"atan", "atan("}, {"x\xC2\xB2", "\xC2\xB2"}, {"^", "^"}, {"C", nullptr}},
+    {{"ln", "ln("}, {"log", "log("}, {"7", "7"}, {"8", "8"}, {"9", "9"}, {"\xC3\xB7", "\xC3\xB7"}},
+    {{"\xE2\x88\x9A", "\xE2\x88\x9A("}, {"2nd", nullptr}, {"4", "4"}, {"5", "5"}, {"6", "6"}, {"\xC3\x97", "\xC3\x97"}},
+    {{"\xCF\x80", "\xCF\x80"}, {"e", "e"}, {"1", "1"}, {"2", "2"}, {"3", "3"}, {"-", "-"}},
+    {{"DEG", nullptr}, {"x", "x"}, {"0", "0"}, {".", "."}, {"=", nullptr}, {"+", "+"}},
+  },
+  {
+    {{"y(x)", nullptr}, {"x=?", nullptr}, {"sinh", "sinh("}, {"(", "("}, {")", ")"}, {"<-", nullptr}},
+    {{"cosh", "cosh("}, {"tanh", "tanh("}, {"abs", "abs("}, {"exp", "exp("}, {"^", "^"}, {"C", nullptr}},
+    {{"\xE2\x88\x9B", "\xE2\x88\x9B("}, {"L=R", "="}, {"7", "7"}, {"8", "8"}, {"9", "9"}, {"\xC3\xB7", "\xC3\xB7"}},
+    {{"x!", "!"}, {"1st", nullptr}, {"4", "4"}, {"5", "5"}, {"6", "6"}, {"\xC3\x97", "\xC3\x97"}},
+    {{"Ans", "Ans"}, {"1/x", "\xE2\x81\xBB\xC2\xB9"}, {"1", "1"}, {"2", "2"}, {"3", "3"}, {"-", "-"}},
+    {{"DEG", nullptr}, {"x", "x"}, {"0", "0"}, {".", "."}, {"=", nullptr}, {"+", "+"}},
+  },
 };
+int calcPage = 0;                                    // 0 - обычные клавиши, 1 - вторая страница
+std::string calcLastFn;                              // последняя функция/уравнение с x (для графика и решения)
+#define calcKeyAt(r, c) CALC_KEYS[calcPage][(r)][(c)]   // макрос, а не функция: Arduino IDE 1.8 ставит прототипы выше struct CalcKey
 calc::Parser calcP;
-calc::Parser mathP;                                 // для «Математики»: с переменной x, углы в радианах
-int calcMode = 0;                                   // 0 - калькулятор, 1 - ввод функции f(x), 2 - ввод числа (точки)
 const int CK_W = 40, CK_H = 25, CK_Y = 90;
 
-const char* calcLabel(int r, int c) {
-  if (r == 5 && c == 0) return calcMode ? "RAD" : calcP.degrees ? "DEG" : "RAD";
-  if (calcMode && r == 5 && c == 4) return "OK";
-  if (calcMode == 1 && r == 5 && c == 1) return "x";
-  if (calcMode == 2 && r == 5 && c == 1) return "\xE2\x88\x9E";
-  return CALC_KEYS[r][c].label;
-}
-
-const char* calcIns(int r, int c) {
-  if (calcMode == 1 && r == 5 && c == 1) return "x";
-  if (calcMode == 2 && r == 5 && c == 1) return "\xE2\x88\x9E";
-  return CALC_KEYS[r][c].ins;
-}
-
 void drawCalcKey(int r, int c, bool sel) {
-  const char* label = calcLabel(r, c);
+  const CalcKey& k = calcKeyAt(r, c);
+  const char* label = k.label;
+  if (r == 5 && c == 0) label = calcP.degrees ? "DEG" : "RAD";
+  bool fnKey = !strcmp(label, "2nd") || !strcmp(label, "1st") || !strcmp(label, "y(x)") || !strcmp(label, "x=?");
   bool digit = c >= 2 && r >= 2 && c <= 4;
   uint16_t bg = sel ? C_BLUE : digit ? 0x2104 : (c == 5 || (r < 2 && c >= 3)) ? 0x39C7 : 0x10A2;
-  uint16_t fg = (r == 5 && c == 4) ? C_GREEN : C_WHITE;
+  uint16_t fg = (r == 5 && c == 4) ? C_GREEN : fnKey ? C_YELLOW : C_WHITE;
   int x = c * CK_W, y = CK_Y + r * CK_H;
   tft.fillRect(x, y, CK_W - 1, CK_H - 1, bg);
   std::vector<uint16_t> cps;
@@ -4725,7 +4727,8 @@ void drawCalcKey(int r, int c, bool sel) {
 // Удалить последний знак; имя функции со скобкой («sin(») удаляется целиком.
 void calcBackspace(std::string& e) {
   if (e.empty()) return;
-  static const char* TOK[] = {"asin(", "acos(", "atan(", "sin(", "cos(", "tan(", "ln(", "log(", "\xE2\x88\x9A(", "Ans"};
+  static const char* TOK[] = {"asin(", "acos(", "atan(", "sinh(", "cosh(", "tanh(", "sin(", "cos(", "tan(", "ln(", "log(",
+                              "abs(", "exp(", "\xE2\x88\x9A(", "\xE2\x88\x9B(", "Ans", "\xE2\x81\xBB\xC2\xB9"};
   for (const char* t : TOK) {
     size_t n = strlen(t);
     if (e.size() >= n && e.compare(e.size() - n, n, t) == 0) {
@@ -4760,32 +4763,177 @@ void drawCalcDisplay(const std::string& expr, const std::string& res, uint16_t r
   }
 }
 
-// Экран калькулятора. mode 0 - обычный калькулятор (возвращает пустую строку);
-// mode 1 - ввод функции с x, mode 2 - ввод числа: по «OK» возвращает набранное, по удержанию кнопки - пустую строку.
-std::string calcEntry(int mode, const char* prompt) {
-  calcMode = mode;
-  mathP.degrees = false;
-  mathP.allowX = mode == 1;
-  mathP.x = 1.2345;
+// ---------- График функции и решение уравнений ----------
+const int PLOT_W = 240, PLOT_H = 216;                // область графика; снизу строка со значениями
+
+// Вверх/вниз - масштаб, влево/вправо - сдвиг, нажатие - курсор (показывает x и y), удержание - выход.
+void runGraph(const std::string& fn) {
+  double xc = 0;
+  double w = (calcP.degrees && calc::hasTrig(fn)) ? 720.0 : 20.0;   // ширина окна по x
+  bool trace = false;
+  int tx = PLOT_W / 2;
+  std::vector<float> ys((size_t)PLOT_W);
+  double ylo = -1, yhi = 1;
+  auto sample = [&]() {
+    double x0 = xc - w / 2, dx = w / (PLOT_W - 1);
+    std::vector<float> fin;
+    fin.reserve((size_t)PLOT_W);
+    for (int i = 0; i < PLOT_W; i++) {
+      calc::Err e;
+      double v = calcP.evalAt(fn, x0 + i * dx, e);
+      bool good = e == calc::E_NONE && isfinite(v) && fabs(v) < 1e30;
+      ys[(size_t)i] = good ? (float)v : NAN;
+      if (good) fin.push_back((float)v);
+    }
+    if (fin.empty()) {
+      ylo = -1;
+      yhi = 1;
+      return;
+    }
+    std::sort(fin.begin(), fin.end());
+    double mn = fin.front(), mx = fin.back();
+    double p5 = fin[fin.size() * 5 / 100], p95 = fin[(fin.size() - 1) * 95 / 100];
+    if (p95 > p5 && mx - mn > 20 * (p95 - p5)) {     // уходит в бесконечность (1/x, tan x): берём основную часть
+      mn = p5 - 0.5 * (p95 - p5);
+      mx = p95 + 0.5 * (p95 - p5);
+    }
+    if (mx - mn < 1e-12 * std::max(1.0, fabs(mx))) {
+      mn -= 1;
+      mx += 1;
+    } else {
+      double pad = (mx - mn) * 0.06;
+      mn -= pad;
+      mx += pad;
+    }
+    ylo = mn;
+    yhi = mx;
+  };
+  auto py = [&](double v) {
+    double t = (yhi - v) / (yhi - ylo) * (PLOT_H - 1);
+    if (t < -2000) t = -2000;
+    if (t > 2000) t = 2000;
+    return (int)lround(t);
+  };
+  auto draw = [&]() {
+    double x0 = xc - w / 2, dx = w / (PLOT_W - 1);
+    tft.fillRect(0, 0, PLOT_W, PLOT_H, C_BLACK);
+    if (ylo < 0 && yhi > 0) tft.drawFastHLine(0, py(0), PLOT_W, C_GRAY);
+    if (x0 < 0 && x0 + w > 0) tft.drawFastVLine((int)lround(-x0 / dx), 0, PLOT_H, C_GRAY);
+    char b[48];
+    {
+      SmallFont small;
+      snprintf(b, sizeof(b), "%.4g", yhi);
+      drawUtf8(b, 2, 0, C_LIGHT, C_BLACK);
+      snprintf(b, sizeof(b), "%.4g", ylo);
+      drawUtf8(b, 2, PLOT_H - 16, C_LIGHT, C_BLACK);
+    }
+    int prevY = 0;
+    bool prevOk = false;
+    for (int i = 0; i < PLOT_W; i++) {
+      if (isnan(ys[(size_t)i])) {
+        prevOk = false;
+        continue;
+      }
+      int y = py(ys[(size_t)i]);
+      if (prevOk && abs(y - prevY) < PLOT_H * 8 / 10) tft.drawLine(i - 1, prevY, i, y, C_YELLOW);   // разрыв (tan x) не соединяем
+      else tft.drawPixel(i, y, C_YELLOW);
+      prevY = y;
+      prevOk = true;
+    }
+    if (trace) {
+      tft.drawFastVLine(tx, 0, PLOT_H, 0x03FF);
+      if (!isnan(ys[(size_t)tx])) tft.fillCircle(tx, py(ys[(size_t)tx]), 3, C_RED);
+    }
+    tft.fillRect(0, PLOT_H, 240, 240 - PLOT_H, C_BLACK);
+    SmallFont small;
+    if (trace) {
+      if (isnan(ys[(size_t)tx])) snprintf(b, sizeof(b), "x=%.5g  y: --", x0 + tx * dx);
+      else snprintf(b, sizeof(b), "x=%.5g  y=%.5g", x0 + tx * dx, (double)ys[(size_t)tx]);
+    } else {
+      snprintf(b, sizeof(b), "x: %.4g ... %.4g", x0, x0 + w);
+    }
+    drawUtf8(b, 2, PLOT_H + 4, C_WHITE, C_BLACK);
+  };
+  showMsg(L3("Строю график...", "Plotting...", "正在绘图……"), C_YELLOW);
+  sample();
+  draw();
+  for (;;) {
+    uint8_t j = joyEvent();
+    bool resample = false, redraw = false;
+    if (j == J_UP) {
+      w = std::max(w / 1.5, 1e-4);
+      resample = redraw = true;
+    } else if (j == J_DOWN) {
+      w = std::min(w * 1.5, 1e6);
+      resample = redraw = true;
+    } else if (j == J_LEFT || j == J_RIGHT) {
+      int dir = j == J_LEFT ? -1 : 1;
+      if (trace) {
+        tx += dir * 3;
+        if (tx < 0 || tx > PLOT_W - 1) {             // курсор дошёл до края - сдвигаем окно
+          tx = tx < 0 ? 0 : PLOT_W - 1;
+          xc += dir * w / 8;
+          resample = true;
+        }
+      } else {
+        xc += dir * w / 8;
+        resample = true;
+      }
+      redraw = true;
+    }
+    if (redraw) {
+      if (resample) sample();
+      draw();
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (e == EV_CLICK) {
+      trace = !trace;
+      tx = PLOT_W / 2;
+      draw();
+    }
+    delay(2);
+  }
+}
+
+// Корни уравнения: многочлены и одночлены - точно (с комплексными), остальное - приближённо.
+void runSolve(const std::string& fn) {
+  showMsg(L3("Решаю...", "Solving...", "正在求解……"), C_YELLOW);
+  calc::Solution sol;
+  calc::solve(calcP, fn, sol);
+  std::string head = fn;
+  if (!calc::hasEq(fn)) head += " = 0";
+  viewAnswer(fromStd(head + "\n\n" + calc::describe(sol, cfgLang == LANG_RU)), C_WHITE);
+}
+
+void runCalc() {
   std::string expr, res;
   uint16_t resCol = C_LIGHT;
   bool fresh = false;                                // только что нажато «=»
   int row = 2, col = 2;
   bool ru = cfgLang == LANG_RU;
+  calcPage = 0;
+  auto drawKeys = [&]() {
+    for (int r = 0; r < 6; r++)
+      for (int c = 0; c < 6; c++) drawCalcKey(r, c, r == row && c == col);
+  };
   tft.fillScreen(C_BLACK);
   tft.fillRect(0, 80, 240, 1, C_GRAY);
-  for (int r = 0; r < 6; r++)
-    for (int c = 0; c < 6; c++) drawCalcKey(r, c, r == row && c == col);
+  drawKeys();
   auto preview = [&]() {                             // считаем на лету, пока идёт набор
     calc::Err err;
-    double v = (calcMode ? mathP : calcP).eval(expr, err);
-    if (calcMode == 1 || expr.empty()) res = calcMode ? prompt : "";
-    else if (err == calc::E_NONE) res = "= " + calc::format(v);
-    else res = calcMode ? prompt : "";
+    if (expr.empty()) {
+      res = "";
+    } else if (calc::hasVar(expr) || calc::hasEq(expr)) {   // функция или уравнение - значения нет
+      res = calc::hasEq(expr) ? L3("уравнение", "equation", "方程") : L3("функция f(x)", "function f(x)", "函数 f(x)");
+    } else {
+      double v = calcP.eval(expr, err);
+      res = err == calc::E_NONE ? "= " + calc::format(v) : "";
+    }
     resCol = C_LIGHT;
     drawCalcDisplay(expr, res, resCol);
   };
-  preview();
+  drawCalcDisplay(expr, res, resCol);
   for (;;) {
     uint8_t j = joyEvent();
     if (j != J_NONE) {
@@ -4797,17 +4945,14 @@ std::string calcEntry(int mode, const char* prompt) {
       drawCalcKey(row, col, true);
     }
     BtnEvent e = btnEvent();
-    if (e == EV_LONG) return "";
+    if (e == EV_LONG) return;
     if (e == EV_CLICK) {
-      CalcKey k = CALC_KEYS[row][col];
-      k.ins = calcIns(row, col);
+      const CalcKey& k = calcKeyAt(row, col);
       if (k.ins) {
         char c0 = k.ins[0];
         bool op = c0 == '+' || c0 == '^' || c0 == '!' || !strcmp(k.ins, "\xC3\x97") || !strcmp(k.ins, "\xC3\xB7") ||
-                  !strcmp(k.ins, "\xC2\xB2");
-        if (calcMode) {                              // при вводе функции или числа прошлый ответ не подставляем
-          fresh = false;
-        } else if (fresh) {                                 // после «=»: знак действия продолжает с Ans, остальное - новый пример
+                  !strcmp(k.ins, "\xC2\xB2") || !strcmp(k.ins, "\xE2\x81\xBB\xC2\xB9");
+        if (fresh) {                                 // после «=»: знак действия продолжает с Ans, остальное - новый пример
           expr = (op || c0 == '-') ? "Ans" : "";
           fresh = false;
         } else if (expr.empty() && op) {             // пример начат со знака действия - берём прошлый ответ
@@ -4823,17 +4968,28 @@ std::string calcEntry(int mode, const char* prompt) {
         fresh = false;
         expr.clear();
         preview();
+      } else if (!strcmp(k.label, "2nd") || !strcmp(k.label, "1st")) {   // вторая страница клавиш
+        calcPage = 1 - calcPage;
+        drawKeys();
+      } else if (!strcmp(k.label, "y(x)") || !strcmp(k.label, "x=?")) {  // график / корни
+        std::string fn = expr.empty() ? calcLastFn : expr;
+        if (!fn.empty()) {
+          calcLastFn = fn;
+          if (k.label[0] == 'y') runGraph(fn);
+          else runSolve(fn);
+          tft.fillScreen(C_BLACK);                   // вернулись: перерисовать калькулятор
+          tft.fillRect(0, 80, 240, 1, C_GRAY);
+          drawKeys();
+          drawCalcDisplay(expr, res, resCol);
+        }
       } else if (!strcmp(k.label, "DEG")) {
-        if (calcMode) continue;                      // в «Математике» углы всегда в радианах
         calcP.degrees = !calcP.degrees;
         drawCalcKey(row, col, true);
         if (!fresh) preview();
-      } else if (calcMode && !expr.empty()) {        // «OK»: проверяем запись и отдаём её
-        calc::Err err;
-        bool infinity = calcMode == 2 && (expr == "\xE2\x88\x9E" || expr == "-\xE2\x88\x9E" || expr == "+\xE2\x88\x9E");
-        mathP.eval(expr, err);
-        if (infinity || err == calc::E_NONE || (calcMode == 1 && err != calc::E_SYNTAX)) return expr;
-        drawCalcDisplay(expr, calc::errName(err, ru), C_RED);
+      } else if (!expr.empty() && (calc::hasVar(expr) || calc::hasEq(expr))) {   // «=» для функции: подсказка
+        res = L3("2nd: y(x) график, x=? корни", "2nd: y(x) graph, x=? roots", "2nd: y(x)图像, x=?求根");
+        resCol = C_YELLOW;
+        drawCalcDisplay(expr, res, resCol);
       } else if (!expr.empty()) {                    // «=»
         calc::Err err;
         double v = calcP.eval(expr, err);
@@ -4850,225 +5006,6 @@ std::string calcEntry(int mode, const char* prompt) {
       }
     }
     delay(2);
-  }
-}
-
-void runCalc() {
-  calcEntry(0, "");
-  calcMode = 0;
-}
-
-// ---------- Математика: графики, уравнения, пределы, производная, интеграл ----------
-std::string mathExpr;                                    // текущая функция f(x)
-
-double mathF(double x, bool& ok) {
-  calc::Err err;
-  mathP.x = x;
-  double v = mathP.eval(mathExpr, err);
-  ok = err == calc::E_NONE;
-  return v;
-}
-
-// Число для показа: 7 значащих цифр (дальше - погрешность счёта) + на что оно похоже.
-String mathNum(double v) {
-  if (v != 0) {
-    double m = pow(10.0, 6 - floor(log10(fabs(v))));
-    if (mth::fin(m) && m != 0) v = round(v * m) / m;
-  }
-  std::string s = calc::format(v), h = mth::hint(v);
-  if (!h.empty()) s += " (" + h + ")";
-  return fromStd(s);
-}
-
-String mathLim(const mth::Lim& l) {
-  if (l.kind == mth::L_VALUE) return mathNum(l.value);
-  if (l.kind == mth::L_PINF) return "+\xE2\x88\x9E";
-  if (l.kind == mth::L_NINF) return "-\xE2\x88\x9E";
-  return L3("не определить", "undetermined", "无法确定");
-}
-
-// Точка: число или бесконечность. inf: 0 - число (в v), +1 / -1 - бесконечность. false - отмена.
-bool mathPoint(const char* prompt, double& v, int& inf) {
-  std::string s = calcEntry(2, prompt);
-  if (s.empty()) return false;
-  inf = 0;
-  if (s == "\xE2\x88\x9E" || s == "+\xE2\x88\x9E") inf = 1;
-  else if (s == "-\xE2\x88\x9E") inf = -1;
-  else {
-    calc::Err err;
-    v = mathP.eval(s, err);
-    if (err != calc::E_NONE) return false;
-  }
-  return true;
-}
-
-void runGraph() {
-  const int PLOT_Y = 18, PLOT_H = 204;                          // поле графика: строки 18..221
-  double xmin = -10, xmax = 10;
-  bool trace = false;
-  int tx = 120;
-  static double ys[240];
-  for (;;) {
-    std::vector<double> v(240);
-    for (int i = 0; i < 240; i++) {
-      bool ok;
-      double y = mathF(xmin + (xmax - xmin) * i / 239.0, ok);
-      ys[i] = ok && mth::fin(y) ? y : NAN;
-      v[i] = ys[i];
-    }
-    double ymin, ymax;
-    mth::yRange(v, ymin, ymax);
-    tft.fillScreen(C_BLACK);
-    {
-      SmallFont small;
-      String head = String("x: ") + fromStd(calc::format(round(xmin * 1000) / 1000)) + ".." + fromStd(calc::format(round(xmax * 1000) / 1000));
-      drawUtf8(head.c_str(), 2, 1, C_YELLOW, C_BLACK);
-      char b[40];
-      snprintf(b, sizeof(b), "y: %.3g..%.3g", ymin, ymax);
-      drawUtf8(b, 238 - textWidth(b), 1, C_LIGHT, C_BLACK);
-    }
-    // сетка и оси
-    for (int k = 1; k < 4; k++) {
-      tft.drawFastVLine(k * 60, PLOT_Y, PLOT_H, 0x18C3);
-      tft.drawFastHLine(0, PLOT_Y + k * PLOT_H / 4, 240, 0x18C3);
-    }
-    if (xmin < 0 && xmax > 0) tft.drawFastVLine((int)((0 - xmin) / (xmax - xmin) * 239), PLOT_Y, PLOT_H, C_LIGHT);
-    if (ymin < 0 && ymax > 0) tft.drawFastHLine(0, PLOT_Y + (int)((ymax - 0) / (ymax - ymin) * (PLOT_H - 1)), 240, C_LIGHT);
-    // кривая: соседние точки соединяем, кроме скачков через весь экран (разрывы)
-    int py = -10000;
-    for (int i = 0; i < 240; i++) {
-      if (isnan(ys[i])) {
-        py = -10000;
-        continue;
-      }
-      double fy = (ymax - ys[i]) / (ymax - ymin) * (PLOT_H - 1);
-      int y = fy < -2000 ? -2000 : fy > 2000 ? 2000 : (int)fy;
-      bool jump = py != -10000 && (y - py > PLOT_H || py - y > PLOT_H || ((y < 0 || y >= PLOT_H) && (py < 0 || py >= PLOT_H) && (y < 0) != (py < 0)));
-      if (py != -10000 && !jump) {
-        int a = py < y ? py : y, b2 = py < y ? y : py;
-        if (a < 0) a = 0;
-        if (b2 >= PLOT_H) b2 = PLOT_H - 1;
-        if (a <= b2) tft.drawFastVLine(i, PLOT_Y + a, b2 - a + 1, C_GREEN);
-      } else if (y >= 0 && y < PLOT_H) {
-        tft.drawPixel(i, PLOT_Y + y, C_GREEN);
-      }
-      py = y;
-    }
-    {
-      SmallFont small;
-      if (trace) {
-        tft.drawFastVLine(tx, PLOT_Y, PLOT_H, C_RED);
-        char b[48];
-        double x = xmin + (xmax - xmin) * tx / 239.0;
-        if (isnan(ys[tx])) snprintf(b, sizeof(b), "x=%.4g  y: -", x);
-        else snprintf(b, sizeof(b), "x=%.4g  y=%.5g", x, ys[tx]);
-        drawUtf8(b, 2, 224, C_WHITE, C_BLACK);
-      } else {
-        drawUtf8(L3("<>сдвиг ^v масштаб клик:точка", "<>pan ^v zoom click:point", "<>移动 ^v缩放 按下:取点"), 2, 224, C_LIGHT, C_BLACK);
-      }
-    }
-    for (;;) {                                           // ждём действие
-      uint8_t j = joyEvent();
-      BtnEvent e = btnEvent();
-      if (e == EV_LONG) return;
-      if (e == EV_CLICK) {
-        trace = !trace;
-        break;
-      }
-      if (j == J_NONE) {
-        delay(3);
-        continue;
-      }
-      double w = xmax - xmin, c = (xmin + xmax) / 2;
-      if (trace) {
-        if (j == J_LEFT) tx = tx >= 4 ? tx - 4 : 0;
-        else if (j == J_RIGHT) tx = tx <= 235 ? tx + 4 : 239;
-        else continue;
-      } else if (j == J_LEFT) {
-        xmin -= w / 4;
-        xmax -= w / 4;
-      } else if (j == J_RIGHT) {
-        xmin += w / 4;
-        xmax += w / 4;
-      } else if (j == J_UP && w > 0.002) {
-        xmin = c - w / 4;
-        xmax = c + w / 4;
-      } else if (j == J_DOWN && w < 1e6) {
-        xmin = c - w;
-        xmax = c + w;
-      } else {
-        continue;
-      }
-      break;
-    }
-  }
-}
-
-void runMath() {
-  int sel = 0;
-  for (;;) {
-    std::vector<String> items = splitBar(L3("График функции|Решить уравнение|Предел|Производная в точке|Интеграл|Назад",
-                                            "Function graph|Solve an equation|Limit|Derivative at a point|Integral|Back",
-                                            "函数图像|解方程|极限|某点导数|定积分|返回"));
-    sel = listScreen(L3("Математика", "Maths", "数学"), items, std::vector<String>(), sel);
-    if (sel < 0 || sel > 4) return;
-    std::string e = calcEntry(1, sel == 1 ? "f(x) = 0" : "f(x) =");
-    if (e.empty()) continue;
-    mathExpr = e;
-    String fx = fromStd(e);
-    if (sel == 0) {
-      runGraph();
-    } else if (sel == 1) {
-      showMsg(L3("Ищу корни...", "Looking for roots...", "正在求根……"), C_YELLOW);
-      std::vector<double> r;
-      mth::findRoots(mathF, -50, 50, 4000, r);
-      String t = fx + " = 0\n\n";
-      if (r.empty()) t += L3("На отрезке от -50 до 50 корней не найдено.", "No roots found between -50 and 50.", "在-50到50之间没有找到根。");
-      for (size_t i = 0; i < r.size(); i++) t += String("x") + String((int)i + 1) + " = " + mathNum(r[i]) + "\n";
-      if (!r.empty()) t += String("\n") + L3("Поиск шёл на отрезке от -50 до 50, счёт приближённый.", "Searched between -50 and 50; the values are approximate.", "搜索范围-50到50，结果为近似值。");
-      if (r.size() >= 12) t += String(" ") + L3("Показаны первые 12 корней.", "The first 12 roots are shown.", "仅显示前12个根。");
-      viewSavable(L3("Уравнение", "Equation", "方程"), t);
-    } else if (sel == 2) {
-      double x0 = 0;
-      int inf = 0;
-      if (!mathPoint("x \xE2\x86\x92", x0, inf)) continue;
-      String t = String("lim ") + fx + "\n";
-      if (inf) {
-        t += String(L3("при x \xE2\x86\x92 ", "as x \xE2\x86\x92 ", "x \xE2\x86\x92 ")) + (inf > 0 ? "+\xE2\x88\x9E" : "-\xE2\x88\x9E") + "\n\n= " + mathLim(mth::limitInf(mathF, inf));
-      } else {
-        mth::Lim l = mth::limitSide(mathF, x0, -1), r = mth::limitSide(mathF, x0, 1);
-        t += String(L3("при x \xE2\x86\x92 ", "as x \xE2\x86\x92 ", "x \xE2\x86\x92 ")) + mathNum(x0) + "\n\n";
-        if (mth::sameLim(l, r)) t += String("= ") + mathLim(l);
-        else
-          t += String(L3("Слева: ", "From the left: ", "左极限：")) + mathLim(l) + "\n" + L3("Справа: ", "From the right: ", "右极限：") + mathLim(r) + "\n\n" +
-               L3("Двустороннего предела нет.", "There is no two-sided limit.", "双侧极限不存在。");
-      }
-      t += String("\n\n") + L3("Предел найден численно - проверяйте вывод сами.", "Found numerically - check the derivation yourself.", "数值结果，请自行验证推导。");
-      viewSavable(L3("Предел", "Limit", "极限"), t);
-    } else if (sel == 3) {
-      double x0 = 0;
-      int inf = 0;
-      if (!mathPoint("x =", x0, inf) || inf) continue;
-      bool ok, okf;
-      double d = mth::derivative(mathF, x0, ok), f0 = mth::call(mathF, x0, okf);
-      String t = String("f(x) = ") + fx + "\nx = " + mathNum(x0) + "\n\n";
-      t += String("f(x) = ") + (okf ? mathNum(f0) : String("-")) + "\n";
-      t += String("f'(x) = ") + (ok ? mathNum(d) : String(L3("не определена", "undefined", "无定义")));
-      viewSavable(L3("Производная", "Derivative", "导数"), t);
-    } else {
-      double a = 0, b = 0;
-      int inf = 0;
-      if (!mathPoint(L3("от a =", "from a =", "下限 a ="), a, inf) || inf) continue;
-      if (!mathPoint(L3("до b =", "to b =", "上限 b ="), b, inf) || inf) continue;
-      showMsg(L3("Считаю...", "Calculating...", "计算中……"), C_YELLOW);
-      bool ok;
-      double s = mth::integral(mathF, a, b, ok);
-      String t = String("\xE2\x88\xAB ") + fx + " dx\n" + L3("от ", "from ", "从 ") + mathNum(a) + L3(" до ", " to ", " 到 ") + mathNum(b) + "\n\n";
-      t += ok ? String("= ") + mathNum(s)
-              : String(L3("Не получилось: на отрезке есть разрыв или функция меняется слишком резко.",
-                          "Failed: there is a discontinuity on the interval or the function changes too sharply.", "失败：区间内有间断点或函数变化过于剧烈。"));
-      viewSavable(L3("Интеграл", "Integral", "积分"), t);
-    }
   }
 }
 
@@ -6418,9 +6355,9 @@ void runRemote() {
 void runTools() {
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Калькулятор|Википедия|Картинки|Галерея|Погода|Курсы валют|Часы|Таймер|Секундомер|Пульт|Математика|Назад",
-                                            "Calculator|Wikipedia|Images|Gallery|Weather|Exchange rates|Clock|Timer|Stopwatch|Remote|Maths|Back",
-                                            "计算器|维基百科|图片|相册|天气|汇率|时钟|计时器|秒表|遥控器|数学|返回"));
+    std::vector<String> items = splitBar(L3("Калькулятор|Википедия|Картинки|Галерея|Погода|Курсы валют|Часы|Таймер|Секундомер|Пульт|Назад",
+                                            "Calculator|Wikipedia|Images|Gallery|Weather|Exchange rates|Clock|Timer|Stopwatch|Remote|Back",
+                                            "计算器|维基百科|图片|相册|天气|汇率|时钟|计时器|秒表|遥控器|返回"));
     sel = listScreen(L3("Инструменты", "Tools", "工具"), items, std::vector<String>(), sel);
     switch (sel) {
       case 0: runCalc(); break;
@@ -6433,7 +6370,6 @@ void runTools() {
       case 7: runTimer(); break;
       case 8: runStopwatch(); break;
       case 9: runRemote(); break;
-      case 10: runMath(); break;
       default: return;
     }
   }

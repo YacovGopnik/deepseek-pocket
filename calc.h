@@ -2,6 +2,8 @@
 // Понимает: + - × ÷ * / ^ ² ⁻¹ ! %, скобки (незакрытые закрываются сами), π, e, Ans,
 // 2E5 (экспонента), неявное умножение (2π, 3(4), 2sin(30)), функции:
 // sin cos tan asin acos atan sinh cosh tanh ln log lg log2 exp abs sqrt √ ∛.
+// Переменная x (для функций и уравнений): evalAt(f, x) считает f в точке x;
+// запись «левая = правая» понимается как левая − правая.
 // Чистая логика на std::string - тестируется на компьютере.
 #pragma once
 #include <math.h>
@@ -18,8 +20,18 @@ class Parser {
  public:
   bool degrees = true;   // углы в градусах
   double ans = 0;        // результат прошлого вычисления
-  bool allowX = false;   // разрешена переменная x (графики, уравнения, пределы)
-  double x = 0;          // её значение
+  double xv = 0;         // значение переменной x
+
+  // Значение функции в точке x. «L = R» даёт L − R (удобно для уравнений).
+  double evalAt(const std::string& s, double x, Err& err) {
+    xv = x;
+    size_t eq = s.find('=');
+    if (eq == std::string::npos) return eval(s, err);
+    double l = eval(s.substr(0, eq), err);
+    if (err != E_NONE) return l;
+    double r = eval(s.substr(eq + 1), err);
+    return l - r;
+  }
 
   double eval(const std::string& s, Err& err) {
     src = s;
@@ -227,10 +239,6 @@ class Parser {
     }
     if (eat("\xCF\x80") || eat("pi")) return M_PI;               // π
     if (eat("Ans")) return ans;
-    if (allowX && at("x")) {
-      p += 1;
-      return x;
-    }
     if (eat("\xE2\x88\x9A")) {                                   // √
       double v = arg();
       if (v < 0) fail(E_MATH);
@@ -277,6 +285,7 @@ class Parser {
       if (v <= 0) fail(E_MATH);
       return log10(v);
     }
+    if (eat("x")) return xv;
     if (eat("e")) return M_E;
     fail(E_SYNTAX);
     p = src.size();
