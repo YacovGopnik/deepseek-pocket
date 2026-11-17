@@ -3446,6 +3446,7 @@ void runSaved();
 bool runTemplates();
 bool runSettings();
 String inputText();
+bool admService();                                   // администратор: показать объявление / выполнить команду
 void viewAnswer(const String& utf8, uint16_t fg);
 BtnEvent viewText(const String& utf8, uint16_t fg);
 int choiceScreen(const String& header, const std::vector<String>& opts);
