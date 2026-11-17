@@ -9,6 +9,7 @@ on:
       - 'firmware/**'
       - '**.md'
       - 'room.html'
+      - 'hardware/**'
   workflow_dispatch:
 
 permissions:
