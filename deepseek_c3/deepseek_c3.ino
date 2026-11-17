@@ -743,6 +743,7 @@ int cfgBright = 4;        // яркость: 0..4 (8, 25, 50, 75, 100 %)
 int cfgSound = 1;         // звук: 0 - нет, 1 - только сигналы, 2 - сигналы и щелчки клавиш
 int cfgIdle = 2;          // гасить экран: 0 - нет, 1 - 30 с, 2 - 1 мин, 3 - 2 мин, 4 - 5 мин
 int cfgJoy = 2;           // чувствительность ручки: 0 (надо отклонять до упора) .. 4 (хватает лёгкого наклона)
+int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
 // Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
 int joyThr() {
@@ -801,6 +802,7 @@ void loadSettings() {
   cfgJoy = (int)prefs.getUChar("joy", 2);
   if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
+  cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
   cfgCity = prefs.getString("city", "");
   cfgLat = prefs.getString("lat", "0").toFloat();
@@ -820,6 +822,7 @@ void saveScreenSettings() {
   prefs.putUChar("idle", (uint8_t)cfgIdle);
   prefs.putUChar("joy", (uint8_t)cfgJoy);
   prefs.putUChar("joyiy", (uint8_t)cfgJoyInvY);
+  prefs.putUChar("rot", (uint8_t)cfgRot);
   prefs.putUChar("tz", (uint8_t)(cfgTz + 12));
   prefs.end();
 }
@@ -1170,6 +1173,16 @@ void joyCalibrate() {
   joyCy = (int)(sy / 16);
 }
 
+// Экран повёрнут на cfgRot шагов по 90°, значит, и гаджет держат повёрнутым: «вверх» для человека -
+// это другая сторона ручки. Поворачиваем направление так же, как картинку.
+void joyRotate(int& dx, int& dy) {
+  for (int k = 0; k < cfgRot; k++) {
+    int t = dx;
+    dx = dy;
+    dy = -t;
+  }
+}
+
 // Отклонение ручки от центра с учётом настроек осей: примерно -2048..2048.
 void joyAnalog(int& dx, int& dy) {
   dx = analogRead(PIN_JOY_X) - joyCx;
@@ -1177,6 +1190,7 @@ void joyAnalog(int& dx, int& dy) {
   if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
   if (JOY_INVERT_X) dx = -dx;
   if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
+  joyRotate(dx, dy);
   int half = joyThr() / 2;
   if (dx > half || dx < -half || dy > half || dy < -half) {
     if (screenAsleep) wakeScreen();
@@ -1191,6 +1205,7 @@ uint8_t joyRawDir() {
   if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
   if (JOY_INVERT_X) dx = -dx;
   if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
+  joyRotate(dx, dy);
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
   if (ax < joyThr() && ay < joyThr()) return J_NONE;
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
@@ -7137,9 +7152,9 @@ bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -7155,6 +7170,7 @@ bool runSettings() {
     right.resize(items.size());
     right[11] = cfgJoyInvY ? L3("обратная", "inverted", "反向") : L3("обычная", "normal", "正常");
     right[12] = admOn ? L3("вы админ", "signed in", "已登录") : "";
+    right[13] = String(cfgRot * 90) + "\xC2\xB0";
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -7213,6 +7229,11 @@ bool runSettings() {
         break;
       case 12:
         runAdmin();
+        break;
+      case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
+        cfgRot = (cfgRot + 1) & 3;
+        tft.setRotation((TFT_ROTATION + cfgRot) % 4);
+        saveScreenSettings();
         break;
       default:
         return changed;
@@ -9390,7 +9411,7 @@ void setup() {
   displayReset();                    // сброс экрана на обеих ножках + есть ли батарея
   SPI.begin(PIN_SCK, -1, PIN_MOSI, -1);
   tft.init(240, 240, SPI_MODE3);     // модули без CS работают в режиме 3
-  tft.setRotation(TFT_ROTATION);
+  tft.setRotation((TFT_ROTATION + cfgRot) % 4);   // поворот из настроек
   tft.setSPISpeed(TFT_SPI_HZ);       // быстрее шина - быстрее экран (особенно в гонке)
   drawBoot();                        // заставка «DeepSeek OS»
   Serial.println("2: display ok");
