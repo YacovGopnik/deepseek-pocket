@@ -66,6 +66,8 @@
 #include "pixabay.h"
 #include "calc.h"
 #include "calc_solve.h"
+#include "admin.h"
+#include "esp_random.h"
 #include "tools.h"
 #include "games2.h"
 #include "chess.h"
@@ -99,7 +101,7 @@ const int HTTP_TIMEOUT_MS = 30000;                   // сколько ждат�
 // Джойстик. Если направления перепутаны - поменяйте эти три настройки.
 const bool JOY_SWAP_XY = false;   // true, если вверх/вниз и влево/вправо поменялись местами
 const bool JOY_INVERT_X = true;   // true, если влево и вправо перепутаны
-const bool JOY_INVERT_Y = false;   // true, если вверх и вниз перепутаны
+const bool JOY_INVERT_Y = false;   // true, если вверх и вниз перепутаны (ещё есть переключатель: Настройки -> Ось Y джойстика)
 const int JOY_THRESHOLD = 1100;   // насколько отклонить ручку (из 2048), чтобы сработало
 const uint32_t REPEAT_DELAY_MS = 400;  // удержание: через сколько начинается автоповтор
 const uint32_t REPEAT_RATE_MS = 110;   // удержание: шаг автоповтора
@@ -146,6 +148,12 @@ const int IR_TRIM_US = 3;          // поправка на время рабо�
 #define FW_VERSION 1                // при сборке на GitHub номер подставляется сам
 #endif
 #define OTA_REPO "YacovGopnik/deepseek-pocket"
+// Администратор (Настройки -> Администратор). Здесь - ОТКРЫТЫЙ ключ админа (130 знаков hex), его можно публиковать:
+// по нему гаджеты проверяют подпись команд. Получить: Настройки -> Администратор -> Создать ключ (ключ появится
+// на экране и в мониторе порта). Пусто - вход админа отключён, команды не принимаются.
+#ifndef ADMIN_PUBKEY
+#define ADMIN_PUBKEY ""
+#endif
 #define OTA_BRANCH "main"
 
 // Фонарик (необязательно): белый светодиод, включается в Настройках.
@@ -735,6 +743,7 @@ int cfgBright = 4;        // яркость: 0..4 (8, 25, 50, 75, 100 %)
 int cfgSound = 1;         // звук: 0 - нет, 1 - только сигналы, 2 - сигналы и щелчки клавиш
 int cfgIdle = 2;          // гасить экран: 0 - нет, 1 - 30 с, 2 - 1 мин, 3 - 2 мин, 4 - 5 мин
 int cfgJoy = 2;           // чувствительность ручки: 0 (надо отклонять до упора) .. 4 (хватает лёгкого наклона)
+int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
 // Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
 int joyThr() {
   static const int PCT[5] = {150, 125, 100, 70, 45};
@@ -791,6 +800,7 @@ void loadSettings() {
   cfgIdle = (int)prefs.getUChar("idle", 2);
   cfgJoy = (int)prefs.getUChar("joy", 2);
   if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
+  cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
   cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
   cfgCity = prefs.getString("city", "");
   cfgLat = prefs.getString("lat", "0").toFloat();
@@ -809,6 +819,7 @@ void saveScreenSettings() {
   prefs.putUChar("bri", (uint8_t)cfgBright);
   prefs.putUChar("idle", (uint8_t)cfgIdle);
   prefs.putUChar("joy", (uint8_t)cfgJoy);
+  prefs.putUChar("joyiy", (uint8_t)cfgJoyInvY);
   prefs.putUChar("tz", (uint8_t)(cfgTz + 12));
   prefs.end();
 }
@@ -878,6 +889,9 @@ String fromStd(const std::string& s) { return String(s.c_str()); }
 const uint16_t C_BLACK = 0x0000, C_WHITE = 0xFFFF, C_BLUE = 0x001F;
 const uint16_t C_RED = 0xF800, C_YELLOW = 0xFFE0, C_GRAY = 0x4228, C_GREEN = 0x07E0;
 const uint16_t C_LIGHT = 0xAD55;
+const uint16_t C_BAR = 0x18E4;      // строка состояния и заголовки окон
+const uint16_t C_SEL = 0x2B3E;      // выбранный пункт
+const uint16_t C_ACCENT = 0x04B2;   // тонкая линия под заголовком
 
 // Два шрифта: крупный 12x24 (основной) и мелкий 8x16 (служебные строки).
 // GW/GH/COLS/ROWS - размеры текущего шрифта; переключать через SmallFont.
@@ -1162,7 +1176,7 @@ void joyAnalog(int& dx, int& dy) {
   dy = analogRead(PIN_JOY_Y) - joyCy;
   if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
   if (JOY_INVERT_X) dx = -dx;
-  if (JOY_INVERT_Y) dy = -dy;
+  if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
   int half = joyThr() / 2;
   if (dx > half || dx < -half || dy > half || dy < -half) {
     if (screenAsleep) wakeScreen();
@@ -1176,7 +1190,7 @@ uint8_t joyRawDir() {
   int dy = analogRead(PIN_JOY_Y) - joyCy;
   if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
   if (JOY_INVERT_X) dx = -dx;
-  if (JOY_INVERT_Y) dy = -dy;
+  if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
   if (ax < joyThr() && ay < joyThr()) return J_NONE;
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
@@ -2792,9 +2806,10 @@ int listScreen(const char* title, const std::vector<String>& items, const std::v
   if (sel < 0 || sel >= n) sel = 0;
   auto drawRow = [&](int i) {
     int y = Y0 + (i - top) * ROW;
-    uint16_t bg = i == sel ? C_BLUE : C_BLACK;
-    tft.fillRect(0, y, 240, ROW - 2, bg);
-    drawUtf8(items[(size_t)i].c_str(), 6, y + 2, C_WHITE, bg);
+    uint16_t bg = i == sel ? C_SEL : C_BLACK;
+    tft.fillRect(0, y, 240, ROW - 2, C_BLACK);
+    if (i == sel) tft.fillRoundRect(2, y, 236, ROW - 2, 7, C_SEL);
+    drawUtf8(items[(size_t)i].c_str(), 8, y + 2, C_WHITE, bg);
     if ((size_t)i < right.size() && right[(size_t)i].length()) {
       SmallFont small;
       drawUtf8(right[(size_t)i].c_str(), 240 - textWidth(right[(size_t)i].c_str()) - 6, y + 6, C_YELLOW, bg);
@@ -2802,12 +2817,14 @@ int listScreen(const char* title, const std::vector<String>& items, const std::v
   };
   auto drawAll = [&]() {
     tft.fillScreen(C_BLACK);
-    drawUtf8(title, 0, 0, C_YELLOW, C_BLACK);
+    tft.fillRect(0, 0, 240, 28, C_BAR);            // заголовок окна, как в настольной системе
+    tft.fillRect(0, 28, 240, 1, C_ACCENT);
+    drawUtf8(title, 6, 2, C_WHITE, C_BAR);
     updateBattery();
-    drawMiniStatus(222, 5, C_BLACK);               // время и заряд - в правом углу любого меню
+    drawMiniStatus(222, 6, C_BAR);                 // время и заряд - в правом углу любого меню
     for (int i = top; i < n && i < top + VIS; i++) drawRow(i);
     SmallFont small;                               // стрелки, если список длиннее экрана
-    if (top > 0) drawUtf8("^", 228, 8, C_LIGHT, C_BLACK);
+    if (top > 0) drawUtf8("^", 228, 6, C_LIGHT, C_BAR);
     if (top + VIS < n) drawUtf8("v", 228, 218, C_LIGHT, C_BLACK);
   };
   if (sel >= VIS) top = sel - VIS + 1;
@@ -3434,51 +3451,36 @@ BtnEvent viewText(const String& utf8, uint16_t fg);
 int choiceScreen(const String& header, const std::vector<String>& opts);
 extern String pendingInput;
 
-// Возвращает true, если нужно перерисовать клавиатуру с начала (сменился язык или выбран шаблон).
+bool g_kbChat = false;                               // следующий inputText - поле вопроса в чате (удержание - меню чата)
+bool g_goHome = false;                               // выбрано «Домой»: выйти из чата на главный экран
+
+// Меню чата (удержание кнопки на клавиатуре чата). true - перерисовать клавиатуру с начала (выбран шаблон).
 bool runMenu() {
-  bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Шаблоны|Сохранённое|Конспекты|Справочник|Инструменты|Комната|Игры|Новый чат|Настройки|Назад",
-                                            "Templates|Saved|Notes|Reference|Tools|Room|Games|New chat|Settings|Back",
-                                            "模板|已保存|笔记|手册|工具|房间|游戏|新对话|设置|返回"));
-    std::vector<String> right(items.size());
-    if (roomUnread > 0) right[5] = String("+") + String(roomUnread);
-    int k = listScreen(T().menuTitle, items, right, sel);
-    if (k < 0) return changed;
+    std::vector<String> items = splitBar(L3("На главный экран|Новый чат|Шаблоны вопросов|Сохранённое|Назад",
+                                            "Home screen|New chat|Question templates|Saved|Back",
+                                            "主屏幕|新对话|问题模板|已保存|返回"));
+    int k = listScreen(L3("Чат DeepSeek", "DeepSeek chat", "DeepSeek 对话"), items, std::vector<String>(), sel);
+    if (k < 0) return false;
     sel = k;
     switch (k) {
       case 0:
-        if (runTemplates()) return true;
-        break;
+        g_goHome = true;
+        return false;
       case 1:
-        runSaved();
-        break;
-      case 2:
-        runNotes();
-        break;
-      case 3:
-        runReference();
-        break;
-      case 4:
-        runTools();
-        break;
-      case 5:
-        runRoom();
-        break;
-      case 6:
-        runGamesMenu();
-        break;
-      case 7:
         chat.clear();
         showMsg(T().chatCleared, C_GREEN);
         delay(1200);
-        return changed;
-      case 8:
-        if (runSettings()) changed = true;
+        return false;
+      case 2:
+        if (runTemplates()) return true;
+        break;
+      case 3:
+        runSaved();
         break;
       default:
-        return changed;
+        return false;
     }
   }
 }
@@ -3592,6 +3594,8 @@ void drawInput(const std::vector<uint16_t>& text) {
 String pendingInput;           // вопрос, который не удалось отправить (вернётся в поле ввода)
 
 String inputText() {
+  bool chatMode = g_kbChat;                          // в чате удержание открывает меню чата, в остальных местах - «назад»
+  g_kbChat = false;
   SaverArm arm;
   int layer = startLayer();
   int row = 0, col = 0;        // где курсор
@@ -3659,6 +3663,10 @@ String inputText() {
       redraw = false;
     }
     if (g_bgTick) g_bgTick();
+    if (admService()) {                              // объявление или команда администратора заняли экран
+      redraw = true;
+      continue;
+    }
     if (updateBattery() || roomUnreadDirty || statusClockDue()) drawStatusBar();
     {                                                // фоновый Wi-Fi: обновить значок, если состояние сменилось
       static uint32_t nextWifiCheck = 0;
@@ -3716,9 +3724,11 @@ String inputText() {
     }
 
     BtnEvent e = btnEvent();
-    if (e == EV_LONG) {                      // долгое нажатие - меню
+    if (e == EV_LONG) {                      // долгое нажатие: в чате - меню, в остальных местах - назад
+      if (!chatMode) return String("");
       saverArmed = false;
       bool menuChanged = runMenu();
+      if (g_goHome) return String("");
       saverArmed = true;
       saverDue = false;
       noteActivity();
@@ -5555,6 +5565,19 @@ bool roomUnreadDirty = false;
 const size_t ROOM_KEEP = 40;                         // сколько последних сообщений помним
 const size_t ROOM_USERS = 10;
 
+// Администратор: состояние (код - в разделе «АДМИНИСТРАТОР» ниже).
+bool admOn = false;                                  // этот гаджет вошёл как админ (до перезапуска)
+uint8_t admKey[32];                                  // закрытый ключ админа - только в памяти
+std::vector<std::string> roomBans;                   // заблокированные метки (от админа)
+String roomPin;                                      // закреплённое сообщение комнаты
+uint32_t roomPinTs = 0;
+bool roomKicked = false;                             // админ выгнал из комнаты
+void admReceive(const std::string& sub, const std::string& payload);
+void admPresence(const std::string& room, const std::string& payload);
+bool admBanned(const String& id);
+bool admService();
+void runAdmin();
+
 bool mqWrite(const std::string& pkt) { return mqClient.write((const uint8_t*)pkt.data(), pkt.size()) == pkt.size(); }
 std::string roomBase() { return mqtt::roomTopic(toStd(cfgRoom)); }
 
@@ -5585,7 +5608,9 @@ int roomUserIndex(const String& id, bool create) {
 }
 
 void sendHere(bool here) {
-  mqWrite(mqtt::publish(roomBase() + "/p", mqtt::presence(toStd(roomId), toStd(cfgNick), here)));
+  std::string pl = mqtt::presence(toStd(roomId), toStd(cfgNick), here);
+  if (here) pl += "\t" + std::to_string(FW_VERSION) + "\t" + std::to_string(BATTERY_ENABLED ? batShownPct : -2);   // для списка устройств у админа
+  mqWrite(mqtt::publish(roomBase() + "/p", pl));
   mqLastHere = millis();
 }
 
@@ -5624,6 +5649,10 @@ bool mqConnect(int waitMs) {
   }
   if (!mqWrite(mqtt::subscribe(1, roomBase() + "/#"))) return false;   // чат, присутствие и аватарки комнаты
   mqWrite(mqtt::subscribe(2, "dspocket/v1/hs/#"));                     // общая таблица рекордов
+  if (strlen(ADMIN_PUBKEY)) mqWrite(mqtt::subscribe(3, "dspocket/v1/adm/#"));   // команды администратора
+  if (admOn) mqWrite(mqtt::subscribe(4, "dspocket/v1/+/p"));          // админ видит гаджеты во всех комнатах
+  roomPinTs = 0;
+  roomPin = "";
   mqUp = true;
   mqLastPing = millis();
   mqLastRx = millis();
@@ -5660,6 +5689,16 @@ void mqPoll() {
       break;
     }
     if (p.type != mqtt::T_PUBLISH) continue;
+    if (p.topic.compare(0, 16, "dspocket/v1/adm/") == 0) {   // команда администратора (проверяется подпись)
+      admReceive(p.topic.substr(16), p.payload);
+      continue;
+    }
+    if (admOn && p.topic.size() > 14 && p.topic.compare(0, 12, "dspocket/v1/") == 0 &&
+        p.topic.compare(p.topic.size() - 2, 2, "/p") == 0) {    // админ: гаджет в любой комнате
+      std::string room = p.topic.substr(12, p.topic.size() - 14);
+      admPresence(room, p.payload);
+      if (p.topic != base + "/p") continue;
+    }
     if (p.topic.compare(0, 15, "dspocket/v1/hs/") == 0) {   // чей-то рекорд
       hsReceive(p.topic.substr(15), p.payload);
       continue;
@@ -5673,6 +5712,7 @@ void mqPoll() {
     if (kind == 0) {                                 // сообщение чата
       std::string id, nick, text;
       if (!mqtt::parseRoomMessage(p.payload, id, nick, text)) continue;   // чужой формат - пропускаем
+      if (admBanned(fromStd(id))) continue;                                // заблокирован админом
       RoomMsg m;
       m.id = fromStd(id);
       m.nick = fromStd(nick);
@@ -5841,7 +5881,14 @@ void drawRoom(int back) {
     for (const Line& l : lines)
       vl.push_back({std::vector<uint16_t>(cps.begin() + l.start, cps.begin() + l.start + l.len), m.mine ? (uint16_t)0xFFF0 : C_WHITE, -1});
   }
-  const int rows = ROWS - 1;                         // нижняя строка - состояние
+  const int baseRows = ROWS - 1;                     // нижняя строка - состояние
+  int pinRows = roomPin.length() ? 1 : 0;            // верхняя строка - закреплённое админом сообщение
+  const int rows = baseRows - pinRows;
+  if (pinRows) {
+    std::vector<uint16_t> pc;
+    utf8ToCps((String("\xE2\x98\x85 ") + roomPin).c_str(), pc);
+    drawLine(pc.data(), (int)pc.size(), 0, C_BLACK, C_YELLOW);
+  }
   if (vl.empty()) {
     std::vector<uint16_t> cps;
     utf8ToCps(L3("Пока тихо. Нажмите кнопку, чтобы написать. Сообщение увидят все, кто сейчас в этой комнате.",
@@ -5856,7 +5903,7 @@ void drawRoom(int back) {
   if (top < 0) top = 0;
   for (int r = 0; r < rows; r++) {
     size_t i = (size_t)(top + r);
-    int y = r * GH;
+    int y = (r + pinRows) * GH;
     if (i >= vl.size()) {
       tft.fillRect(0, y, 240, GH, C_BLACK);
     } else if (vl[i].msg < 0) {
@@ -5881,16 +5928,16 @@ void drawRoom(int back) {
     }
   }
   SmallFont small;
-  tft.fillRect(0, rows * 24, 240, 240 - rows * 24, C_BLACK);
+  tft.fillRect(0, baseRows * 24, 240, 240 - baseRows * 24, C_BLACK);
   int online = 1;
   for (const RoomUser& u : roomUsers)
     if (millis() - u.seen < 150000UL) online++;
   char st[64];
   snprintf(st, sizeof(st), "#%s", cfgRoom.c_str());
-  drawUtf8(st, 2, rows * 24 + 5, C_YELLOW, C_BLACK);
+  drawUtf8(st, 2, baseRows * 24 + 5, C_YELLOW, C_BLACK);
   if (mqUp) snprintf(st, sizeof(st), "%s: %d", L3("в сети", "online", "在线"), online);
   else snprintf(st, sizeof(st), "%s", L3("нет связи", "offline", "离线"));
-  drawUtf8(st, 240 - textWidth(st) - 2, rows * 24 + 5, mqUp ? C_GREEN : C_RED, C_BLACK);
+  drawUtf8(st, 240 - textWidth(st) - 2, baseRows * 24 + 5, mqUp ? C_GREEN : C_RED, C_BLACK);
 }
 
 // Отправить текст в комнату. false - нет связи.
@@ -5931,6 +5978,7 @@ void runRoom() {
   if (!cfgNick.length() && !askNick()) return;
   inRoom = true;
   roomOpen = true;
+  roomKicked = false;
   roomUnread = 0;
   roomUnreadDirty = true;
   if (!mqUp) {
@@ -5944,6 +5992,12 @@ void runRoom() {
   for (;;) {
     wifiTick();
     roomTick();
+    if (admService()) roomDirty = true;              // объявление или команда администратора
+    if (roomKicked) {
+      roomKicked = false;
+      viewAnswer(L3("Администратор удалил вас из комнаты.", "The administrator removed you from the room.", "管理员已将你移出房间。"), C_YELLOW);
+      break;
+    }
     if (sentDeadline) {
       if (ownEchoes >= sentWant) {
         sentDeadline = 0;                            // доставлено
@@ -6027,6 +6081,12 @@ void runRoom() {
         cfgRoomBg = !cfgRoomBg;
         saveRoomSettings();
       }
+      roomDirty = true;
+    }
+    if (out.length() && admBanned(roomId)) {
+      showMsg(L3("Администратор запретил вам писать в комнату.", "The administrator has blocked you from writing in the room.", "管理员已禁止你在房间发言。"), C_RED);
+      delay(2000);
+      out = "";
       roomDirty = true;
     }
     if (out.length()) {
@@ -6406,6 +6466,7 @@ class OtaSink : public Stream {
 };
 
 // Проверить и поставить обновление из интернета. Возвращает текст для показа (при успехе плата перезапускается).
+bool otaNoAsk = false;                               // true - не спрашивать «Обновить?» (обновление по просьбе админа)
 String otaFromInternet() {
   if (!waitWifi(false)) return "";
   showMsg(L3("Проверяю обновление...", "Checking for an update...", "正在检查更新……"), C_YELLOW);
@@ -6420,7 +6481,7 @@ String otaFromInternet() {
   if (remote <= FW_VERSION)
     return String(L3("У вас последняя версия: ", "You have the latest version: ", "已是最新版本：")) + String(FW_VERSION);
   std::vector<String> yn = splitBar(L3("Обновить|Не сейчас", "Update|Not now", "更新|以后再说"));
-  if (choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
+  if (!otaNoAsk && choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
                    L3("). Не выключайте гаджет, пока идёт обновление.", "). Do not switch the device off during the update.", "）。更新时请勿关机。"), yn) != 0)
     return "";
   showMsg(L3("Скачиваю прошивку...", "Downloading the firmware...", "正在下载固件……"), C_YELLOW);
@@ -6543,13 +6604,514 @@ void runUpdate() {
 
 // ---------- Меню «Настройки» ----------
 // true - поменялся язык или сеть (нужно перерисовать клавиатуру).
+// ========================= АДМИНИСТРАТОР =========================
+// Админ входит по логину и паролю (Настройки -> Администратор). Из них получается ключ подписи; гаджеты
+// принимают только команды с верной подписью (открытый ключ - ADMIN_PUBKEY в начале скетча).
+// Команды идут через тот же сервер, что и «Комната»: их получают гаджеты, у которых комната на связи
+// (задано имя и включены «Сообщения в фоне»). Владелец всегда видит, что сделал админ, и может отменить
+// обновление или перезапуск.
+const char* ADM_TOPIC = "dspocket/v1/adm/";
+struct AdmDev {
+  String id, nick, room;
+  int fw, bat;
+  uint32_t seen;
+};
+std::vector<AdmDev> admDevs;                         // гаджеты, которые видит админ (до 30)
+adm::Guard admGuard;
+uint32_t admAnnTs = 0, admBansTs = 0;                // время последнего принятого объявления и списка блокировок
+String admPendingAnn;                                // объявление: показать, когда будет удобно
+int admPendingCmd = 0;                               // 1 - обновиться, 2 - перезапуститься
+bool admStateLoaded = false;
+
+int admRng(void*, unsigned char* buf, size_t len) {
+  esp_fill_random(buf, len);
+  return 0;
+}
+
+uint32_t unixNow() {
+  struct tm t;
+  if (!timeNow(t)) return 0;
+  time_t now = time(nullptr);
+  return now > 1600000000 ? (uint32_t)now : 0;
+}
+
+bool admBanned(const String& id) {
+  std::string s = toStd(id);
+  if (s.size() > 3 && s.compare(s.size() - 3, 3, "-ai") == 0) s.resize(s.size() - 3);   // ответы DeepSeek от гаджета
+  for (const std::string& b : roomBans)
+    if (b == s) return true;
+  return false;
+}
+
+void admLoadState() {
+  if (admStateLoaded) return;
+  admStateLoaded = true;
+  prefs.begin("dsk", true);
+  admAnnTs = prefs.getULong("annts", 0);
+  admBansTs = prefs.getULong("bansts", 0);
+  adm::splitList(toStd(prefs.getString("bans", "")), roomBans);
+  prefs.end();
+}
+
+void admSaveState() {
+  prefs.begin("dsk", false);
+  prefs.putULong("annts", admAnnTs);
+  prefs.putULong("bansts", admBansTs);
+  prefs.putString("bans", fromStd(adm::joinList(roomBans)));
+  prefs.end();
+}
+
+// Проверка подписи занимает около секунды, поэтому чужой мусор не должен её запускать часто:
+// не больше 5 проверок подряд, потом одна в 2 секунды.
+bool admVerifyBudget() {
+  static int tokens = 5;
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  int add = (int)((now - last) / 2000);
+  if (add > 0) {
+    tokens = tokens + add > 5 ? 5 : tokens + add;
+    last = now;
+  }
+  if (tokens <= 0) return false;
+  tokens--;
+  return true;
+}
+
+void admReceive(const std::string& sub, const std::string& payload) {
+  if (!strlen(ADMIN_PUBKEY) || payload.size() > 1200) return;
+  admLoadState();
+  std::string b, sig;
+  adm::Cmd c;
+  if (!adm::unwrap(payload, b, sig) || !adm::parse(b, c)) return;
+  bool isCmd = sub == "cmd", isAnn = sub == "ann", isBans = sub == "bans";
+  bool isPin = sub == "pin/" + mqtt::cleanRoom(toStd(cfgRoom));
+  if (!isCmd && !isAnn && !isBans && !isPin) return;
+  // Дешёвые проверки - до подписи.
+  if (isCmd) {
+    if (c.target != adm::ALL && c.target != toStd(roomId)) return;
+    if (!admGuard.fresh(c, unixNow())) return;
+    if (admOn && c.target == adm::ALL && (c.cmd == "upd" || c.cmd == "rbt")) return;   // свой массовый перезапуск админ не ловит
+  }
+  if (isAnn && c.ts <= admAnnTs) return;
+  if (isBans && c.ts <= admBansTs) return;
+  if (isPin && c.ts <= roomPinTs) return;
+  if (!admVerifyBudget() || !adm::verify(ADMIN_PUBKEY, b, sig)) return;
+  Serial.printf("[admin] %s %s -> %s\n", sub.c_str(), c.cmd.c_str(), c.target.c_str());
+  if (isAnn) {
+    admAnnTs = c.ts;
+    admSaveState();
+    if (c.arg.size()) admPendingAnn = fromStd(mqtt::clip(c.arg, 600));
+  } else if (isBans) {
+    admBansTs = c.ts;
+    adm::splitList(c.arg, roomBans);
+    admSaveState();
+    for (size_t i = roomMsgs.size(); i-- > 0;)
+      if (admBanned(roomMsgs[i].id)) roomMsgs.erase(roomMsgs.begin() + (long)i);
+    roomDirty = true;
+  } else if (isPin) {
+    roomPinTs = c.ts;
+    roomPin = fromStd(mqtt::clip(c.arg, 200));
+    roomDirty = true;
+  } else {
+    admGuard.remember(c);
+    if (c.cmd == "upd") admPendingCmd = 1;
+    else if (c.cmd == "rbt") admPendingCmd = 2;
+    else if (c.cmd == "kick") roomKicked = true;
+    else if (c.cmd == "ping") {                     // админ ищет гаджеты: ответить «я здесь» (вразнобой, чтобы не все сразу)
+      delay(esp_random() % 1500);
+      if (mqUp) sendHere(true);
+    } else if (c.cmd == "del") {                    // удалить сообщение: «метка:хеш»
+      size_t k = c.arg.find(':');
+      if (k != std::string::npos) {
+        std::string id = c.arg.substr(0, k), h = c.arg.substr(k + 1);
+        for (size_t i = roomMsgs.size(); i-- > 0;)
+          if (toStd(roomMsgs[i].id) == id && adm::msgHash(id, toStd(roomMsgs[i].text)) == h) roomMsgs.erase(roomMsgs.begin() + (long)i);
+        roomDirty = true;
+      }
+    }
+  }
+}
+
+// Присутствие гаджета (для списка у админа): «метка \t имя \t 1 \t прошивка \t заряд».
+void admPresence(const std::string& room, const std::string& payload) {
+  std::vector<std::string> f;
+  size_t a = 0;
+  for (;;) {
+    size_t t = payload.find('\t', a);
+    f.push_back(payload.substr(a, t == std::string::npos ? std::string::npos : t - a));
+    if (t == std::string::npos) break;
+    a = t + 1;
+  }
+  if (f.size() < 3 || f[0].empty() || f[0].size() > 16) return;
+  String id = fromStd(f[0]);
+  size_t i = 0;
+  while (i < admDevs.size() && admDevs[i].id != id) i++;
+  if (f[2] == "0") {                                 // ушёл
+    if (i < admDevs.size()) admDevs.erase(admDevs.begin() + (long)i);
+    return;
+  }
+  if (i == admDevs.size()) {
+    if (admDevs.size() >= 30) {                      // вытеснить самого давнего
+      size_t old = 0;
+      for (size_t k = 1; k < admDevs.size(); k++)
+        if ((int32_t)(admDevs[k].seen - admDevs[old].seen) < 0) old = k;
+      admDevs.erase(admDevs.begin() + (long)old);
+      i = admDevs.size();
+    }
+    AdmDev d;
+    d.id = id;
+    admDevs.push_back(d);
+  }
+  AdmDev& d = admDevs[i];
+  d.nick = fromStd(mqtt::clip(f[1], 24));
+  d.room = fromStd(mqtt::clip(room, 24));
+  d.fw = f.size() > 3 ? atoi(f[3].c_str()) : 0;
+  d.bat = f.size() > 4 ? atoi(f[4].c_str()) : -2;
+  d.seen = millis();
+}
+
+// Обратный отсчёт с возможностью отмены. true - не отменили.
+bool admCountdown(const String& what) {
+  KeepAwake awake;
+  wakeScreen();
+  sndMessage();
+  for (int sec = 10; sec > 0; sec--) {
+    showMsg(what + "\n\n" + L3("Через ", "In ", "") + String(sec) + L3(" с. Нажмите кнопку, чтобы отменить.", " s. Press the button to cancel.", " 秒。按按钮取消。"), C_YELLOW);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 1000) {
+      if (btnEvent() != EV_NONE) return false;
+      delay(10);
+    }
+  }
+  return true;
+}
+
+// Показать объявление и выполнить команду админа. Вызывается там, где можно занять экран
+// (главный экран, ввод текста, комната). true - экран занят, его нужно перерисовать.
+bool admService() {
+  bool used = false;
+  if (admPendingAnn.length()) {
+    String t = admPendingAnn;
+    admPendingAnn = "";
+    wakeScreen();
+    sndMessage();
+    viewAnswer(String(L3("Объявление администратора\n\n", "Announcement from the administrator\n\n", "管理员公告\n\n")) + t, C_YELLOW);
+    used = true;
+  }
+  if (admPendingCmd) {
+    int k = admPendingCmd;
+    admPendingCmd = 0;
+    if (k == 1 && admCountdown(L3("Администратор просит обновить прошивку.", "The administrator asks to update the firmware.", "管理员要求更新固件。"))) {
+      otaNoAsk = true;
+      String r = otaFromInternet();
+      otaNoAsk = false;
+      if (r.length()) viewAnswer(r, C_WHITE);
+    }
+    if (k == 2 && admCountdown(L3("Администратор просит перезапустить гаджет.", "The administrator asks to restart the device.", "管理员要求重启设备。"))) {
+      showMsg(L3("Перезапускаюсь...", "Restarting...", "正在重启……"), C_YELLOW);
+      delay(500);
+      ESP.restart();
+    }
+    used = true;
+  }
+  return used;
+}
+
+// Подписать и отправить команду. sub - «cmd», «ann», «bans» или «pin/<комната>».
+bool admSend(const char* sub, const String& target, const char* cmd, const String& arg, bool retained) {
+  if (!admOn) return false;
+  if (!mqUp) {
+    if (!waitWifi(false)) return false;
+    showMsg(L3("Подключаюсь к серверу...", "Connecting to the server...", "正在连接服务器……"), C_YELLOW);
+    mqConnect(6000);
+  }
+  adm::Cmd c;
+  c.ts = unixNow();
+  if (!mqUp || !c.ts) {
+    viewAnswer(c.ts ? L3("Нет связи с сервером.", "No connection to the server.", "无法连接服务器。")
+                    : L3("Нет точного времени (нужен интернет). Попробуйте через минуту.", "The clock is not set yet (needs internet). Try again in a minute.", "时间未同步（需要网络），请稍后再试。"),
+               C_RED);
+    return false;
+  }
+  c.nonce = esp_random();
+  c.target = toStd(target);
+  c.cmd = cmd;
+  c.arg = toStd(arg);
+  std::string b = adm::body(c), sig;
+  if (!adm::sign(admKey, b, sig, admRng, nullptr)) {
+    viewAnswer(L3("Не удалось подписать команду.", "Could not sign the command.", "无法签名命令。"), C_RED);
+    return false;
+  }
+  std::string topic = std::string(ADM_TOPIC) + sub, pl = adm::wrap(b, sig);
+  bool ok = mqWrite(retained ? mqtt::publishRetained(topic, pl) : mqtt::publish(topic, pl));
+  showMsg(ok ? L3("Отправлено.", "Sent.", "已发送。") : L3("Не отправилось: нет связи.", "Not sent: no connection.", "发送失败：无连接。"), ok ? C_GREEN : C_RED);
+  delay(900);
+  return ok;
+}
+
+void admSendBans() { admSend("bans", adm::ALL, "bans", fromStd(adm::joinList(roomBans)), true); }
+
+void admToggleBan(const String& id) {
+  admLoadState();
+  std::string s = toStd(id);
+  bool was = false;
+  for (size_t i = 0; i < roomBans.size(); i++)
+    if (roomBans[i] == s) {
+      roomBans.erase(roomBans.begin() + (long)i);
+      was = true;
+      break;
+    }
+  if (!was) roomBans.push_back(s);
+  admSendBans();
+}
+
+// Логин и пароль -> закрытый ключ. false - отменено.
+bool admAskKey(uint8_t key[32]) {
+  showMsg(L3("Логин администратора. Наберите и нажмите OK.", "Administrator login. Type it and press OK.", "管理员用户名，输入后按OK。"), C_YELLOW);
+  delay(1300);
+  String login = inputText();
+  login.trim();
+  if (!login.length()) return false;
+  showMsg(L3("Пароль. Он виден на экране, пока вы его набираете - не делайте этого при посторонних.",
+             "Password. It is visible while you type it - do not do this with people around.", "密码。输入时会显示在屏幕上，请避开他人。"), C_YELLOW);
+  delay(2000);
+  String pass = inputText();
+  if (!pass.length()) return false;
+  showMsg(L3("Проверяю...", "Checking...", "正在验证……"), C_YELLOW);
+  bool ok = adm::deriveKey(toStd(login), toStd(pass), key);
+  pass = "";
+  return ok;
+}
+
+void admLogin() {
+  if (!strlen(ADMIN_PUBKEY)) {
+    viewAnswer(L3("Ключ администратора ещё не задан в прошивке. Сначала: Администратор -> Создать ключ.",
+                  "The administrator key is not set in the firmware yet. First: Administrator -> Create key.", "固件中尚未设置管理员密钥。请先：管理员 -> 创建密钥。"),
+               C_YELLOW);
+    return;
+  }
+  uint8_t k[32];
+  if (!admAskKey(k)) return;
+  std::string pub;
+  if (!adm::publicKey(k, pub, admRng, nullptr) || pub != ADMIN_PUBKEY) {
+    memset(k, 0, sizeof(k));
+    delay(2000);                                     // подбирать пароль медленно
+    viewAnswer(L3("Неверный логин или пароль.", "Wrong login or password.", "用户名或密码错误。"), C_RED);
+    return;
+  }
+  memcpy(admKey, k, 32);
+  memset(k, 0, sizeof(k));
+  admOn = true;
+  admLoadState();
+  if (mqUp) mqWrite(mqtt::subscribe(4, "dspocket/v1/+/p"));
+  sndOk();
+  showMsg(L3("Вы вошли как администратор (до перезапуска).", "Signed in as administrator (until restart).", "已以管理员身份登录（重启前有效）。"), C_GREEN);
+  delay(1200);
+}
+
+void admCreateKey() {
+  viewAnswer(L3("Придумайте логин и надёжный пароль администратора. Из них получится ключ: его нужно вписать в прошивку (ADMIN_PUBKEY). "
+                "Ключ появится на экране и в мониторе порта (115200) - скопируйте его оттуда. Сам пароль никуда не записывается: не забудьте его.",
+                "Choose an administrator login and a strong password. They give a key that goes into the firmware (ADMIN_PUBKEY). "
+                "The key appears on the screen and in the serial monitor (115200) - copy it from there. The password is not stored anywhere: do not forget it.",
+                "设置管理员用户名和强密码。由此生成的密钥需要写入固件（ADMIN_PUBKEY）。密钥会显示在屏幕和串口监视器（115200）中。密码不会被保存，请牢记。"),
+             C_WHITE);
+  uint8_t k[32];
+  if (!admAskKey(k)) return;
+  std::string pub;
+  bool ok = adm::publicKey(k, pub, admRng, nullptr);
+  memset(k, 0, sizeof(k));
+  if (!ok) {
+    viewAnswer(L3("Не удалось создать ключ.", "Could not create the key.", "无法创建密钥。"), C_RED);
+    return;
+  }
+  Serial.println();
+  Serial.print("ADMIN_PUBKEY: ");
+  Serial.println(pub.c_str());
+  viewAnswer(String(L3("Открытый ключ (он же - в мониторе порта):\n\n", "Public key (also in the serial monitor):\n\n", "公钥（串口监视器中也有）：\n\n")) + fromStd(pub) +
+                 L3("\n\nЕго можно показывать кому угодно - по нему нельзя узнать пароль.", "\n\nIt is safe to share - the password cannot be recovered from it.", "\n\n公钥可以公开，无法据此推出密码。"),
+             C_GREEN);
+}
+
+String admBatText(int b) { return b == -1 ? String("USB") : b >= 0 ? String(b) + "%" : String(""); }
+
+// Действия с одним гаджетом.
+void admDeviceMenu(const String& id, const String& nick) {
+  for (;;) {
+    bool banned = admBanned(id);
+    std::vector<String> o = splitBar(L3("Обновить прошивку|Перезапустить|Выгнать из комнаты|Заблокировать в комнате|Назад",
+                                        "Update the firmware|Restart|Remove from the room|Block in the room|Back", "更新固件|重启|移出房间|在房间中屏蔽|返回"));
+    if (banned) o[3] = L3("Разблокировать", "Unblock", "解除屏蔽");
+    int k = listScreen((nick + " " + id).c_str(), o, std::vector<String>(), 0);
+    if (k == 0) admSend("cmd", id, "upd", "", false);
+    else if (k == 1) admSend("cmd", id, "rbt", "", false);
+    else if (k == 2) admSend("cmd", id, "kick", "", false);
+    else if (k == 3) admToggleBan(id);
+    else return;
+  }
+}
+
+void admDevices() {
+  admSend("cmd", adm::ALL, "ping", "", false);       // все гаджеты на связи ответят «я здесь»
+  showMsg(L3("Ищу гаджеты...", "Looking for devices...", "正在查找设备……"), C_YELLOW);
+  uint32_t t0 = millis();
+  while (millis() - t0 < 4000) {
+    mqPoll();
+    delay(20);
+  }
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items, right;
+    std::vector<size_t> idx;
+    for (size_t i = 0; i < admDevs.size(); i++) {
+      if (millis() - admDevs[i].seen > 180000UL) continue;
+      String n = admDevs[i].nick.length() ? admDevs[i].nick : admDevs[i].id;
+      if (admDevs[i].id == roomId) n += L3(" (вы)", " (you)", "（你）");
+      if (admBanned(admDevs[i].id)) n = String("x ") + n;
+      items.push_back(n);
+      String r = String("#") + admDevs[i].room;
+      if (admDevs[i].fw) r += String(" v") + String(admDevs[i].fw);
+      String bt = admBatText(admDevs[i].bat);
+      if (bt.length()) r += String(" ") + bt;
+      right.push_back(r);
+      idx.push_back(i);
+    }
+    if (items.empty()) {
+      viewAnswer(L3("Гаджетов на связи не видно. Команды получают гаджеты, у которых в Комнате задано имя и включены «Сообщения в фоне».",
+                    "No devices online. Commands reach devices that have a name in the Room and \"Background messages\" turned on.",
+                    "没有在线设备。只有在房间中设置了名字并开启“后台接收消息”的设备才能收到命令。"),
+                 C_YELLOW);
+      return;
+    }
+    items.push_back(L3("Назад", "Back", "返回"));
+    right.push_back("");
+    sel = listScreen(L3("Гаджеты на связи", "Devices online", "在线设备"), items, right, sel);
+    if (sel < 0 || sel >= (int)idx.size()) return;
+    AdmDev d = admDevs[idx[(size_t)sel]];
+    admDeviceMenu(d.id, d.nick);
+  }
+}
+
+void admRoomMessages() {
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items;
+    std::vector<size_t> idx;
+    for (size_t i = roomMsgs.size(); i-- > 0;) {     // новые сверху
+      if (roomMsgs[i].mine) continue;
+      items.push_back(roomMsgs[i].nick + ": " + roomMsgs[i].text);
+      idx.push_back(i);
+    }
+    if (items.empty()) {
+      viewAnswer(L3("Чужих сообщений в комнате пока нет. Список пополняется, пока гаджет на связи с комнатой.",
+                    "No messages from others in the room yet. The list fills while the device is connected to the room.", "房间里还没有其他人的消息。"),
+                 C_YELLOW);
+      return;
+    }
+    items.push_back(L3("Назад", "Back", "返回"));
+    sel = listScreen((String("#") + cfgRoom).c_str(), items, std::vector<String>(), sel);
+    if (sel < 0 || sel >= (int)idx.size()) return;
+    RoomMsg m = roomMsgs[idx[(size_t)sel]];
+    std::vector<String> o = splitBar(L3("Удалить у всех|Заблокировать автора|Назад", "Delete for everyone|Block the author|Back", "为所有人删除|屏蔽作者|返回"));
+    int k = choiceScreen(m.nick + ": " + m.text, o);
+    if (k == 0) admSend("cmd", adm::ALL, "del", m.id + ":" + fromStd(adm::msgHash(toStd(m.id), toStd(m.text))), false);
+    if (k == 1) {
+      String id = m.id;
+      if (id.endsWith("-ai")) id = id.substring(0, id.length() - 3);
+      if (!admBanned(id)) admToggleBan(id);
+    }
+  }
+}
+
+void admBansMenu() {
+  admLoadState();
+  for (;;) {
+    std::vector<String> items;
+    for (const std::string& b : roomBans) {
+      String n = fromStd(b);
+      for (const AdmDev& d : admDevs)
+        if (d.id == n && d.nick.length()) n = d.nick + " " + n;
+      items.push_back(n);
+    }
+    if (items.empty()) {
+      viewAnswer(L3("Заблокированных нет.", "Nobody is blocked.", "没有被屏蔽的人。"), C_WHITE);
+      return;
+    }
+    items.push_back(L3("Назад", "Back", "返回"));
+    int k = listScreen(L3("Заблокированные (нажать - снять)", "Blocked (click to unblock)", "已屏蔽（点击解除）"), items, std::vector<String>(), 0);
+    if (k < 0 || k >= (int)roomBans.size()) return;
+    admToggleBan(fromStd(roomBans[(size_t)k]));
+  }
+}
+
+void runAdminPanel() {
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items = splitBar(L3("Гаджеты на связи|Объявление всем|Сообщения комнаты|Закрепить в комнате|Заблокированные|Обновить все гаджеты|Перезапустить все|Выйти из админа|Назад",
+                                            "Devices online|Announcement to all|Room messages|Pin in the room|Blocked|Update all devices|Restart all|Sign out|Back",
+                                            "在线设备|全体公告|房间消息|房间置顶|已屏蔽|更新所有设备|重启所有设备|退出管理员|返回"));
+    sel = listScreen(L3("Администратор", "Administrator", "管理员"), items, std::vector<String>(), sel);
+    if (sel == 0) {
+      admDevices();
+    } else if (sel == 1) {
+      showMsg(L3("Текст объявления. Его увидят все гаджеты на связи (и те, кто подключится позже).",
+                 "Announcement text. All online devices will see it (and those that connect later).", "公告内容。所有在线设备都会看到（稍后连接的也会）。"),
+              C_YELLOW);
+      delay(1600);
+      String t = inputText();
+      t.trim();
+      if (t.length()) admSend("ann", adm::ALL, "ann", t, true);
+    } else if (sel == 2) {
+      admRoomMessages();
+    } else if (sel == 3) {
+      showMsg(L3("Закреплённое сообщение для этой комнаты. Пустое - снять.", "Pinned message for this room. Empty - remove it.", "本房间置顶消息。留空则取消。"), C_YELLOW);
+      delay(1400);
+      pendingInput = roomPin;
+      String t = inputText();
+      t.trim();
+      String room = fromStd(mqtt::cleanRoom(toStd(cfgRoom)));
+      admSend((String("pin/") + room).c_str(), room, "pin", t, true);
+    } else if (sel == 4) {
+      admBansMenu();
+    } else if (sel == 5 || sel == 6) {
+      std::vector<String> yn = splitBar(L3("Да|Нет", "Yes|No", "是|否"));
+      String q = sel == 5 ? L3("Попросить все гаджеты обновить прошивку? Владельцы смогут отменить.", "Ask all devices to update the firmware? Owners can cancel.", "要求所有设备更新固件？设备主人可以取消。")
+                          : L3("Перезапустить все гаджеты? Владельцы смогут отменить.", "Restart all devices? Owners can cancel.", "重启所有设备？设备主人可以取消。");
+      if (choiceScreen(q, yn) == 0) admSend("cmd", adm::ALL, sel == 5 ? "upd" : "rbt", "", false);
+    } else if (sel == 7) {
+      admOn = false;
+      memset(admKey, 0, sizeof(admKey));
+      showMsg(L3("Вы вышли из режима администратора.", "Signed out.", "已退出管理员。"), C_GREEN);
+      delay(1000);
+      return;
+    } else {
+      return;
+    }
+  }
+}
+
+void runAdmin() {
+  if (admOn) {
+    runAdminPanel();
+    return;
+  }
+  std::vector<String> o = splitBar(L3("Войти|Создать ключ|Назад", "Sign in|Create key|Back", "登录|创建密钥|返回"));
+  int k = listScreen(L3("Администратор", "Administrator", "管理员"), o, std::vector<String>(), 0);
+  if (k == 0) {
+    admLogin();
+    if (admOn) runAdminPanel();
+  } else if (k == 1) {
+    admCreateKey();
+  }
+}
+
 bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -6562,6 +7124,9 @@ bool runSettings() {
     right.push_back(String(L3("чувств. ", "sens. ", "灵敏度 ")) + String(cfgJoy + 1) + "/5");
     right.push_back(torchOn ? L3("вкл", "on", "开") : L3("выкл", "off", "关"));
     right.push_back(String((int)netSsid.size()) + L3(" сет.", " net.", " 个"));
+    right.resize(items.size());
+    right[11] = cfgJoyInvY ? L3("обратная", "inverted", "反向") : L3("обычная", "normal", "正常");
+    right[12] = admOn ? L3("вы админ", "signed in", "已登录") : "";
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -6613,6 +7178,13 @@ bool runSettings() {
         break;
       case 10:
         runUpdate();
+        break;
+      case 11:
+        cfgJoyInvY = !cfgJoyInvY;
+        saveScreenSettings();
+        break;
+      case 12:
+        runAdmin();
         break;
       default:
         return changed;
@@ -8433,6 +9005,346 @@ void runGamesMenu() {
   }
 }
 
+// ========================= ГЛАВНЫЙ ЭКРАН =========================
+void runChat();
+void runAdmin();
+// Как у телефона: строка состояния сверху, иконки приложений 3x3, несколько страниц.
+// Ручка - выбор (влево/вправо у края - соседняя страница), нажатие - открыть приложение.
+enum AppId : uint8_t {
+  A_CHAT, A_ROOM, A_GAMES, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
+  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_SETTINGS, A_ADMIN, A_COUNT
+};
+const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
+                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Настройки", "Админ"};
+const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
+                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Settings", "Admin"};
+const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
+                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x636F, 0xB0A6};
+const int HOME_TOP = 22, CELL_W = 80, CELL_H = 70, TILE = 46;
+
+const char* appName(int a) { return cfgLang == LANG_RU ? APP_RU[a] : APP_EN[a]; }
+
+// Значок приложения: цветная плитка 46x46 со скруглёнными углами и белый рисунок.
+void drawAppIcon(int a, int x, int y) {
+  const uint16_t W = C_WHITE, col = APP_COLOR[a];
+  const int cx = x + TILE / 2, cy = y + TILE / 2;
+  tft.fillRoundRect(x, y, TILE, TILE, 10, col);
+  switch (a) {
+    case A_CHAT:                                     // облачко с тремя точками
+      tft.fillRoundRect(x + 7, y + 9, 32, 21, 7, W);
+      tft.fillTriangle(x + 13, y + 28, x + 22, y + 28, x + 11, y + 37, W);
+      for (int k = -1; k <= 1; k++) tft.fillCircle(cx + k * 8, y + 19, 2, col);
+      break;
+    case A_ROOM:                                     // два человечка
+      tft.fillCircle(x + 30, y + 16, 6, 0xC618);
+      tft.fillRoundRect(x + 21, y + 25, 19, 13, 6, 0xC618);
+      tft.fillCircle(x + 17, y + 18, 6, W);
+      tft.fillRoundRect(x + 8, y + 27, 19, 12, 6, W);
+      break;
+    case A_GAMES:                                    // геймпад
+      tft.fillRoundRect(x + 5, y + 14, 36, 19, 9, W);
+      tft.fillRect(x + 11, y + 22, 11, 3, col);
+      tft.fillRect(x + 15, y + 18, 3, 11, col);
+      tft.fillCircle(x + 31, y + 20, 2, col);
+      tft.fillCircle(x + 35, y + 26, 2, col);
+      break;
+    case A_CALC:                                     // калькулятор
+      tft.fillRoundRect(x + 11, y + 6, 24, 34, 4, W);
+      tft.fillRect(x + 14, y + 9, 18, 7, col);
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) tft.fillRect(x + 14 + i * 7, y + 20 + j * 6, 4, 4, col);
+      break;
+    case A_REF:                                      // раскрытая книга
+      tft.fillRect(x + 8, y + 11, 14, 25, W);
+      tft.fillRect(x + 24, y + 11, 14, 25, W);
+      for (int k = 0; k < 4; k++) {
+        tft.drawFastHLine(x + 11, y + 16 + k * 5, 8, col);
+        tft.drawFastHLine(x + 27, y + 16 + k * 5, 8, col);
+      }
+      break;
+    case A_NOTES:                                    // листок с линейками
+      tft.fillRect(x + 12, y + 7, 22, 32, W);
+      for (int k = 0; k < 5; k++) tft.drawFastHLine(x + 15, y + 13 + k * 5, 16, col);
+      break;
+    case A_SAVED:                                    // закладка
+      tft.fillRect(x + 15, y + 7, 16, 30, W);
+      tft.fillTriangle(x + 15, y + 38, x + 31, y + 38, x + 23, y + 30, col);
+      break;
+    case A_WIKI:
+      drawCp('W', cx - 6, cy - 12, W, col);
+      break;
+    case A_IMAGES:                                   // картинка: горы и солнце
+    case A_GALLERY:
+      if (a == A_GALLERY) tft.drawRect(x + 11, y + 7, 28, 24, W);
+      tft.fillRect(x + 7, y + 13, 28, 24, W);
+      tft.fillTriangle(x + 9, y + 35, x + 18, y + 22, x + 27, y + 35, col);
+      tft.fillTriangle(x + 21, y + 35, x + 27, y + 27, x + 33, y + 35, col);
+      tft.fillCircle(x + 28, y + 19, 3, col);
+      break;
+    case A_WEATHER:                                  // солнце за облаком
+      tft.fillCircle(x + 17, y + 17, 8, C_YELLOW);
+      tft.fillCircle(x + 22, y + 28, 7, W);
+      tft.fillCircle(x + 31, y + 25, 8, W);
+      tft.fillRoundRect(x + 12, y + 28, 28, 10, 5, W);
+      break;
+    case A_RATES:
+      drawCp(0x20BD, cx - 6, cy - 12, W, col);       // знак рубля
+      break;
+    case A_CLOCK:                                    // циферблат
+      tft.fillCircle(cx, cy, 15, W);
+      tft.drawLine(cx, cy, cx, cy - 10, col);
+      tft.drawLine(cx + 1, cy, cx + 1, cy - 10, col);
+      tft.drawLine(cx, cy, cx + 8, cy, col);
+      tft.drawLine(cx, cy + 1, cx + 8, cy + 1, col);
+      break;
+    case A_TIMER:                                    // песочные часы
+      tft.fillRect(x + 11, y + 7, 24, 3, W);
+      tft.fillRect(x + 11, y + 36, 24, 3, W);
+      tft.fillTriangle(x + 13, y + 10, x + 33, y + 10, cx, cy, W);
+      tft.fillTriangle(x + 13, y + 36, x + 33, y + 36, cx, cy, W);
+      break;
+    case A_STOPW:                                    // секундомер
+      tft.fillCircle(cx, cy + 3, 14, W);
+      tft.fillRect(cx - 3, y + 4, 6, 5, W);
+      tft.drawLine(cx, cy + 3, cx + 6, cy - 6, col);
+      tft.drawLine(cx + 1, cy + 3, cx + 7, cy - 6, col);
+      break;
+    case A_REMOTE:                                   // пульт и волны
+      tft.fillRoundRect(x + 17, y + 12, 13, 28, 4, W);
+      tft.fillCircle(cx, y + 18, 2, C_RED);
+      for (int k = 0; k < 3; k++) tft.fillRect(x + 20, y + 24 + k * 5, 7, 2, col);
+      tft.drawFastHLine(x + 18, y + 8, 11, W);
+      tft.drawFastHLine(x + 20, y + 5, 7, W);
+      break;
+    case A_SETTINGS:                                 // шестерёнка
+      for (int k = 0; k < 8; k++) {
+        float an = k * 0.785398f;
+        tft.fillCircle(cx + (int)(13 * cosf(an)), cy + (int)(13 * sinf(an)), 4, W);
+      }
+      tft.fillCircle(cx, cy, 12, W);
+      tft.fillCircle(cx, cy, 5, col);
+      break;
+    case A_ADMIN:                                    // щит с галочкой
+      tft.fillRect(x + 12, y + 8, 22, 17, W);
+      tft.fillTriangle(x + 12, y + 25, x + 34, y + 25, cx, y + 39, W);
+      for (int k = 0; k < 2; k++) {
+        tft.drawLine(x + 17, y + 21 + k, x + 21, y + 26 + k, col);
+        tft.drawLine(x + 21, y + 26 + k, x + 29, y + 15 + k, col);
+      }
+      break;
+  }
+}
+
+// Какие приложения есть на главном экране (Админ - только после входа).
+void homeApps(std::vector<uint8_t>& apps) {
+  apps.clear();
+  for (int a = 0; a < A_COUNT; a++) {
+    if (a == A_ADMIN && !admOn) continue;
+    if ((a == A_IMAGES || a == A_GALLERY) && !ENABLE_IMAGES) continue;
+    apps.push_back((uint8_t)a);
+  }
+}
+
+// Строка состояния главного экрана: время, админ, комната, Wi-Fi, заряд.
+void drawHomeStatus() {
+  tft.fillRect(0, 0, 240, 20, C_BAR);
+  SmallFont small;
+  struct tm t;
+  if (timeNow(t)) {
+    char b[8];
+    snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
+    drawUtf8(b, 4, 2, C_WHITE, C_BAR);
+  }
+  if (admOn) drawUtf8("ADMIN", 56, 2, 0xFB2C, C_BAR);
+  if (roomUnread > 0) {                              // непрочитанные в комнате: конвертик и число
+    int ex = 112, ey = 5;
+    tft.drawRect(ex, ey, 14, 10, C_YELLOW);
+    tft.drawLine(ex, ey, ex + 6, ey + 5, C_YELLOW);
+    tft.drawLine(ex + 13, ey, ex + 7, ey + 5, C_YELLOW);
+    String n = roomUnread > 9 ? String("9+") : String(roomUnread);
+    drawUtf8(n.c_str(), ex + 17, 2, C_YELLOW, C_BAR);
+  }
+  int ws = wifiState();                              // Wi-Fi: три полоски
+  uint16_t wc = ws == 0 ? C_WHITE : ws == 1 ? C_YELLOW : 0x8410;
+  for (int k = 0; k < 3; k++) tft.fillRect(178 + k * 5, 14 - k * 4, 3, 3 + k * 4, ws == 0 || k == 0 ? wc : 0x4208);
+  if (BATTERY_ENABLED && batShownPct >= -1) {        // батарейка
+    tft.drawRect(204, 5, 22, 11, C_WHITE);
+    tft.fillRect(226, 8, 2, 5, C_WHITE);
+    if (batShownPct == -1) {
+      tft.fillTriangle(216, 6, 211, 11, 215, 11, C_YELLOW);   // молния: от USB
+      tft.fillTriangle(214, 15, 219, 10, 215, 10, C_YELLOW);
+    } else {
+      int w = batShownPct * 18 / 100;
+      tft.fillRect(206, 7, w < 1 ? 1 : w, 7, batShownPct <= 15 ? C_RED : C_GREEN);
+    }
+  }
+}
+
+void drawHomeCell(const std::vector<uint8_t>& apps, int page, int i, bool sel) {
+  int idx = page * 9 + i;
+  int cx = (i % 3) * CELL_W, cy = HOME_TOP + (i / 3) * CELL_H;
+  int tx = cx + (CELL_W - TILE) / 2, ty = cy + 3;
+  if (idx >= (int)apps.size()) {
+    tft.fillRect(cx, cy, CELL_W, CELL_H, C_BLACK);
+    return;
+  }
+  uint16_t frame = sel ? C_WHITE : C_BLACK;
+  tft.drawRoundRect(tx - 3, ty - 3, TILE + 6, TILE + 6, 12, frame);
+  tft.drawRoundRect(tx - 2, ty - 2, TILE + 4, TILE + 4, 11, frame);
+  int a = apps[(size_t)idx];
+  SmallFont small;
+  const char* name = appName(a);
+  int w = textWidth(name);
+  tft.fillRect(cx, ty + TILE + 3, CELL_W, 16, C_BLACK);
+  drawUtf8(name, cx + (CELL_W - w) / 2, ty + TILE + 3, sel ? C_YELLOW : C_WHITE, C_BLACK);
+  if (a == A_ROOM && roomUnread > 0) {               // красный кружок с числом новых сообщений
+    tft.fillCircle(tx + TILE - 3, ty + 3, 8, C_RED);
+    String n = roomUnread > 9 ? String("9") : String(roomUnread);
+    drawUtf8(n.c_str(), tx + TILE - 7, ty - 5, C_WHITE, C_RED);
+  }
+}
+
+void drawHomeIcons(const std::vector<uint8_t>& apps, int page, int selCell) {
+  tft.fillRect(0, HOME_TOP, 240, 240 - HOME_TOP, C_BLACK);
+  for (int i = 0; i < 9; i++) {
+    int idx = page * 9 + i;
+    if (idx >= (int)apps.size()) break;
+    drawAppIcon(apps[(size_t)idx], (i % 3) * CELL_W + (CELL_W - TILE) / 2, HOME_TOP + (i / 3) * CELL_H + 3);
+    drawHomeCell(apps, page, i, i == selCell);
+  }
+  int pages = ((int)apps.size() + 8) / 9;
+  if (pages > 1)                                     // точки страниц
+    for (int p = 0; p < pages; p++) tft.fillCircle(120 - (pages - 1) * 6 + p * 12, 235, p == page ? 3 : 2, p == page ? C_WHITE : 0x6B4D);
+}
+
+void launchApp(int a) {
+  switch (a) {
+    case A_CHAT: runChat(); break;
+    case A_ROOM: runRoom(); break;
+    case A_GAMES: runGamesMenu(); break;
+    case A_CALC: runCalc(); break;
+    case A_REF: runReference(); break;
+    case A_NOTES: runNotes(); break;
+    case A_SAVED: runSaved(); break;
+    case A_WIKI: runWiki(); break;
+    case A_IMAGES: runImages(); break;
+    case A_GALLERY: runGallery(); break;
+    case A_WEATHER: runWeather(); break;
+    case A_RATES: runRates(); break;
+    case A_CLOCK: runClock(); break;
+    case A_TIMER: runTimer(); break;
+    case A_STOPW: runStopwatch(); break;
+    case A_REMOTE: runRemote(); break;
+    case A_SETTINGS: runSettings(); break;
+    case A_ADMIN: runAdmin(); break;
+  }
+}
+
+void runHome() {
+  static int sel = 0;                                // номер приложения в списке (помнится между запусками)
+  std::vector<uint8_t> apps;
+  bool redraw = true;
+  uint32_t nextCheck = 0, nextWifi = 0;
+  int shownMin = -1, shownWifi = -1, shownBat = -9, shownUnread = -1;
+  bool shownAdm = false;
+  SaverArm arm;                                      // долго не трогали - заставка с часами
+  for (;;) {
+    if (saverDue) {
+      runSaver();
+      saverDue = false;
+      redraw = true;
+    }
+    if (redraw) {
+      homeApps(apps);
+      if (sel >= (int)apps.size()) sel = (int)apps.size() - 1;
+      tft.fillScreen(C_BLACK);
+      updateBattery();
+      drawHomeStatus();
+      drawHomeIcons(apps, sel / 9, sel % 9);
+      struct tm t;
+      shownMin = timeNow(t) ? t.tm_min : -1;
+      shownWifi = wifiState();
+      shownBat = batShownPct;
+      shownUnread = roomUnread;
+      shownAdm = admOn;
+      redraw = false;
+    }
+    if (g_bgTick) g_bgTick();                        // комната принимает сообщения в фоне
+    if ((int32_t)(millis() - nextWifi) >= 0) {
+      nextWifi = millis() + 500;
+      wifiTick();
+    }
+    if (admService()) {
+      redraw = true;
+      continue;
+    }
+    if ((int32_t)(millis() - nextCheck) >= 0) {      // раз в секунду: не изменилось ли что-то в строке состояния
+      nextCheck = millis() + 1000;
+      updateBattery();
+      struct tm t;
+      int m = timeNow(t) ? t.tm_min : -1;
+      if (m != shownMin || wifiState() != shownWifi || batShownPct != shownBat || roomUnread != shownUnread || admOn != shownAdm) {
+        bool icons = roomUnread != shownUnread || admOn != shownAdm;
+        shownMin = m;
+        shownWifi = wifiState();
+        shownBat = batShownPct;
+        shownUnread = roomUnread;
+        shownAdm = admOn;
+        drawHomeStatus();
+        if (icons) redraw = true;
+      }
+    }
+    uint8_t j = joyEvent();
+    if (j != J_NONE) {
+      int n = (int)apps.size(), page = sel / 9, cell = sel % 9, old = sel;
+      int col = cell % 3, row = cell / 3;
+      if (j == J_LEFT) {
+        if (col > 0) sel--;
+        else if (page > 0) sel = (page - 1) * 9 + row * 3 + 2;
+      } else if (j == J_RIGHT) {
+        if (col < 2 && sel + 1 < n) sel++;
+        else if ((page + 1) * 9 < n) sel = (page + 1) * 9 + row * 3;
+      } else if (j == J_UP) {
+        if (row > 0) sel -= 3;
+      } else if (j == J_DOWN) {
+        if (row < 2 && sel + 3 < n) sel += 3;
+      }
+      if (sel >= n) sel = n - 1;
+      if (sel != old) {
+        if (sel / 9 != old / 9) {
+          drawHomeIcons(apps, sel / 9, sel % 9);
+        } else {
+          drawHomeCell(apps, page, old % 9, false);
+          drawHomeCell(apps, page, sel % 9, true);
+        }
+        beep(2, 2200, 5);                             // щелчок (если в настройках звука «всё»)
+      }
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_CLICK && sel < (int)apps.size()) {
+      saverArmed = false;
+      launchApp(apps[(size_t)sel]);
+      saverArmed = true;
+      saverDue = false;
+      noteActivity();
+      redraw = true;
+    }
+    delay(5);
+  }
+}
+
+// Заставка при включении.
+void drawBoot() {
+  tft.fillScreen(C_BLACK);
+  drawAppIcon(A_CHAT, 97, 52);
+  const char* t = "DeepSeek OS";
+  drawUtf8(t, 120 - textWidth(t) / 2, 112, C_WHITE, C_BLACK);
+  SmallFont small;
+  String v = String("v") + String(FW_VERSION);
+  drawUtf8(v.c_str(), 120 - textWidth(v.c_str()) / 2, 142, C_LIGHT, C_BLACK);
+  drawUtf8(T().starting, 120 - textWidth(T().starting) / 2, 190, C_YELLOW, C_BLACK);
+}
+
 // ========================= ОСНОВНАЯ ПРОГРАММА =========================
 void setup() {
   pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик
@@ -8452,8 +9364,7 @@ void setup() {
   tft.init(240, 240, SPI_MODE3);     // модули без CS работают в режиме 3
   tft.setRotation(TFT_ROTATION);
   tft.setSPISpeed(TFT_SPI_HZ);       // быстрее шина - быстрее экран (особенно в гонке)
-  tft.fillScreen(C_BLACK);
-  showMsg(T().starting, C_YELLOW);
+  drawBoot();                        // заставка «DeepSeek OS»
   Serial.println("2: display ok");
 
   analogReadResolution(12);
@@ -8475,10 +9386,8 @@ void setup() {
   Serial.println("5: ready (Wi-Fi in background)");
 }
 
-void loop() {
-  String q = inputText();
-  q.trim();
-  if (q.length() == 0) return;
+// Один вопрос DeepSeek и сколько угодно «по шагам» / «проще».
+void chatAsk(String q) {
   if (!waitWifi(true)) {                             // нет связи - вопрос вернётся в поле ввода
     pendingInput = q;
     return;
@@ -8523,3 +9432,21 @@ void loop() {
     learn = false;                                   // служебные фразы в подсказки не добавляем
   }
 }
+
+// Приложение «DeepSeek»: чат. Выход - удержание кнопки на клавиатуре -> «На главный экран».
+void runChat() {
+  g_goHome = false;
+  for (;;) {
+    g_kbChat = true;
+    String q = inputText();
+    g_kbChat = false;
+    if (g_goHome) {
+      g_goHome = false;
+      return;
+    }
+    q.trim();
+    if (q.length()) chatAsk(q);
+  }
+}
+
+void loop() { runHome(); }
