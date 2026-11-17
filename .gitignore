@@ -1,0 +1,3 @@
+# Файлы сборки Arduino IDE (Скетч -> Экспорт бинарного файла)
+deepseek_c3/build/
+deepseek_c3/*.bin

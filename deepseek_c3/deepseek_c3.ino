@@ -5,7 +5,7 @@
 // Библиотеки (Менеджер библиотек): "Adafruit ST7735 and ST7789 Library"
 // (вместе с Adafruit GFX и BusIO) и "ArduinoJson" версии 7.x.
 // Плата: ESP32C3 Dev Module, USB CDC On Boot: Enabled,
-// Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)  <- обязательно, из-за шрифта с иероглифами.
+// Partition Scheme: Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS), Erase All Flash: Disabled.
 //
 // Управление аналоговым джойстиком (модуль KY-023): наклон - перемещение,
 // нажатие - ввод, долгое нажатие (больше 0,7 с) на клавиатуре - меню.

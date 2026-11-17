@@ -38,12 +38,10 @@ jobs:
         run: |
           VER=$((100 + GITHUB_RUN_NUMBER))
           echo "VER=$VER" >> "$GITHUB_ENV"
-          mkdir -p build/deepseek_c3
-          cp *.ino *.h *.cpp build/deepseek_c3/
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs" \
             --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER" \
-            --output-dir out build/deepseek_c3
+            --output-dir out deepseek_c3
           ls -la out
 
       - name: Publish firmware
