@@ -10181,7 +10181,24 @@ void setup() {
     loadLearned();
     loadAvatar();
   }
-  sdMount();                                 // SD-карта (если включена в настройках)
+  // SD-карта (если включена в настройках). Защита: если прошлый запуск с картой не дошёл до конца
+  // или при включении зажата кнопка джойстика - карта выключается, чтобы гаджет точно загрузился.
+  if (cfgSd) {
+    pinMode(PIN_SW, INPUT_PULLUP);
+    delay(5);
+    prefs.begin("dsk", false);
+    bool failed = prefs.getUChar("sdboot", 0) != 0;
+    if (failed || digitalRead(PIN_SW) == LOW) {
+      cfgSd = 0;
+      prefs.putUChar("sd", 0);
+      prefs.putUChar("sdboot", 0);
+      Serial.println(failed ? "SD card turned off: the previous start with it did not finish" : "SD card turned off: button held");
+    } else {
+      prefs.putUChar("sdboot", 1);                 // снимем в конце запуска
+    }
+    prefs.end();
+  }
+  sdMount();
   Serial.printf("4: learned words: %u\n", (unsigned)sugg.learnedCount());
 
   if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
@@ -10189,6 +10206,11 @@ void setup() {
   if (ENABLE_BLE && cfgBle) {                        // Bluetooth включён в настройках
     ble::begin(toStd(roomId));
     Serial.printf("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
+  }
+  if (cfgSd) {                                       // запуск с картой прошёл
+    prefs.begin("dsk", false);
+    prefs.putUChar("sdboot", 0);
+    prefs.end();
   }
   Serial.println("5: ready (Wi-Fi in background)");
 }
