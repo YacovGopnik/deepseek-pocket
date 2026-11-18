@@ -109,6 +109,9 @@ inline void sendPhone(const std::string&) {}
 inline void media(uint16_t) {}
 }  // namespace ble
 #endif
+#ifndef ENABLE_WTTR
+#define ENABLE_WTTR FULL_EDITION                     // запасной сервер погоды wttr.in (~20 КБ)
+#endif
 #ifndef ENABLE_WIFIPAD
 #define ENABLE_WIFIPAD FULL_EDITION                  // пульт и клавиатура с телефона по Wi-Fi
 #endif
@@ -5456,6 +5459,11 @@ const char* weatherName(int code) {
 
 // Координаты города через wttr.in - если геокодер Open-Meteo недоступен.
 bool wttrGeo(const String& city, tools::Place& pl) {
+#if !ENABLE_WTTR
+  (void)city;
+  (void)pl;
+  return false;
+#else
   String path = String("wttr.in/") + fromStd(tools::urlEncode(toStd(city))) + "?format=j1";
   JsonDocument filter;
   JsonObject na = filter["nearest_area"].add<JsonObject>();
@@ -5491,6 +5499,7 @@ bool wttrGeo(const String& city, tools::Place& pl) {
     return pl.lat != 0 || pl.lon != 0;
   }
   return false;
+#endif
 }
 
 // Спросить город и найти его координаты. true - найден и сохранён.
@@ -5552,6 +5561,10 @@ int wwoToWmo(int c) {                                // коды погоды wt
 }
 
 bool wttrForecast(tools::Forecast& f) {
+#if !ENABLE_WTTR
+  (void)f;
+  return false;
+#else
   char path[64];
   snprintf(path, sizeof(path), "wttr.in/%.3f,%.3f?format=j1", cfgLat, cfgLon);
   JsonDocument filter;
@@ -5620,6 +5633,7 @@ bool wttrForecast(tools::Forecast& f) {
     return !isnan(f.temp);
   }
   return false;
+#endif
 }
 
 void runWeather() {
