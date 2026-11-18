@@ -1498,6 +1498,22 @@ bool sdMount() {
   return sdOk;
 }
 
+// Карта иногда отвечает только через 10-20 с после включения. Если при запуске не нашлась -
+// первые 2 минуты пробуем ещё раз каждые 15 с (одна попытка ~1 с).
+void sdRetryService() {
+  static uint32_t last = 0;
+  if (!cfgSd || sdOk || millis() > 120000 || millis() - last < 15000) return;
+  last = millis();
+  SdBus bus;
+  SD.end();
+  sdOk = SD.begin(SD_CS, SPI, 4000000, "/sd", 4);
+  if (sdOk) {
+    SD.mkdir("/pics");
+    SD.mkdir("/fw");
+  }
+  Serial.printf("SD card retry: %s\n", sdOk ? "ok" : "not found");
+}
+
 fs::FS& picFs() {
   if (sdOk) return SD;
   return LittleFS;
@@ -7411,6 +7427,7 @@ bool admCountdown(const String& what) {
 // Показать объявление и выполнить команду админа. Вызывается там, где можно занять экран
 // (главный экран, ввод текста, комната). true - экран занят, его нужно перерисовать.
 bool admService() {
+  sdRetryService();
   bool used = bleService();                          // заодно: уведомления с телефона по Bluetooth
   if (admPendingAnn.length()) {
     String t = admPendingAnn;
