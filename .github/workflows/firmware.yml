@@ -50,9 +50,14 @@ jobs:
             --fqbn "esp32:esp32:nologo_esp32c3_super_mini:CDCOnBoot=cdc,PartitionScheme=huge_app" \
             --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER -DENABLE_BLE=1" \
             --build-path build-ble --output-dir out-ble deepseek_c3
-          ls -la out out-ble
+          # Игровая сборка: только игры, комната и настройки
+          arduino-cli compile \
+            --fqbn "esp32:esp32:nologo_esp32c3_super_mini:CDCOnBoot=cdc,PartitionScheme=huge_app" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER -DGAMES_EDITION=1" \
+            --build-path build-games --output-dir out-games deepseek_c3
+          ls -la out out-ble out-games
           # Разметка из partitions.csv: под прошивку 0x1E0000 байт
-          for f in out/deepseek_c3.ino.bin out-ble/deepseek_c3.ino.bin; do
+          for f in out/deepseek_c3.ino.bin out-ble/deepseek_c3.ino.bin out-games/deepseek_c3.ino.bin; do
             SZ=$(stat -c %s "$f"); echo "$f: $SZ of 1966080"
             if [ "$SZ" -gt 1966080 ]; then echo "::error::$f does not fit"; exit 1; fi
           done
@@ -62,6 +67,7 @@ jobs:
           mkdir -p firmware
           cp out/deepseek_c3.ino.bin firmware/firmware.bin
           cp out-ble/deepseek_c3.ino.bin firmware/firmware-ble.bin
+          cp out-games/deepseek_c3.ino.bin firmware/firmware-games.bin
           echo "$VER" > firmware/version.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

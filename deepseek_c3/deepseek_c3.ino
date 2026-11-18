@@ -75,9 +75,17 @@
 #endif
 // Сборка «с Bluetooth» (ENABLE_BLE 1) не помещается целиком: в ней нет части приложений (ниже).
 // Полная сборка - всё, кроме Bluetooth. Обе собирает GitHub; на гаджете: Настройки -> Обновление -> Сменить сборку.
+// Игровая сборка (GAMES_EDITION 1): только игры, комната, телефон-пульт и настройки - место под большие игры.
+#ifndef GAMES_EDITION
+#define GAMES_EDITION 0
+#endif
+#if GAMES_EDITION && ENABLE_BLE
+#error "GAMES_EDITION and ENABLE_BLE cannot be on together"
+#endif
 #define FULL_EDITION (!ENABLE_BLE)
+#define EDITION_ID (GAMES_EDITION ? 2 : ENABLE_BLE ? 1 : 0)   // 0 полная, 1 с Bluetooth, 2 игровая
 #ifndef ENABLE_WEBIMG
-#define ENABLE_WEBIMG FULL_EDITION                   // картинки из интернета (галерея с телефона есть всегда)
+#define ENABLE_WEBIMG (FULL_EDITION && !GAMES_EDITION)                   // картинки из интернета (галерея с телефона есть всегда)
 #endif
 #ifndef ENABLE_CHESS
 #define ENABLE_CHESS FULL_EDITION
@@ -89,10 +97,10 @@
 #define ENABLE_AIGAMES FULL_EDITION                  // Викторина и История с DeepSeek
 #endif
 #ifndef ENABLE_IR
-#define ENABLE_IR FULL_EDITION                       // ИК-пульт (GPIO8)
+#define ENABLE_IR (FULL_EDITION && !GAMES_EDITION)                       // ИК-пульт (GPIO8)
 #endif
 #ifndef ENABLE_TORCH
-#define ENABLE_TORCH FULL_EDITION                    // фонарик (GPIO2)
+#define ENABLE_TORCH (FULL_EDITION && !GAMES_EDITION)                    // фонарик (GPIO2)
 #endif
 #if ENABLE_BLE
 #include "ble_link.h"
@@ -109,8 +117,15 @@ inline void sendPhone(const std::string&) {}
 inline void media(uint16_t) {}
 }  // namespace ble
 #endif
+#ifndef ENABLE_SANDBOX
+#define ENABLE_SANDBOX FULL_EDITION                  // «Песочница» (мир из блоков)
+#endif
+#if ENABLE_SANDBOX
+#include "sandbox_game.h"
+#include <new>
+#endif
 #ifndef ENABLE_WTTR
-#define ENABLE_WTTR FULL_EDITION                     // запасной сервер погоды wttr.in (~20 КБ)
+#define ENABLE_WTTR (FULL_EDITION && !GAMES_EDITION)                     // запасной сервер погоды wttr.in (~20 КБ)
 #endif
 #ifndef ENABLE_WIFIPAD
 #define ENABLE_WIFIPAD FULL_EDITION                  // пульт и клавиатура с телефона по Wi-Fi
@@ -2025,10 +2040,25 @@ void buildScanList() {
 void viewAnswer(const String& utf8, uint16_t fg);
 // Приложение есть только в полной сборке.
 void notInEdition() {
-  viewAnswer(L3("Этого нет в сборке «с Bluetooth»: она не вмещает всё. Полная сборка: Настройки -> Обновление -> Сменить сборку.",
-                "Not available in the Bluetooth edition: it cannot hold everything. Full edition: Settings -> Update -> Switch edition.",
-                "蓝牙版不包含此功能。完整版：设置 -> 更新 -> 切换版本。"),
+  viewAnswer(GAMES_EDITION ? L3("Этого нет в игровой сборке. Полная сборка: Настройки -> Обновление -> Сменить сборку.",
+                                "Not available in the games edition. Full edition: Settings -> Update -> Switch edition.", "游戏版不包含此功能。")
+                           : L3("Этого нет в сборке «с Bluetooth»: она не вмещает всё. Полная сборка: Настройки -> Обновление -> Сменить сборку.",
+                                "Not available in the Bluetooth edition: it cannot hold everything. Full edition: Settings -> Update -> Switch edition.",
+                                "蓝牙版不包含此功能。完整版：设置 -> 更新 -> 切换版本。"),
              C_YELLOW);
+}
+
+// Сборки прошивки: 0 - полная, 1 - с Bluetooth, 2 - игровая.
+const char* edFile(int e) { return e == 1 ? "firmware-ble.bin" : e == 2 ? "firmware-games.bin" : "firmware.bin"; }
+const char* edName(int e) {
+  return e == 1 ? L3("с Bluetooth", "Bluetooth", "蓝牙版") : e == 2 ? L3("игровая", "games", "游戏版") : L3("полная", "full", "完整版");
+}
+const char* edAbout(int e) {
+  return e == 1 ? L3("Сборка с Bluetooth: телефон как клавиатура и пульт для музыки. Без части игр, картинок из интернета, ИК-пульта и фонарика.",
+                     "Bluetooth edition: phone keyboard and music remote. Without some games, web images, IR remote and torch.", "蓝牙版。")
+         : e == 2 ? L3("Игровая сборка: только игры (в том числе большие), комната, пульт с телефона и настройки. Без DeepSeek-чата, справочника, калькулятора и остальных приложений.",
+                       "Games edition: games only (including the big ones), room, phone pad and settings. No DeepSeek chat, reference, calculator or other apps.", "游戏版。")
+                  : L3("Полная сборка: все приложения и игры, без Bluetooth.", "Full edition: all apps and games, no Bluetooth.", "完整版。");
 }
 // Точка доступа + страница настройки. Возвращается при отмене кнопкой,
 // после сохранения перезапускает плату.
@@ -7023,7 +7053,7 @@ class OtaSink : public Stream {
 };
 
 // Проверить и поставить обновление из интернета. Возвращает текст для показа (при успехе плата перезапускается).
-bool otaSwitch = false;                              // true - поставить другую сборку (полная <-> с Bluetooth)
+int otaTarget = -1;                                  // какую сборку поставить; -1 - ту же, что стоит
 bool otaNoAsk = false;                               // true - не спрашивать «Обновить?» (обновление по просьбе админа)
 String otaFromInternet() {
   if (!waitWifi(false)) return "";
@@ -7036,15 +7066,13 @@ String otaFromInternet() {
            L3("). Можно обновиться с телефона.", "). You can update from your phone.", "）。可以从手机更新。");
   body.trim();
   int remote = atoi(body.c_str());
-  bool wantBle = otaSwitch ? !ENABLE_BLE : ENABLE_BLE;
-  const char* fwFile = wantBle ? "firmware-ble.bin" : "firmware.bin";
+  int want = otaTarget >= 0 ? otaTarget : EDITION_ID;
+  bool otaSwitch = want != EDITION_ID;
+  const char* fwFile = edFile(want);
   if (!otaSwitch && remote <= FW_VERSION)
     return String(L3("У вас последняя версия: ", "You have the latest version: ", "已是最新版本：")) + String(FW_VERSION);
   std::vector<String> yn = splitBar(L3("Обновить|Не сейчас", "Update|Not now", "更新|以后再说"));
-  if (otaSwitch && choiceScreen(String(wantBle ? L3("Поставить сборку «с Bluetooth» (без части игр, картинок из интернета, ИК-пульта и фонарика)? ",
-                                                   "Install the Bluetooth edition (without some games, web images, IR remote and torch)? ", "安装蓝牙版？")
-                                               : L3("Поставить полную сборку (без Bluetooth)? ", "Install the full edition (no Bluetooth)? ", "安装完整版（无蓝牙）？")) +
-                                    L3("Настройки сохранятся.", "Settings are kept.", "设置会保留。"), yn) != 0)
+  if (otaSwitch && choiceScreen(String(edAbout(want)) + L3(" Поставить? Настройки сохранятся.", " Install? Settings are kept.", " 安装？设置会保留。"), yn) != 0)
     return "";
   if (!otaSwitch && !otaNoAsk && choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
                    L3("). Не выключайте гаджет, пока идёт обновление.", "). Do not switch the device off during the update.", "）。更新时请勿关机。"), yn) != 0)
@@ -7147,7 +7175,7 @@ void handleFwDone() {
 
 // ---------- Сборки прошивки на SD-карте ----------
 // Обе сборки (полная и с Bluetooth) скачиваются с GitHub на карту; переключаться между ними можно без интернета.
-String sdFwPath(bool ble) { return ble ? "/fw/ble.bin" : "/fw/full.bin"; }
+String sdFwPath(int e) { return e == 1 ? "/fw/ble.bin" : e == 2 ? "/fw/games.bin" : "/fw/full.bin"; }
 
 int sdFwVersion() {
   SdBus b;
@@ -7157,9 +7185,9 @@ int sdFwVersion() {
   return v;
 }
 
-bool sdFwHas(bool ble) {
+bool sdFwHas(int e) {
   SdBus b;
-  File f = SD.open(sdFwPath(ble).c_str(), "r");
+  File f = SD.open(sdFwPath(e).c_str(), "r");
   bool ok = f && f.size() > 100000;
   if (f) f.close();
   return ok;
@@ -7237,12 +7265,11 @@ String sdDownloadEditions() {
   int code = httpGetText(base + "version.txt", body);
   if (code != 200) return String(L3("Не удалось узнать версию (код ", "Cannot get the version (code ", "无法获取版本（代码 ")) + String(code) + ")";
   int remote = body.toInt();
-  for (int k = 0; k < 2; k++) {
-    bool ble = k == 1;
-    showMsg(String(L3("Скачиваю на карту: ", "Downloading to the card: ", "正在下载到卡：")) +
-                (ble ? L3("сборка с Bluetooth", "Bluetooth edition", "蓝牙版") : L3("полная сборка", "full edition", "完整版")) + " v" + String(remote),
+  for (int k = 0; k < 3; k++) {
+    showMsg(String(L3("Скачиваю на карту: сборка ", "Downloading to the card: edition ", "正在下载到卡：")) + edName(k) + " v" + String(remote) + " (" +
+                String(k + 1) + "/3)",
             C_YELLOW);
-    String err = sdDownload(base + (ble ? "firmware-ble.bin" : "firmware.bin"), sdFwPath(ble));
+    String err = sdDownload(base + edFile(k), sdFwPath(k));
     if (err.length()) return String(L3("Не получилось: ", "Failed: ", "失败：")) + err;
   }
   SdBus b;
@@ -7251,16 +7278,16 @@ String sdDownloadEditions() {
     f.print(remote);
     f.close();
   }
-  return String(L3("Готово: на карте обе сборки версии ", "Done: both editions of version ", "完成：卡上有两个版本 ")) + String(remote);
+  return String(L3("Готово: на карте все три сборки версии ", "Done: all three editions of version ", "完成：卡上有三个版本 ")) + String(remote);
 }
 
 // Поставить сборку с карты (без интернета). При успехе плата перезапускается.
-String sdInstall(bool ble) {
+String sdInstall(int e) {
   File f;
   size_t len = 0;
   {
     SdBus b;
-    f = SD.open(sdFwPath(ble).c_str(), "r");
+    f = SD.open(sdFwPath(e).c_str(), "r");
     len = f ? (size_t)f.size() : 0;
   }
   if (!f || len < 100000) return L3("Этой сборки на карте нет.", "This edition is not on the card.", "卡上没有这个版本。");
@@ -7301,22 +7328,27 @@ String sdInstall(bool ble) {
 void runSdEditions() {
   for (;;) {
     int v = sdFwVersion();
-    bool hasFull = sdFwHas(false), hasBle = sdFwHas(true);
-    std::vector<String> o = splitBar(L3("Скачать обе сборки на карту|Поставить полную с карты|Поставить с Bluetooth с карты|Назад",
-                                        "Download both editions to the card|Install full from the card|Install Bluetooth from the card|Back",
-                                        "下载两个版本到卡|从卡安装完整版|从卡安装蓝牙版|返回"));
+    std::vector<String> o;
+    o.push_back(L3("Скачать все сборки на карту", "Download all editions to the card", "下载全部版本到卡"));
+    std::vector<int> eds;
+    for (int e = 0; e < 3; e++)
+      if (sdFwHas(e)) {
+        o.push_back(String(L3("Поставить с карты: ", "Install from the card: ", "从卡安装：")) + edName(e));
+        eds.push_back(e);
+      }
+    o.push_back(L3("Назад", "Back", "返回"));
     String head = String(L3("Сборки на SD-карте. ", "Editions on the SD card. ", "SD卡上的版本。")) +
                   (v ? String(L3("На карте версия ", "Card version ", "卡上版本 ")) + String(v) : String(L3("На карте пока ничего нет.", "Nothing on the card yet.", "卡上还没有。"))) +
-                  (hasFull ? L3(", полная", ", full", "，完整版") : "") + (hasBle ? L3(", с Bluetooth", ", Bluetooth", "，蓝牙版") : "") +
-                  String(L3(". У вас: ", ". Installed: ", "。当前：")) + String(FW_VERSION) + (ENABLE_BLE ? L3(" с Bluetooth", " Bluetooth", " 蓝牙版") : L3(" полная", " full", " 完整版"));
+                  String(L3(". У вас: ", ". Installed: ", "。当前：")) + String(FW_VERSION) + ", " + edName(EDITION_ID);
     int k = choiceScreen(head, o);
     String msg;
     if (k == 0) msg = sdDownloadEditions();
-    else if (k == 1 || k == 2) {
+    else if (k >= 1 && k <= (int)eds.size()) {
+      int e = eds[(size_t)(k - 1)];
       std::vector<String> yn = splitBar(L3("Поставить|Отмена", "Install|Cancel", "安装|取消"));
-      if (choiceScreen(L3("Поставить эту сборку с карты? Настройки сохранятся. Около 20 секунд.", "Install this edition from the card? Settings are kept. About 20 seconds.",
-                          "从卡安装此版本？设置会保留。约20秒。"), yn) == 0)
-        msg = sdInstall(k == 2);
+      if (choiceScreen(String(edAbout(e)) + L3(" Поставить с карты? Настройки сохранятся. Около 20 секунд.", " Install from the card? Settings are kept. About 20 seconds.",
+                                               " 从卡安装？约20秒。"), yn) == 0)
+        msg = sdInstall(e);
     } else return;
     if (msg.length()) viewAnswer(msg, C_WHITE);
   }
@@ -7324,18 +7356,29 @@ void runSdEditions() {
 
 void runUpdate() {
   for (;;) {
-    std::vector<String> o = splitBar(ENABLE_BLE ? L3("Проверить в интернете|Сменить на полную сборку|С телефона (файл .bin)|Назад",
-                                                     "Check online|Switch to the full edition|From phone (.bin file)|Back", "联网检查|切换到完整版|从手机（.bin文件）|返回")
-                                                : L3("Проверить в интернете|Сменить на сборку с Bluetooth|С телефона (файл .bin)|Назад",
-                                                     "Check online|Switch to the Bluetooth edition|From phone (.bin file)|Back", "联网检查|切换到蓝牙版|从手机（.bin文件）|返回"));
+    std::vector<String> o = splitBar(L3("Проверить в интернете|Сменить сборку|С телефона (файл .bin)|Назад",
+                                        "Check online|Switch edition|From phone (.bin file)|Back", "联网检查|切换版本|从手机（.bin文件）|返回"));
     if (sdOk) o.insert(o.begin() + 3, L3("Сборки на SD-карте", "Editions on the SD card", "SD卡上的版本"));
     int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION) +
-                             (ENABLE_BLE ? L3(", сборка с Bluetooth", ", Bluetooth edition", "，蓝牙版") : L3(", полная сборка", ", full edition", "，完整版")),
+                             String(L3(", сборка: ", ", edition: ", "，版本：")) + edName(EDITION_ID),
                          o);
     if (k == 0 || k == 1) {
-      otaSwitch = k == 1;
+      otaTarget = -1;
+      if (k == 1) {                                  // выбрать другую сборку
+        std::vector<String> eo;
+        std::vector<int> eds;
+        for (int e = 0; e < 3; e++)
+          if (e != EDITION_ID) {
+            eo.push_back(String(L3("Сборка ", "Edition: ", "版本：")) + edName(e));
+            eds.push_back(e);
+          }
+        eo.push_back(L3("Назад", "Back", "返回"));
+        int c = choiceScreen(String(L3("Сейчас стоит сборка ", "Installed edition: ", "当前版本：")) + edName(EDITION_ID) + L3(". На какую сменить?", ". Switch to?", "。切换到？"), eo);
+        if (c < 0 || c >= (int)eds.size()) continue;
+        otaTarget = eds[(size_t)c];
+      }
       String msg = otaFromInternet();
-      otaSwitch = false;
+      otaTarget = -1;
       if (msg.length()) viewAnswer(msg, C_WHITE);
     } else if (k == 3 && sdOk) {
       runSdEditions();
@@ -10040,6 +10083,558 @@ const char* gameTitle(const char* key) {
   return key;
 }
 
+// ========================= ПЕСОЧНИЦА =========================
+// Логика - в sandbox_game.h. Здесь картинка, управление, меню и сохранение мира.
+#if ENABLE_SANDBOX
+const int SB_TOP = 16, SB_VH = 224;                  // сверху 16 точек - строка состояния, ниже - мир
+struct SbGfx {
+  uint16_t tex[sbx::BLOCKS][5][64];                  // текстуры блоков при 5 уровнях света
+  uint16_t wall[5][64];                              // стена пещеры (фон под землёй)
+  uint16_t line[240 * 8];                            // полоса экрана 240x8
+  uint8_t light[34][32];                             // свет видимых блоков
+};
+sbx::Game* sbG = nullptr;
+SbGfx* sbX = nullptr;
+const uint16_t SB_KEY = 0xF81F;                      // «прозрачный» цвет в текстуре факела
+
+uint16_t sbRgb(int r, int g, int b) {
+  r = r < 0 ? 0 : r > 255 ? 255 : r;
+  g = g < 0 ? 0 : g > 255 ? 255 : g;
+  b = b < 0 ? 0 : b > 255 ? 255 : b;
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+uint16_t sbShade(uint16_t c, int lvl) {              // 4 - как есть, 0 - почти черно
+  static const int K[5] = {28, 80, 140, 200, 256};
+  if (c == SB_KEY) return c;
+  int r = (c >> 11) << 3, g = ((c >> 5) & 63) << 2, b = (c & 31) << 3;
+  return sbRgb(r * K[lvl] >> 8, g * K[lvl] >> 8, b * K[lvl] >> 8);
+}
+uint32_t sbHash(uint32_t a) {
+  a ^= a >> 16;
+  a *= 0x7feb352d;
+  a ^= a >> 15;
+  a *= 0x846ca68b;
+  return a ^ (a >> 16);
+}
+
+// Простые узоры для блоков: основной цвет с шумом и детали.
+void sbMakeTex(uint8_t b, uint16_t* out) {
+  for (int y = 0; y < 8; y++)
+    for (int x = 0; x < 8; x++) {
+      int n = (int)(sbHash(b * 977 + y * 8 + x) & 31) - 16;   // шум -16..15
+      int r = 0, g = 0, bl = 0;
+      switch (b) {
+        case sbx::DIRT: r = 134; g = 90; bl = 54; break;
+        case sbx::GRASS:
+          if (y < 2 || (y == 2 && (x & 1))) { r = 70; g = 170; bl = 60; }
+          else { r = 134; g = 90; bl = 54; }
+          break;
+        case sbx::STONE: r = g = bl = 120; if ((x + y * 3) % 7 == 0) n -= 30; break;
+        case sbx::LOG: r = 110; g = 74; bl = 40; if (x == 2 || x == 5) n -= 35; break;
+        case sbx::LEAVES: r = 40; g = 130; bl = 45; if (sbHash(x * 31 + y * 7) % 5 == 0) { r = 25; g = 90; bl = 30; } break;
+        case sbx::PLANKS: r = 180; g = 134; bl = 80; if (y == 3 || y == 7) n -= 45; if ((y < 4 && x == 6) || (y >= 4 && x == 2)) n -= 35; break;
+        case sbx::COAL: case sbx::IRON: case sbx::GOLD: {
+          r = g = bl = 120;
+          bool speck = sbHash(b * 13 + x * 5 + y * 11) % 4 == 0 && x > 0 && x < 7 && y > 0 && y < 7;
+          if (speck) {
+            if (b == sbx::COAL) { r = g = bl = 30; }
+            else if (b == sbx::IRON) { r = 210; g = 160; bl = 120; }
+            else { r = 250; g = 210; bl = 40; }
+          }
+          break;
+        }
+        case sbx::SAND: r = 220; g = 200; bl = 130; break;
+        case sbx::BEDROCK: r = g = bl = 45; if ((x ^ y) & 2) n -= 20; break;
+        case sbx::BENCH:
+          if (y < 3) { r = 170; g = 120; bl = 70; }
+          else if (x == 1 || x == 6) { r = 120; g = 80; bl = 45; }
+          else { out[y * 8 + x] = SB_KEY; continue; }
+          break;
+        case sbx::BRICK: r = 150; g = 150; bl = 155; if (y == 3 || y == 7 || (y < 4 && x == 3) || (y >= 4 && x == 7)) { r = g = bl = 80; n = 0; } break;
+        case sbx::TORCH:
+          if (x >= 3 && x <= 4 && y >= 3) { r = 120; g = 80; bl = 40; n = 0; }
+          else if (x >= 3 && x <= 4 && y >= 1) { r = 255; g = y == 1 ? 240 : 170; bl = 40; n = 0; }
+          else { out[y * 8 + x] = SB_KEY; continue; }
+          break;
+        default: r = g = bl = 255;
+      }
+      out[y * 8 + x] = sbRgb(r + n, g + n, bl + n);
+    }
+}
+
+bool sbGfxInit() {
+  if (!sbX) sbX = (SbGfx*)malloc(sizeof(SbGfx));
+  if (!sbX) return false;
+  uint16_t base[64];
+  for (int b = 1; b < sbx::BLOCKS; b++) {
+    sbMakeTex((uint8_t)b, base);
+    for (int l = 0; l < 5; l++)
+      for (int i = 0; i < 64; i++) sbX->tex[b][l][i] = sbShade(base[i], l);
+  }
+  for (int i = 0; i < 64; i++) {                     // стена пещеры: тёмный камень
+    int n = (int)(sbHash(i * 7 + 3) & 15);
+    base[i] = sbRgb(52 + n, 44 + n, 40 + n);
+  }
+  for (int l = 0; l < 5; l++)
+    for (int i = 0; i < 64; i++) sbX->wall[l][i] = sbShade(base[i], l);
+  return true;
+}
+
+uint16_t sbSky() {                                   // цвет неба по времени суток
+  static const uint16_t SKY[5] = {0x0000, 0x08A6, 0x31AD, 0x4C1A, 0x6D7F};
+  return SKY[sbG->skyLight()];
+}
+
+// Свет для видимых блоков: небо сверху, глубже - темнее; факелы светят вокруг себя.
+void sbLight(int tx0, int ty0) {
+  sbx::Game& g = *sbG;
+  int sky = g.skyLight();
+  for (int j = 0; j < 30; j++)
+    for (int i = 0; i < 32; i++) {
+      int tx = tx0 + i, ty = ty0 + j;
+      int l;
+      if (tx < 0 || tx >= sbx::W) l = 0;
+      else {
+        int d = ty - g.surf[tx];
+        l = d < 0 ? sky : sky - (d + 1) / 2;
+        if (l < 0) l = 0;
+      }
+      sbX->light[j][i] = (uint8_t)l;
+    }
+  for (int ty = ty0 - 5; ty < ty0 + 35; ty++)
+    for (int tx = tx0 - 5; tx < tx0 + 37; tx++) {
+      if (g.at(tx, ty) != sbx::TORCH) continue;
+      for (int j = ty - 5; j <= ty + 5; j++)
+        for (int i = tx - 5; i <= tx + 5; i++) {
+          int jj = j - ty0, ii = i - tx0;
+          if (jj < 0 || jj >= 30 || ii < 0 || ii >= 32) continue;
+          int d = abs(i - tx) + abs(j - ty);
+          int l = 4 - d / 2;
+          if (l > sbX->light[jj][ii]) sbX->light[jj][ii] = (uint8_t)l;
+        }
+    }
+}
+
+// Человечек 8x16 (свой рисунок): каска, лицо, рубашка, штаны. 0 - прозрачно.
+static const char* const SB_MAN[16] = {
+    "..yyyy..", ".yyyyyy.", ".ssssss.", ".sksskk.", ".ssssss.", "..ssss..", ".bbbbbb.", "bbbbbbbb",
+    "sbbbbbbs", "sbbbbbbs", "s.bbbb.s", "..pppp..", "..pp.pp.", "..pp.pp.", "..pp.pp.", ".hh..hh."};
+uint16_t sbManColor(char c) {
+  switch (c) {
+    case 'y': return 0xFE60;
+    case 's': return 0xF5B0;
+    case 'k': return 0x2104;
+    case 'b': return 0x2B5F;
+    case 'p': return 0x5A69;
+    case 'h': return 0x3186;
+  }
+  return SB_KEY;
+}
+
+void sbFrame() {
+  sbx::Game& g = *sbG;
+  int camX = (int)(g.px + sbx::PW / 2) - 120, camY = (int)(g.py + sbx::PH / 2) - SB_VH / 2;
+  if (camX < 0) camX = 0;
+  if (camX > sbx::W * sbx::T - 240) camX = sbx::W * sbx::T - 240;
+  if (camY < 0) camY = 0;
+  if (camY > sbx::H * sbx::T - SB_VH) camY = sbx::H * sbx::T - SB_VH;
+  int tx0 = camX >> 3, ty0 = camY >> 3;
+  sbLight(tx0, ty0);
+  uint16_t sky = sbSky();
+  int atx, aty;
+  {
+    int t1, t2;
+    g.target(t1, t2, false);
+    if (g.at(t1, t2) == sbx::AIR) g.target(t1, t2, true);
+    atx = t1;
+    aty = t2;
+  }
+  tft.startWrite();
+  tft.setAddrWindow(0, SB_TOP, 240, SB_VH);
+  for (int s = 0; s < SB_VH / 8; s++) {
+    uint16_t* L = sbX->line;
+    for (int r = 0; r < 8; r++) {
+      int wy = camY + s * 8 + r, ty = wy >> 3, fy = wy & 7;
+      uint16_t* row = L + r * 240;
+      for (int x = 0; x < 240;) {
+        int wx = camX + x, tx = wx >> 3, fx = wx & 7;
+        int n = 8 - fx;
+        if (x + n > 240) n = 240 - x;
+        uint8_t b = g.at(tx, ty);
+        int lv = sbX->light[ty - ty0][tx - tx0];
+        bool under = tx >= 0 && tx < sbx::W && ty >= g.surf[tx];
+        const uint16_t* bg = under ? &sbX->wall[lv][fy * 8] : nullptr;
+        if (b == sbx::AIR || b == sbx::TORCH || b == sbx::BENCH) {
+          const uint16_t* t = b != sbx::AIR ? &sbX->tex[b][b == sbx::TORCH ? 4 : lv][fy * 8] : nullptr;
+          for (int k = 0; k < n; k++) {
+            uint16_t c = t ? t[fx + k] : SB_KEY;
+            row[x + k] = c != SB_KEY ? c : bg ? bg[fx + k] : sky;
+          }
+        } else {
+          memcpy(row + x, &sbX->tex[b][lv][fy * 8 + fx], (size_t)n * 2);
+        }
+        x += n;
+      }
+    }
+    // поверх: прицел, слизни, игрок
+    int y0 = camY + s * 8;
+    auto put = [&](int wx, int wy, uint16_t c) {
+      int sx = wx - camX, sy = wy - y0;
+      if (sx >= 0 && sx < 240 && sy >= 0 && sy < 8) L[sy * 240 + sx] = c;
+    };
+    if (aty * 8 + 8 > y0 && aty * 8 < y0 + 8) {
+      uint16_t c = g.hits ? 0xFC00 : 0xFFFF;
+      for (int k = 0; k < 8; k++) {
+        put(atx * 8 + k, aty * 8, c);
+        put(atx * 8 + k, aty * 8 + 7, c);
+        put(atx * 8, aty * 8 + k, c);
+        put(atx * 8 + 7, aty * 8 + k, c);
+      }
+    }
+    for (const sbx::Slime& m : g.sl) {
+      if (!m.alive) continue;
+      int mx = (int)m.x, my = (int)m.y;
+      if (my + 6 <= y0 || my >= y0 + 8) continue;
+      for (int j = 0; j < 6; j++)
+        for (int i = 0; i < 8; i++) {
+          bool in = (j == 0 && i > 1 && i < 6) || (j == 1 && i > 0 && i < 7) || j > 1;
+          if (!in) continue;
+          uint16_t c = (j == 2 && (i == 2 || i == 5)) ? 0x0000 : (j == 1 && i == 2) ? 0xBFF7 : (g.night() ? 0x2E9F : 0x3E67);
+          put(mx + i, my + j, c);
+        }
+    }
+    int pxi = (int)g.px - 1, pyi = (int)g.py - 2;
+    if (pyi + 16 > y0 && pyi < y0 + 8 && (g.hurtT == 0 || (g.hurtT / 3) % 2 == 0)) {
+      for (int j = 0; j < 16; j++) {
+        if (pyi + j < y0 || pyi + j >= y0 + 8) continue;
+        for (int i = 0; i < 8; i++) {
+          char ch = SB_MAN[j][g.facing > 0 ? i : 7 - i];
+          uint16_t c = sbManColor(ch);
+          if (c != SB_KEY) put(pxi + i, pyi + j, c);
+        }
+      }
+    }
+    tft.writePixels(L, 240 * 8, true);
+  }
+  tft.endWrite();
+}
+
+const char* sbItemName(uint8_t it) {
+  switch (it) {
+    case sbx::DIRT: return L3("Земля", "Dirt", "泥土");
+    case sbx::GRASS: return L3("Дёрн", "Grass", "草");
+    case sbx::STONE: return L3("Камень", "Stone", "石头");
+    case sbx::LOG: return L3("Бревно", "Log", "原木");
+    case sbx::LEAVES: return L3("Листва", "Leaves", "树叶");
+    case sbx::PLANKS: return L3("Доски", "Planks", "木板");
+    case sbx::COAL: return L3("Уголь", "Coal", "煤");
+    case sbx::IRON: return L3("Железо", "Iron", "铁");
+    case sbx::GOLD: return L3("Золото", "Gold", "金");
+    case sbx::SAND: return L3("Песок", "Sand", "沙子");
+    case sbx::TORCH: return L3("Факел", "Torch", "火把");
+    case sbx::BENCH: return L3("Верстак", "Workbench", "工作台");
+    case sbx::BRICK: return L3("Кирпич", "Brick", "砖");
+    case sbx::I_GEL: return L3("Слизь", "Gel", "凝胶");
+    case sbx::I_PICK_WOOD: return L3("Деревянная кирка", "Wooden pickaxe", "木镐");
+    case sbx::I_PICK_STONE: return L3("Каменная кирка", "Stone pickaxe", "石镐");
+    case sbx::I_PICK_IRON: return L3("Железная кирка", "Iron pickaxe", "铁镐");
+    case sbx::I_SWORD_WOOD: return L3("Деревянный меч", "Wooden sword", "木剑");
+    case sbx::I_SWORD_IRON: return L3("Железный меч", "Iron sword", "铁剑");
+    case sbx::I_CROWN: return L3("Золотая корона", "Golden crown", "金冠");
+  }
+  return "?";
+}
+
+// Значок предмета 8x8 (x2) для строки состояния.
+void sbIcon(uint8_t it, int x, int y) {
+  if (it > sbx::AIR && it < sbx::BLOCKS) {
+    for (int j = 0; j < 8; j++)
+      for (int i = 0; i < 8; i++) {
+        uint16_t c = sbX->tex[it][4][j * 8 + i];
+        tft.fillRect(x + i * 2, y + j * 2, 2, 2, c == SB_KEY ? C_BAR : c);
+      }
+    return;
+  }
+  tft.fillRect(x, y, 16, 16, C_BAR);
+  if (it == sbx::I_GEL) tft.fillRoundRect(x + 3, y + 6, 10, 8, 3, 0x2E9F);
+  else if (it == sbx::I_CROWN) {
+    tft.fillRect(x + 2, y + 8, 12, 5, 0xFEA0);
+    for (int k = 0; k < 3; k++) tft.fillTriangle(x + 2 + k * 5, y + 8, x + 4 + k * 5, y + 3, x + 6 + k * 5, y + 8, 0xFEA0);
+  } else if (it != sbx::I_NONE) {
+    uint16_t head = it == sbx::I_PICK_WOOD || it == sbx::I_SWORD_WOOD ? 0xB408 : it == sbx::I_PICK_STONE ? 0x8410 : 0xD69A;
+    tft.drawLine(x + 3, y + 13, x + 12, y + 4, 0x8A22);
+    if (it == sbx::I_SWORD_WOOD || it == sbx::I_SWORD_IRON) tft.drawLine(x + 6, y + 10, x + 13, y + 3, head), tft.drawLine(x + 7, y + 10, x + 14, y + 3, head);
+    else tft.fillTriangle(x + 6, y + 2, x + 15, y + 5, x + 12, y + 8, head);
+  }
+}
+
+String sbHudKey;                                     // что сейчас нарисовано в строке состояния
+void sbHud(bool force) {
+  sbx::Game& g = *sbG;
+  const sbx::Slot& s = g.inv[g.sel];
+  String key = String(g.hp) + "/" + String(s.item) + "/" + String(s.n) + "/" + String(g.night());
+  if (!force && key == sbHudKey) return;
+  sbHudKey = key;
+  tft.fillRect(0, 0, 240, SB_TOP, C_BAR);
+  for (int k = 0; k < sbx::MAX_HP / 2; k++) {        // сердца
+    int x = 2 + k * 13, v = g.hp - k * 2;
+    uint16_t c = v >= 2 ? 0xF904 : v == 1 ? 0xFB4D : 0x4208;
+    tft.fillCircle(x + 3, 4, 3, c);
+    tft.fillCircle(x + 8, 4, 3, c);
+    tft.fillTriangle(x, 4 + 1, x + 11, 4 + 1, x + 5, 4 + 8, c);
+  }
+  sbIcon(s.item, 150, 0);
+  SmallFont small;
+  if (s.item) drawUtf8(String(s.n).c_str(), 168, 0, C_WHITE, C_BAR);
+  if (g.night()) tft.fillCircle(230, 8, 5, 0xCE79), tft.fillCircle(232, 6, 4, C_BAR);
+  else tft.fillCircle(230, 8, 5, 0xFEA0);
+}
+
+String sbPath() { return "/sbx.bin"; }
+fs::FS& sbFs() {
+  if (sdOk) return SD;
+  return LittleFS;
+}
+
+String sbSave() {
+  size_t n = sbx::Game::saveSize();
+  uint8_t* buf = (uint8_t*)malloc(n);
+  if (!buf) return L3("не хватило памяти", "out of memory", "内存不足");
+  sbG->saveTo(buf);
+  PicBus b;
+  File f = sbFs().open(sbPath().c_str(), "w");
+  size_t w = f ? f.write(buf, n) : 0;
+  if (f) f.close();
+  free(buf);
+  if (w != n) {
+    sbFs().remove(sbPath().c_str());
+    return L3("не удалось записать (нет места?)", "cannot write (no space?)", "无法写入（空间不足？）");
+  }
+  return "";
+}
+
+bool sbLoad() {
+  size_t n = sbx::Game::saveSize();
+  uint8_t* buf = (uint8_t*)malloc(n);
+  if (!buf) return false;
+  bool ok = false;
+  {
+    PicBus b;
+    File f = sbFs().open(sbPath().c_str(), "r");
+    if (f && f.size() == n) ok = f.read(buf, n) == n;
+    if (f) f.close();
+  }
+  ok = ok && sbG->loadFrom(buf, n);
+  free(buf);
+  return ok;
+}
+
+bool sbHasSave() {
+  PicBus b;
+  return sbFs().exists(sbPath().c_str());
+}
+
+void sbInventory() {
+  sbx::Game& g = *sbG;
+  std::vector<String> items, right;
+  std::vector<int> idx;
+  for (int i = 0; i < sbx::SLOTS; i++)
+    if (g.inv[i].item) {
+      items.push_back(String(i == g.sel ? "> " : "") + sbItemName(g.inv[i].item));
+      right.push_back(String(g.inv[i].n));
+      idx.push_back(i);
+    }
+  if (items.empty()) {
+    viewAnswer(L3("Пока пусто. Копайте землю, рубите деревья - всё добытое попадает сюда.",
+                  "Empty for now. Dig dirt and chop trees - everything you get goes here.", "还是空的。挖土、砍树，得到的东西都会放在这里。"), C_WHITE);
+    return;
+  }
+  int k = listScreen(L3("Что ставить", "Block to place", "放置的方块"), items, right, 0);
+  if (k < 0) return;
+  uint8_t it = g.inv[idx[(size_t)k]].item;
+  if (sbx::placeable(it)) g.sel = idx[(size_t)k];
+  else viewAnswer(L3("Это не ставится. Инструменты работают сами, пока лежат в рюкзаке: лучшая кирка копает, лучший меч бьёт.",
+                     "This cannot be placed. Tools work by themselves while in the backpack: the best pickaxe digs, the best sword hits.",
+                     "这个不能放置。工具放在背包里就会自动使用。"), C_WHITE);
+}
+
+void sbCraft() {
+  sbx::Game& g = *sbG;
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items, right;
+    for (int r = 0; r < sbx::RECIPE_COUNT; r++) {
+      const sbx::Recipe& c = sbx::RECIPES[r];
+      items.push_back(String(sbItemName(c.out)) + (c.outN > 1 ? String(" x") + String(c.outN) : String("")));
+      int st = g.canCraft(r);
+      right.push_back(st == 0 ? L3("можно", "ok", "可以") : st == 2 ? L3("верстак", "bench", "工作台") : "-");
+    }
+    sel = listScreen(L3("Мастерить", "Craft", "制作"), items, right, sel);
+    if (sel < 0) return;
+    const sbx::Recipe& c = sbx::RECIPES[sel];
+    int st = g.canCraft(sel);
+    if (st == 0) {
+      g.craft(sel);
+      beep(1, 1500, 40);
+      if (c.out == sbx::I_CROWN) {
+        viewAnswer(L3("Золотая корона! Вы прошли Песочницу. Мир остаётся - стройте дальше.",
+                      "A golden crown! You have beaten the Sandbox. The world stays - keep building.", "金冠！你通关了沙盒。世界会保留，继续建造吧。"), C_GREEN);
+      }
+      continue;
+    }
+    String need = String(L3("Нужно: ", "Needs: ", "需要：")) + sbItemName(c.a) + " " + String(c.an) + " (" + String(g.count(c.a)) + ")";
+    if (c.b) need += String(", ") + sbItemName(c.b) + " " + String(c.bn) + " (" + String(g.count(c.b)) + ")";
+    if (c.bench) need += L3(". И верстак рядом (поставьте его и встаньте возле).", ". And a workbench nearby (place one and stand next to it).", "。并且旁边要有工作台。");
+    viewAnswer(need, C_YELLOW);
+  }
+}
+
+void runSandbox() {
+  if (!sbG) sbG = new (std::nothrow) sbx::Game();
+  if (!sbG || !sbGfxInit()) {
+    delete sbG;
+    sbG = nullptr;
+    viewAnswer(L3("Не хватило памяти для мира. Перезапустите гаджет и попробуйте ещё раз.", "Not enough memory for the world. Restart and try again.",
+                  "内存不足。请重启后再试。"), C_RED);
+    return;
+  }
+  struct Free {                                      // выход из игры - отдать память обратно
+    ~Free() {
+      delete sbG;
+      sbG = nullptr;
+      free(sbX);
+      sbX = nullptr;
+    }
+  } freeOnExit;
+  bool have = sbHasSave();
+  std::vector<String> o = splitBar(have ? L3("Продолжить мир|Новый мир|Как играть|Выйти", "Continue the world|New world|How to play|Leave", "继续|新世界|玩法|退出")
+                                        : L3("Новый мир|Как играть|Выйти", "New world|How to play|Leave", "新世界|玩法|退出"));
+  for (;;) {
+    int k = choiceScreen(L3("Песочница", "Sandbox", "沙盒"), o);
+    if (!have) k = k < 0 ? -1 : k + 1;
+    if (k == 2) {
+      viewAnswer(L3("Ручка влево/вправо - идти, вверх - прыжок. Куда наклонена ручка - туда и цель (белая рамка).\n"
+                    "Нажатие - ударить по блоку (копать), поставить выбранный блок в пустое место или ударить слизня.\n"
+                    "Держать кнопку - меню: что ставить, мастерить, сохранить.\n\n"
+                    "С чего начать: срубите дерево (бейте по стволу), сделайте доски и верстак, у верстака - деревянную кирку. "
+                    "Ей уже можно копать камень и уголь, из угля - факелы. Глубже - железо, у самого дна - золото. "
+                    "Ночью выходят слизни: стройте дом и делайте меч. Цель - золотая корона.",
+                    "Stick left/right - walk, up - jump. Where the stick points is the target (white frame).\n"
+                    "Press - hit a block (dig), place the selected block in an empty spot or hit a slime.\n"
+                    "Hold the button - menu: block to place, craft, save.\n\n"
+                    "Start: chop a tree (hit the trunk), make planks and a workbench, then a wooden pickaxe at the bench. "
+                    "It digs stone and coal; coal makes torches. Iron is deeper, gold is at the very bottom. "
+                    "Slimes come out at night: build a house and craft a sword. The goal is a golden crown.",
+                    "摇杆左右走，上跳。摇杆指向的方向就是目标（白框）。按下：挖方块、放方块或攻击史莱姆。长按：菜单。"),
+                 C_WHITE);
+      continue;
+    }
+    if (k == 0) {
+      if (!sbLoad()) {
+        viewAnswer(L3("Сохранение не читается - начинаю новый мир.", "The save cannot be read - starting a new world.", "存档无法读取，开始新世界。"), C_YELLOW);
+        sbG->generate(esp_random() | 1);
+      }
+      break;
+    }
+    if (k == 1) {
+      showMsg(L3("Создаю мир...", "Creating the world...", "正在生成世界……"), C_YELLOW);
+      sbG->generate(esp_random() | 1);
+      break;
+    }
+    return;
+  }
+  KeepAwake awake;
+  tft.fillScreen(C_BLACK);
+  sbHud(true);
+  const uint32_t TICK = 1000 / sbx::TICKS;
+  uint32_t last = millis(), lastSave = millis();
+  bool act = false;
+  for (;;) {
+    BtnEvent e = btnEvent();
+    if (e == EV_CLICK) act = true;
+    if (e == EV_LONG) {
+      std::vector<String> m = splitBar(L3("Продолжить|Что ставить|Мастерить|Сохранить и выйти|Выйти без сохранения",
+                                          "Continue|Block to place|Craft|Save and leave|Leave without saving", "继续|放置的方块|制作|保存并退出|不保存退出"));
+      int k = choiceScreen(L3("Песочница", "Sandbox", "沙盒"), m);
+      if (k == 1) sbInventory();
+      if (k == 2) sbCraft();
+      if (k == 3) {
+        showMsg(L3("Сохраняю мир...", "Saving the world...", "正在保存……"), C_YELLOW);
+        String err = sbSave();
+        if (err.length()) {
+          viewAnswer(String(L3("Не сохранилось: ", "Not saved: ", "未保存：")) + err, C_RED);
+          continue;
+        }
+        return;
+      }
+      if (k == 4) {
+        std::vector<String> yn = splitBar(L3("Выйти|Остаться", "Leave|Stay", "退出|留下"));
+        if (choiceScreen(L3("Выйти без сохранения? Всё, что сделано после последнего сохранения, пропадёт.",
+                            "Leave without saving? Everything since the last save will be lost.", "不保存退出？"), yn) == 0)
+          return;
+      }
+      tft.fillScreen(C_BLACK);
+      sbHud(true);
+      last = millis();
+      act = false;
+      continue;
+    }
+    uint32_t behind = millis() - last;
+    if (behind < TICK) {
+      delay(1);
+      continue;
+    }
+    int steps = (int)(behind / TICK);
+    if (steps > 3) {
+      steps = 3;
+      last = millis() - 3 * TICK;
+    }
+    last += (uint32_t)steps * TICK;
+    int dx, dy;
+    joyAnalog(dx, dy);
+    int thr = joyThr(), dead = thr / 4;
+    sbx::Input in;
+    in.mx = dx > dead ? (float)(dx - dead) / (thr - dead) : dx < -dead ? (float)(dx + dead) / (thr - dead) : 0;
+    if (in.mx > 1) in.mx = 1;
+    if (in.mx < -1) in.mx = -1;
+    int ax = abs(dx), ay = abs(dy);
+    if (ay > thr && ay >= ax) in.aim = dy < 0 ? sbx::A_UP : sbx::A_DOWN;
+    else if (ax > thr / 2) in.aim = dx > 0 ? sbx::A_RIGHT : sbx::A_LEFT;
+    in.jump = dy < -thr;
+    int ev = 0;
+    for (int i = 0; i < steps; i++) {
+      in.act = act && i == 0;
+      ev |= sbG->step(in);
+    }
+    act = false;
+    if (ev & sbx::E_MINE) beep(2, 700, 6);
+    else if (ev & sbx::E_HIT) beep(2, 400, 4);
+    if (ev & sbx::E_PLACE) beep(2, 1100, 5);
+    if (ev & (sbx::E_ATTACK | sbx::E_KILL)) beep(2, 1800, 6);
+    if (ev & sbx::E_HURT) beep(1, 220, 30);
+    sbFrame();
+    sbHud(false);
+    if (ev & sbx::E_DEAD) {
+      drawSmallCenteredBg(L3("Вы погибли... снова дома", "You died... back home", "你死了……回到出生点"), 110, C_RED, C_BLACK);
+      delay(1500);
+      last = millis();
+    }
+    if (millis() - lastSave > 180000) {               // раз в 3 минуты - само сохраняется
+      sbSave();
+      lastSave = millis();
+      last = millis();
+    }
+    if (admService()) {
+      tft.fillScreen(C_BLACK);
+      sbHud(true);
+      last = millis();
+    }
+  }
+}
+#else
+void runSandbox() { notInEdition(); }
+#endif
+
 void runGamesMenu() {
   int sel = 0;
   for (;;) {
@@ -10050,9 +10645,9 @@ void runGamesMenu() {
                                  L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), L3("Крестики по сети", "Tic-tac-toe online", "联网井字棋"),
                                  L3("Крестики рядом", "Tic-tac-toe nearby", "附近井字棋"), L3("Шахматы", "Chess", "国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
-                                 L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
+                                 L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bquiz", "", "bguess", "bfps", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bquiz", "", "bguess", "bfps", "", "", ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
@@ -10082,7 +10677,8 @@ void runGamesMenu() {
       case 19: runStory(); break;
       case 20: runGuess(); break;
       case 21: runFps3d(); break;
-      case 22: runHiScores(); break;
+      case 22: runSandbox(); break;
+      case 23: runHiScores(); break;
       default: return;                               // «Назад» или удержание
     }
   }
@@ -10430,6 +11026,7 @@ void homeApps(std::vector<uint8_t>& apps) {
     if ((a == A_IMAGES || a == A_GALLERY) && !ENABLE_IMAGES) continue;
     if (a == A_BT && !ENABLE_BLE) continue;
     if (a == A_PHONE && !ENABLE_WIFIPAD) continue;
+    if (GAMES_EDITION && a != A_GAMES && a != A_ROOM && a != A_PHONE && a != A_SETTINGS && a != A_ADMIN) continue;
     if ((a == A_REMOTE && !ENABLE_IR) || (a == A_IMAGES && !ENABLE_WEBIMG)) continue;
     apps.push_back((uint8_t)a);
   }
@@ -10511,24 +11108,24 @@ void drawHomeIcons(const std::vector<uint8_t>& apps, int page, int selCell) {
 
 void launchApp(int a) {
   switch (a) {
-    case A_CHAT: runChat(); break;
+    case A_CHAT: if (!GAMES_EDITION) runChat(); break;
     case A_ROOM: runRoom(); break;
     case A_GAMES: runGamesMenu(); break;
-    case A_CALC: runCalc(); break;
-    case A_REF: runReference(); break;
-    case A_NOTES: runNotes(); break;
-    case A_SAVED: runSaved(); break;
-    case A_WIKI: runWiki(); break;
-    case A_IMAGES: runImages(); break;
-    case A_GALLERY: runGallery(); break;
-    case A_WEATHER: runWeather(); break;
-    case A_RATES: runRates(); break;
-    case A_CLOCK: runClock(); break;
-    case A_TIMER: runTimer(); break;
-    case A_STOPW: runStopwatch(); break;
-    case A_REMOTE: runRemote(); break;
+    case A_CALC: if (!GAMES_EDITION) runCalc(); break;
+    case A_REF: if (!GAMES_EDITION) runReference(); break;
+    case A_NOTES: if (!GAMES_EDITION) runNotes(); break;
+    case A_SAVED: if (!GAMES_EDITION) runSaved(); break;
+    case A_WIKI: if (!GAMES_EDITION) runWiki(); break;
+    case A_IMAGES: if (!GAMES_EDITION) runImages(); break;
+    case A_GALLERY: if (!GAMES_EDITION) runGallery(); break;
+    case A_WEATHER: if (!GAMES_EDITION) runWeather(); break;
+    case A_RATES: if (!GAMES_EDITION) runRates(); break;
+    case A_CLOCK: if (!GAMES_EDITION) runClock(); break;
+    case A_TIMER: if (!GAMES_EDITION) runTimer(); break;
+    case A_STOPW: if (!GAMES_EDITION) runStopwatch(); break;
+    case A_REMOTE: if (!GAMES_EDITION) runRemote(); break;
     case A_BT: runBluetooth(); break;
-    case A_PCSCR: runPcScreen(); break;
+    case A_PCSCR: if (!GAMES_EDITION) runPcScreen(); break;
     case A_PHONE: runPhonePad(); break;
     case A_SETTINGS: runSettings(); break;
     case A_ADMIN: runAdmin(); break;
