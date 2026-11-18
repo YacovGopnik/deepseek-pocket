@@ -1412,23 +1412,42 @@ String portalNote;                                   // что только чт
 const int SD_SCK = 8, SD_MOSI = 2, SD_MISO = 20, SD_CS = 9;
 bool sdOk = false;                                   // карта смонтирована
 int sdDepth = 0;
+// Шаг работы с картой - переживает перезапуск кнопкой RST: если гаджет завис, после RST видно, где.
+RTC_NOINIT_ATTR uint32_t sdDiagStage;
+#define SD_STAGE(n) (sdDiagStage = 0x5D000000u | (uint32_t)(n))
 
+// Шина не останавливается: на работающей шине через матрицу GPIO переключаются только выводы.
 void sdBusOn() {
   if (sdDepth++ > 0) return;
-  SPI.end();
+  spi_t* b = SPI.bus();
+  SD_STAGE(1);
+  spiDetachSCK(b);
+  spiDetachMOSI(b);
+  SD_STAGE(2);
   pinMode(PIN_SCK, OUTPUT);                          // экран без CS: держим его линии в покое
   digitalWrite(PIN_SCK, LOW);
   pinMode(PIN_MOSI, OUTPUT);
   digitalWrite(PIN_MOSI, LOW);
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
+  SD_STAGE(3);
+  spiAttachSCK(b, SD_SCK);
+  spiAttachMISO(b, SD_MISO);
+  spiAttachMOSI(b, SD_MOSI);
+  SD_STAGE(4);
 }
 
 void sdBusOff() {
   if (--sdDepth > 0) return;
-  SPI.end();
+  spi_t* b = SPI.bus();
+  SD_STAGE(5);
+  spiDetachSCK(b);
+  spiDetachMISO(b);
+  spiDetachMOSI(b);
+  SD_STAGE(6);
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
-  SPI.begin(PIN_SCK, -1, PIN_MOSI, -1);
+  spiAttachSCK(b, PIN_SCK);
+  spiAttachMOSI(b, PIN_MOSI);
+  SD_STAGE(7);
 }
 
 struct SdBus {                                       // на время жизни - шина у карты
@@ -1457,7 +1476,9 @@ bool sdMount() {
       SD.end();
       delay(200);
     }
+    SD_STAGE(8);
     sdOk = SD.begin(SD_CS, SPI, 8000000, "/sd", 4);
+    SD_STAGE(9);
   }
   if (sdOk) {
     SD.mkdir("/pics");
@@ -7720,7 +7741,10 @@ bool runSettings() {
     right[11] = cfgJoyInvY ? L3("обратная", "inverted", "反向") : L3("обычная", "normal", "正常");
     right[12] = admOn ? L3("вы админ", "signed in", "已登录") : "";
     right[13] = String(cfgRot * 90) + "\xC2\xB0";
-    right[15] = !cfgSd ? L3("нет", "off", "关") : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
+    prefs.begin("dsk", true);
+    int sdDiag = prefs.getInt("sddiag", -9);
+    prefs.end();
+    right[15] = !cfgSd ? (sdDiag != -9 ? String(L3("сбой ", "fail ", "失败 ")) + String(sdDiag) : String(L3("нет", "off", "关"))) : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
@@ -10207,6 +10231,15 @@ void setup() {
       prefs.putUChar("sd", 0);
       prefs.putUChar("sdboot", 0);
       Serial.println(failed ? "SD card turned off: the previous start with it did not finish" : "SD card turned off: button held");
+      if (failed) {                                  // показать, на каком шаге остановился прошлый запуск
+        int st = (sdDiagStage >> 24) == 0x5D ? (int)(sdDiagStage & 0xFF) : -1;
+        char b[48];
+        snprintf(b, sizeof(b), "SD: zavis na shage %d - kartu vyklyuchil", st);
+        prefs.putInt("sddiag", st);
+        Serial.println(b);
+        bootStage(b);
+        delay(4000);
+      }
     } else {
       prefs.putUChar("sdboot", 1);                 // снимем в конце запуска
     }
@@ -10229,6 +10262,7 @@ void setup() {
     Serial.printf("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
   }
   if (cfgSd) {                                       // запуск с картой прошёл
+    SD_STAGE(0);
     prefs.begin("dsk", false);
     prefs.putUChar("sdboot", 0);
     prefs.end();
