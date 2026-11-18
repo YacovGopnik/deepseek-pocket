@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek pocket — телефон</title>
+<style>
+  :root { --bg: #f4f5f7; --card: #fff; --text: #1d2228; --muted: #69727d; --accent: #2b67f6; --ok: #1f9d55; --err: #d64545; --line: #dfe3e8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171b; --card: #1d2127; --text: #e9edf1; --muted: #98a1ab; --accent: #6b9bff; --ok: #4cc785; --err: #ff7b7b; --line: #2d333b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 560px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 11px 14px; background: var(--accent); color: #fff; cursor: pointer; }
+  button.sec { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  textarea { width: 100%; min-height: 96px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px; resize: vertical; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .row button { flex: 1 1 140px; }
+  #state { color: var(--muted); margin-left: 10px; }
+  #state.ok { color: var(--ok); }
+  #state.err { color: var(--err); }
+  small, .hint { color: var(--muted); }
+  #log { font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); max-height: 140px; overflow: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DeepSeek в кармане — телефон</h1>
+
+  <div class="card">
+    <button id="connect">Подключить</button><span id="state">не подключено</span>
+    <p class="hint">Нужен Chrome на Android. На гаджете включите Bluetooth: Настройки → Bluetooth (сборка «с Bluetooth»). Гаджет называется <b>DS-…</b>.</p>
+  </div>
+
+  <div class="card">
+    <textarea id="text" placeholder="Текст для гаджета"></textarea>
+    <div class="row">
+      <button id="send" disabled>Отправить</button>
+      <button id="insert" class="sec" disabled>Только вставить</button>
+      <button id="note" class="sec" disabled>Уведомление</button>
+    </div>
+    <p class="hint"><b>Отправить</b> — как будто набрали на гаджете и нажали OK (например, вопрос DeepSeek). <b>Только вставить</b> — текст появится в поле ввода. <b>Уведомление</b> — всплывёт на экране гаджета со звуком.</p>
+  </div>
+
+  <div class="card">
+    <small>Журнал</small>
+    <div id="log"></div>
+  </div>
+</main>
+<script>
+const NUS = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+let device = null, rx = null;
+const $ = (id) => document.getElementById(id);
+
+function log(s) {
+  const el = $("log");
+  el.textContent = (new Date().toLocaleTimeString() + "  " + s + "\n" + el.textContent).slice(0, 4000);
+}
+function setState(t, cls) {
+  $("state").textContent = t;
+  $("state").className = cls || "";
+  for (const b of ["send", "insert", "note"]) $(b).disabled = !rx;
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setState("этот браузер не умеет Bluetooth — откройте страницу в Chrome на Android", "err");
+    return;
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: "DS-" }], optionalServices: [NUS] });
+    device.addEventListener("gattserverdisconnected", () => { rx = null; setState("отключено", "err"); log("связь потеряна"); });
+    setState("подключаюсь…");
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(NUS);
+    rx = await svc.getCharacteristic(RX);
+    const tx = await svc.getCharacteristic(TX);
+    await tx.startNotifications();
+    tx.addEventListener("characteristicvaluechanged", (e) => log("гаджет: " + new TextDecoder().decode(e.target.value).trim()));
+    setState("подключено: " + device.name, "ok");
+    log("подключено к " + device.name);
+  } catch (e) {
+    rx = null;
+    setState("не получилось: " + e.message, "err");
+  }
+}
+
+async function send(prefix) {
+  const t = $("text").value.replace(/\r?\n/g, " ").trim();
+  if (!t || !rx) return;
+  const bytes = new TextEncoder().encode(prefix + t + "\n");
+  try {
+    for (let i = 0; i < bytes.length; i += 100) await rx.writeValueWithResponse(bytes.slice(i, i + 100));
+    log("отправлено: " + t);
+    $("text").value = "";
+  } catch (e) {
+    log("ошибка: " + e.message);
+  }
+}
+
+$("connect").onclick = connect;
+$("send").onclick = () => send("S:");
+$("insert").onclick = () => send("T:");
+$("note").onclick = () => send("N:");
+setState("не подключено");
+</script>
+</body>
+</html>
