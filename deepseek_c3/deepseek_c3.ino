@@ -109,6 +109,23 @@ inline void sendPhone(const std::string&) {}
 inline void media(uint16_t) {}
 }  // namespace ble
 #endif
+#ifndef ENABLE_WIFIPAD
+#define ENABLE_WIFIPAD FULL_EDITION                  // пульт и клавиатура с телефона по Wi-Fi
+#endif
+#if ENABLE_WIFIPAD
+#include "wifipad.h"
+#else
+namespace wpad {                                     // заглушка
+inline void poll() {}
+inline void pause(bool) {}
+inline char heldDir() { return 0; }
+inline bool heldBtn() { return false; }
+inline bool connected() { return false; }
+inline bool takeLine(std::string&) { return false; }
+}  // namespace wpad
+#endif
+// Текст с телефона: по Bluetooth или по Wi-Fi.
+inline bool phoneTakeLine(std::string& l) { return ble::takePhoneLine(l) || wpad::takeLine(l); }
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "esp_random.h"
@@ -1235,6 +1252,24 @@ void joyRotate(int& dx, int& dy) {
   }
 }
 
+// Ручка, которую держат на телефоне (пульт по Wi-Fi): J_NONE, если не держат.
+uint8_t padDir() {
+  wpad::poll();
+  switch (wpad::heldDir()) {
+    case 'U': return J_UP;
+    case 'D': return J_DOWN;
+    case 'L': return J_LEFT;
+    case 'R': return J_RIGHT;
+  }
+  return J_NONE;
+}
+
+// Кнопка нажата: на гаджете или на телефоне.
+bool swDown() {
+  wpad::poll();
+  return digitalRead(PIN_SW) == LOW || wpad::heldBtn();
+}
+
 // Отклонение ручки от центра с учётом настроек осей: примерно -2048..2048.
 void joyAnalog(int& dx, int& dy) {
   dx = analogRead(PIN_JOY_X) - joyCx;
@@ -1243,6 +1278,12 @@ void joyAnalog(int& dx, int& dy) {
   if (JOY_INVERT_X) dx = -dx;
   if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
   joyRotate(dx, dy);
+  switch (padDir()) {                                // телефон: до упора в нужную сторону
+    case J_UP: dx = 0; dy = -2000; break;
+    case J_DOWN: dx = 0; dy = 2000; break;
+    case J_LEFT: dx = -2000; dy = 0; break;
+    case J_RIGHT: dx = 2000; dy = 0; break;
+  }
   int half = joyThr() / 2;
   if (dx > half || dx < -half || dy > half || dy < -half) {
     if (screenAsleep) wakeScreen();
@@ -1259,7 +1300,7 @@ uint8_t joyRawDir() {
   if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
   joyRotate(dx, dy);
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-  if (ax < joyThr() && ay < joyThr()) return J_NONE;
+  if (ax < joyThr() && ay < joyThr()) return padDir();
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
   return dy > 0 ? J_DOWN : J_UP;
 }
@@ -1315,7 +1356,7 @@ BtnEvent btnEvent() {
   static uint32_t tChange = 0, tDown = 0;
   static bool longFired = false;
   static uint8_t swallow = 0;            // 1 - нажатие разбудило экран, 2 - экран спрятан удержанием: ждём отпускания
-  int v = digitalRead(PIN_SW);
+  int v = swDown() ? LOW : HIGH;
   uint32_t now = millis();
   if (swallow == 0 && v == LOW && screenAsleep) {
     wakeScreen();
@@ -1968,7 +2009,13 @@ void notInEdition() {
 }
 // Точка доступа + страница настройки. Возвращается при отмене кнопкой,
 // после сохранения перезапускает плату.
+struct PadPause {                                    // пульт с телефона занимает порт 80 - на время настройки выключаем
+  PadPause() { wpad::pause(true); }
+  ~PadPause() { wpad::pause(false); }
+};
+
 void runPortal() {
+  PadPause padPause;
   Serial.println("Wi-Fi setup portal");
   showMsg("Wi-Fi...", C_YELLOW);
   WiFi.disconnect(true);
@@ -3935,7 +3982,7 @@ String inputText() {
     {                                                // текст с телефона по Bluetooth
       std::string line;
       bool submit = false;
-      while (!submit && ble::takePhoneLine(line)) {
+      while (!submit && phoneTakeLine(line)) {
         if (line.compare(0, 2, "N:") == 0) {         // уведомление - покажем после
           bleNotes.push_back(fromStd(line.substr(2)));
           continue;
@@ -5809,7 +5856,7 @@ void runSaver() {
   uint32_t start = millis(), next = 0;
   bool dark = false;
   for (;;) {
-    if (joyRawDir() != J_NONE || digitalRead(PIN_SW) == LOW) break;
+    if (joyRawDir() != J_NONE || swDown()) break;
     if (!dark && millis() - start > 600000UL) {      // 10 минут - гасим подсветку совсем
       analogWrite(PIN_BLK, 0);
       dark = true;
@@ -5831,7 +5878,7 @@ void runSaver() {
     }
     delay(10);
   }
-  while (joyRawDir() != J_NONE || digitalRead(PIN_SW) == LOW) delay(5);   // действие, которое разбудило, не срабатывает
+  while (joyRawDir() != J_NONE || swDown()) delay(5);   // действие, которое разбудило, не срабатывает
   delay(40);
   applyBrightness();
   noteActivity();
@@ -7139,7 +7186,7 @@ void bleSetEnabled(bool on) {
 // Уведомления и текст с телефона, пришедшие не в поле ввода. true - экран занят.
 bool bleService() {
   std::string line;
-  while (ble::takePhoneLine(line)) {
+  while (phoneTakeLine(line)) {
     if (line.compare(0, 2, "N:") == 0 || line.compare(0, 2, "T:") == 0 || line.compare(0, 2, "S:") == 0) line = line.substr(2);
     if (line.size()) bleNotes.push_back(fromStd(line));
   }
@@ -8968,7 +9015,7 @@ void runFps3d() {
         saveBestKey("bfps", f3.best);
         return;
       }
-      bool down = digitalRead(PIN_SW) == LOW;            // выстрел сразу по нажатию, не дожидаясь отпускания
+      bool down = swDown();                              // выстрел сразу по нажатию, не дожидаясь отпускания
       if (down && !wasDown) fire = true;
       wasDown = down;
       uint32_t behind = millis() - last;
@@ -9992,6 +10039,48 @@ void runPcScreen() {
   Serial.println("DSPC BYE");
 }
 
+// ========================= ТЕЛЕФОН (пульт и клавиатура по Wi-Fi) =========================
+// Сам пульт работает всегда, когда есть Wi-Fi; это приложение только показывает адрес.
+void drawPhonePad(bool wifi, bool conn) {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, 240, 28, C_BAR);
+  drawUtf8(L3("Телефон как пульт", "Phone as a remote", "手机遥控"), 6, 2, C_WHITE, C_BAR);
+  SmallFont small;
+  if (!wifi) {
+    drawUtf8(L3("Нет Wi-Fi. Подключите гаджет", "No Wi-Fi. Connect the device", "没有Wi-Fi。请先在设置中"), 8, 50, C_YELLOW, C_BLACK);
+    drawUtf8(L3("к сети в Настройках.", "to a network in Settings.", "连接网络。"), 8, 70, C_YELLOW, C_BLACK);
+  } else {
+    drawUtf8(L3("Телефон - в ту же сеть Wi-Fi.", "Phone on the same Wi-Fi.", "手机连接同一Wi-Fi，"), 8, 40, C_LIGHT, C_BLACK);
+    drawUtf8(L3("Откройте в браузере:", "Open in a browser:", "在浏览器中打开："), 8, 60, C_LIGHT, C_BLACK);
+    drawUtf8("http://", 8, 88, C_LIGHT, C_BLACK);
+    String ip = WiFi.localIP().toString();
+    g_big = true;                                    // адрес - крупно
+    drawUtf8(ip.c_str(), 8, 106, C_YELLOW, C_BLACK);
+    g_big = false;
+    drawUtf8(conn ? L3("Телефон подключён", "Phone connected", "手机已连接") : L3("Телефон не подключён", "No phone connected", "手机未连接"), 8, 150,
+             conn ? C_GREEN : C_LIGHT, C_BLACK);
+    drawUtf8(L3("Пульт работает везде: в играх,", "Works everywhere: in games,", "在游戏、菜单中都能用，"), 8, 176, C_LIGHT, C_BLACK);
+    drawUtf8(L3("меню и при вводе текста.", "menus and text input.", "也能输入文字。"), 8, 194, C_LIGHT, C_BLACK);
+  }
+  drawUtf8(L3("Нажатие - выход", "Press to leave", "按下退出"), 8, 218, C_LIGHT, C_BLACK);
+}
+
+void runPhonePad() {
+  int shownWifi = -1, shownConn = -1;
+  for (;;) {
+    int w = wifiOk() ? 1 : 0, c = wpad::connected() ? 1 : 0;
+    if (w != shownWifi || c != shownConn) {
+      drawPhonePad(w, c);
+      shownWifi = w;
+      shownConn = c;
+    }
+    joyEvent();
+    if (btnEvent() != EV_NONE) return;
+    if (admService()) shownWifi = -1;
+    delay(5);
+  }
+}
+
 // ========================= ГЛАВНЫЙ ЭКРАН =========================
 void runChat();
 void runAdmin();
@@ -9999,14 +10088,14 @@ void runAdmin();
 // Ручка - выбор (влево/вправо у края - соседняя страница), нажатие - открыть приложение.
 enum AppId : uint8_t {
   A_CHAT, A_ROOM, A_GAMES, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
-  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_PCSCR, A_SETTINGS, A_ADMIN, A_COUNT
+  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_PCSCR, A_PHONE, A_SETTINGS, A_ADMIN, A_COUNT
 };
 const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
-                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Экран ПК", "Настройки", "Админ"};
+                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Экран ПК", "Телефон", "Настройки", "Админ"};
 const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
-                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "PC screen", "Settings", "Admin"};
+                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "PC screen", "Phone", "Settings", "Admin"};
 const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
-                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x2A2F, 0x636F, 0xB0A6};
+                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x2A2F, 0x0C87, 0x636F, 0xB0A6};
 const int HOME_TOP = 22, CELL_W = 80, CELL_H = 70, TILE = 46;
 
 const char* appName(int a) { return cfgLang == LANG_RU ? APP_RU[a] : APP_EN[a]; }
@@ -10118,6 +10207,11 @@ void drawAppIcon(int a, int x, int y) {
       tft.fillRect(x + 21, y + 32, 4, 5, W);
       tft.fillRoundRect(x + 14, y + 36, 18, 3, 1, W);
       break;
+    case A_PHONE:                                    // телефон
+      tft.fillRoundRect(x + 14, y + 5, 18, 36, 4, W);
+      tft.fillRect(x + 16, y + 10, 14, 24, col);
+      tft.fillCircle(cx, y + 37, 2, col);
+      break;
     case A_SETTINGS:                                 // шестерёнка
       for (int k = 0; k < 8; k++) {
         float an = k * 0.785398f;
@@ -10144,6 +10238,7 @@ void homeApps(std::vector<uint8_t>& apps) {
     if (a == A_ADMIN && !admOn) continue;
     if ((a == A_IMAGES || a == A_GALLERY) && !ENABLE_IMAGES) continue;
     if (a == A_BT && !ENABLE_BLE) continue;
+    if (a == A_PHONE && !ENABLE_WIFIPAD) continue;
     if ((a == A_REMOTE && !ENABLE_IR) || (a == A_IMAGES && !ENABLE_WEBIMG)) continue;
     apps.push_back((uint8_t)a);
   }
@@ -10243,6 +10338,7 @@ void launchApp(int a) {
     case A_REMOTE: runRemote(); break;
     case A_BT: runBluetooth(); break;
     case A_PCSCR: runPcScreen(); break;
+    case A_PHONE: runPhonePad(); break;
     case A_SETTINGS: runSettings(); break;
     case A_ADMIN: runAdmin(); break;
   }
