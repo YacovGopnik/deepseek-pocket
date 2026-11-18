@@ -1812,6 +1812,7 @@ void handleRoot() {
        "if(t.indexOf('OK')==0)ok++;else{s.textContent=T3+t;this.value='';return}"
        "}catch(e){s.textContent=T3+e;this.value='';return}}"
        "s.textContent=T2+ok;this.value=''};</script>";
+  if (ENABLE_IR) {                                    // в сборке без ИК-пульта раздела нет
   h += "<h3>"; h += L3("Пульты (.ir)", "Remotes (.ir)", "遥控器（.ir）"); h += "</h3><p><small>";
   h += L3("Файл пульта из базы Flipper-IRDB (github.com/" IR_DB_REPO "): скачайте нужный .ir на телефон и выберите его здесь.",
           "A remote file from Flipper-IRDB (github.com/" IR_DB_REPO "): download the .ir file to your phone and pick it here.",
@@ -1821,6 +1822,7 @@ void handleRoot() {
   h += "<script>document.getElementById('rf').onchange=async function(){var s=document.getElementById('rs'),f=this.files[0];if(!f)return;"
        "s.textContent='...';try{var fd=new FormData();fd.append('f',f,f.name);var r=await fetch('/ir',{method:'POST',body:fd});"
        "s.textContent=await r.text()}catch(e){s.textContent=''+e}this.value=''};</script>";
+  }
   h += "<h3>"; h += L3("Обновление прошивки", "Firmware update", "固件更新"); h += "</h3><p><small>";
   h += L3("Файл прошивки .bin. Сейчас стоит версия ", "Firmware .bin file. Installed version: ", "固件.bin文件。当前版本："); h += String(FW_VERSION);
   h += "</small></p><input type='file' id='ff'><p><small id='fs'></small></p>";
@@ -1952,7 +1954,7 @@ void runPortal() {
     server.on("/save", HTTP_POST, handleSave);
     server.on("/note", HTTP_POST, handleNote);
     server.on("/pic", HTTP_POST, handlePicDone, handlePicUpload);
-    server.on("/ir", HTTP_POST, handleIrDone, handleIrUpload);
+    if (ENABLE_IR) server.on("/ir", HTTP_POST, handleIrDone, handleIrUpload);
     server.on("/fw", HTTP_POST, handleFwDone, handleFwUpload);
     server.onNotFound(handleRedirect);   // открывает страницу сама (captive portal)
     serverReady = true;
