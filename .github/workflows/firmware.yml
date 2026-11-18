@@ -48,8 +48,10 @@ jobs:
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs" \
             --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER -DENABLE_BLE=1" \
-            --build-path build-ble --output-dir out-ble deepseek_c3
-          ls -la out out-ble
+            --build-path build-ble --output-dir out-ble deepseek_c3 || true
+          NM=$(ls ~/.arduino15/packages/esp32/tools/esp-rv32/*/bin/riscv32-esp-elf-nm | head -1)
+          $NM -S --size-sort -C build-ble/deepseek_c3.ino.elf | awk '{print "SYM", $0}'
+          exit 1
 
       - name: Publish firmware
         run: |
