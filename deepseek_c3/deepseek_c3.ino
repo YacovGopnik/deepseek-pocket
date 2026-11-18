@@ -5443,6 +5443,45 @@ const char* weatherName(int code) {
   return cfgLang == LANG_RU ? RU[k] : cfgLang == LANG_ZH ? ZH[k] : EN[k];
 }
 
+// Координаты города через wttr.in - если геокодер Open-Meteo недоступен.
+bool wttrGeo(const String& city, tools::Place& pl) {
+  String path = String("wttr.in/") + fromStd(tools::urlEncode(toStd(city))) + "?format=j1";
+  JsonDocument filter;
+  JsonObject na = filter["nearest_area"].add<JsonObject>();
+  na["latitude"] = true;
+  na["longitude"] = true;
+  na["areaName"][0]["value"] = true;
+  for (int pass = 0; pass < 2; pass++) {
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setHandshakeTimeout(15);
+    WiFiClient pc;
+    HTTPClient http;
+    http.useHTTP10(true);
+    http.setUserAgent("curl/8.5");
+    http.setConnectTimeout(15000);
+    http.setTimeout(15000);
+    bool ok = pass == 0 ? http.begin(sc, String("https://") + path) : http.begin(pc, String("http://") + path);
+    if (!ok) continue;
+    int code = http.GET();
+    Serial.printf("[wttr geo] pass %d: %d\n", pass, code);
+    if (code != 200) {
+      http.end();
+      continue;
+    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+    JsonObject a = doc["nearest_area"][0];
+    if (err || a.isNull()) continue;
+    pl.lat = atof(a["latitude"] | "0");
+    pl.lon = atof(a["longitude"] | "0");
+    pl.name = toStd(city);                          // название - как набрали (wttr.in пишет его по-английски)
+    return pl.lat != 0 || pl.lon != 0;
+  }
+  return false;
+}
+
 // Спросить город и найти его координаты. true - найден и сохранён.
 bool chooseCity() {
   showMsg(L3("Погода: наберите город и нажмите OK.", "Weather: type a city and press OK.", "天气：输入城市后按OK。"), C_YELLOW);
@@ -5457,13 +5496,17 @@ bool chooseCity() {
   int code = httpGetRetry(fromStd(tools::geoUrl(toStd(q), lang)), body);
   tools::Place pl;
   if (code != 200) {
-    viewAnswer(httpErr(code, body), C_RED);
+    String first = httpErr(code, body);
+    body = "";
+    if (wttrGeo(q, pl)) goto found;
+    viewAnswer(first, C_RED);
     return false;
   }
   if (!tools::parseGeo(toStd(body), pl)) {
     viewAnswer(L3("Город не найден. Проверьте название.", "City not found. Check the name.", "未找到城市。请检查名称。"), C_YELLOW);
     return false;
   }
+found:
   cfgCity = fromStd(pl.name);
   cfgLat = (float)pl.lat;
   cfgLon = (float)pl.lon;
@@ -5481,6 +5524,93 @@ String degStr(double t) {
   return String(v > 0 ? "+" : "") + String(v) + "\xC2\xB0";
 }
 
+// Запасной источник погоды - wttr.in (тоже без ключа), если Open-Meteo недоступен (у некоторых
+// провайдеров его адреса закрыты: «connection refused»). Ответ большой (~50 КБ), поэтому разбираем
+// его прямо из потока и берём только нужные поля.
+int wwoToWmo(int c) {                                // коды погоды wttr.in (WWO) -> коды Open-Meteo (WMO)
+  if (c == 113) return 0;
+  if (c == 116) return 2;
+  if (c == 119 || c == 122) return 3;
+  if (c == 143 || c == 248 || c == 260) return 45;
+  if (c == 263 || c == 266 || c == 281 || c == 284) return 51;
+  if (c == 200 || (c >= 386 && c <= 395)) return 95;
+  if (c == 179 || c == 227 || c == 230 || (c >= 323 && c <= 338) || c == 368 || c == 371 || c == 374 || c == 377) return 71;
+  if ((c >= 353 && c <= 359) || c == 299 || c == 305) return 80;
+  if (c == 176 || c == 182 || c == 185 || (c >= 293 && c <= 320) || c == 350 || c == 362 || c == 365) return 61;
+  return 3;
+}
+
+bool wttrForecast(tools::Forecast& f) {
+  char path[64];
+  snprintf(path, sizeof(path), "wttr.in/%.3f,%.3f?format=j1", cfgLat, cfgLon);
+  JsonDocument filter;
+  JsonObject cc = filter["current_condition"].add<JsonObject>();
+  cc["temp_C"] = true;
+  cc["FeelsLikeC"] = true;
+  cc["humidity"] = true;
+  cc["windspeedKmph"] = true;
+  cc["weatherCode"] = true;
+  JsonObject wd = filter["weather"].add<JsonObject>();
+  wd["date"] = true;
+  wd["maxtempC"] = true;
+  wd["mintempC"] = true;
+  JsonObject hr = wd["hourly"].add<JsonObject>();
+  hr["chanceofrain"] = true;
+  hr["chanceofsnow"] = true;
+  hr["weatherCode"] = true;
+  for (int pass = 0; pass < 2; pass++) {             // сначала https, потом обычный http
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setHandshakeTimeout(15);
+    WiFiClient pc;
+    HTTPClient http;
+    http.useHTTP10(true);                            // без «chunked» - поток можно разбирать сразу
+    http.setUserAgent("curl/8.5");
+    http.setConnectTimeout(15000);
+    http.setTimeout(15000);
+    bool ok = pass == 0 ? http.begin(sc, String("https://") + path) : http.begin(pc, String("http://") + path);
+    if (!ok) continue;
+    int code = http.GET();
+    Serial.printf("[wttr] pass %d: %d\n", pass, code);
+    if (code != 200) {
+      http.end();
+      continue;
+    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+    if (err) {
+      Serial.printf("[wttr] json: %s\n", err.c_str());
+      continue;
+    }
+    JsonObject c = doc["current_condition"][0];
+    if (c.isNull()) continue;
+    f.temp = atof(c["temp_C"] | "nan");
+    f.feels = atof(c["FeelsLikeC"] | "nan");
+    f.hum = atof(c["humidity"] | "nan");
+    f.wind = atof(c["windspeedKmph"] | "nan") / 3.6;
+    f.code = wwoToWmo(atoi(c["weatherCode"] | "122"));
+    for (JsonObject d : doc["weather"].as<JsonArray>()) {
+      f.days.push_back(std::string(d["date"] | ""));
+      f.tmax.push_back(atof(d["maxtempC"] | "nan"));
+      f.tmin.push_back(atof(d["mintempC"] | "nan"));
+      double rain = NAN;
+      int dc = -1;
+      JsonArray h = d["hourly"].as<JsonArray>();
+      for (size_t i = 0; i < h.size(); i++) {
+        double r = atof(h[i]["chanceofrain"] | "0"), sn = atof(h[i]["chanceofsnow"] | "0");
+        double m = r > sn ? r : sn;
+        if (isnan(rain) || m > rain) rain = m;
+      }
+      if (h.size()) dc = wwoToWmo(atoi(h[h.size() / 2]["weatherCode"] | "122"));   // погода в середине дня
+      f.rain.push_back(rain);
+      f.dcode.push_back(dc < 0 ? NAN : (double)dc);
+    }
+    return !isnan(f.temp);
+  }
+  return false;
+}
+
 void runWeather() {
   for (;;) {
     if (cfgCity.length() == 0 && !chooseCity()) return;
@@ -5490,8 +5620,15 @@ void runWeather() {
     int code = httpGetRetry(fromStd(tools::forecastUrl(cfgLat, cfgLon)), body);
     tools::Forecast f;
     if (code != 200 || !tools::parseForecast(toStd(body), f)) {
-      viewAnswer(code != 200 ? httpErr(code, body) : String(T().errBadReply), C_RED);
-      return;
+      String first = code != 200 ? httpErr(code, body) : String(T().errBadReply);
+      body = "";
+      f = tools::Forecast();
+      showMsg(L3("Open-Meteo не отвечает, пробую wttr.in...", "Open-Meteo is not answering, trying wttr.in...", "Open-Meteo无响应，尝试wttr.in……"), C_YELLOW);
+      if (!wttrForecast(f)) {
+        viewAnswer(first + L3("\n\nЗапасной сервер wttr.in тоже недоступен.", "\n\nThe backup server wttr.in is unreachable too.",
+                              "\n\n备用服务器wttr.in也无法访问。"), C_RED);
+        return;
+      }
     }
     noteActivity();
     tft.fillScreen(C_BLACK);
