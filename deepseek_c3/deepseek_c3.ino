@@ -39,6 +39,7 @@
 #include <vector>
 #include <functional>
 #include <LittleFS.h>
+#include <SD.h>
 
 #include "font8x16.h"
 // Китайский язык и иероглифы: 1 - есть, 0 - нет (экономит около 730 КБ; без этого прошивка
@@ -786,6 +787,7 @@ int cfgBright = 4;        // яркость: 0..4 (8, 25, 50, 75, 100 %)
 int cfgSound = 1;         // звук: 0 - нет, 1 - только сигналы, 2 - сигналы и щелчки клавиш
 int cfgIdle = 2;          // гасить экран: 0 - нет, 1 - 30 с, 2 - 1 мин, 3 - 2 мин, 4 - 5 мин
 int cfgJoy = 2;           // чувствительность ручки: 0 (надо отклонять до упора) .. 4 (хватает лёгкого наклона)
+int cfgSd = 0;            // подключена SD-карта (вместо ИК-пульта, фонарика и пищалки)
 int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
@@ -848,6 +850,7 @@ void loadSettings() {
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
   cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
+  cfgSd = prefs.getUChar("sd", 0) ? 1 : 0;
   cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
   cfgCity = prefs.getString("city", "");
   cfgLat = prefs.getString("lat", "0").toFloat();
@@ -869,6 +872,7 @@ void saveScreenSettings() {
   prefs.putUChar("joyiy", (uint8_t)cfgJoyInvY);
   prefs.putUChar("rot", (uint8_t)cfgRot);
   prefs.putUChar("ble", (uint8_t)cfgBle);
+  prefs.putUChar("sd", (uint8_t)cfgSd);
   prefs.putUChar("tz", (uint8_t)(cfgTz + 12));
   prefs.end();
 }
@@ -1094,11 +1098,13 @@ void showMsg(const String& s, uint16_t fg) {
 extern bool screenAsleep;
 
 void sndTone(int freq) {
+  if (cfgSd) return;                                 // вывод пищалки занят SD-картой
   if (BUZZER_ACTIVE) digitalWrite(PIN_BUZ, freq > 0 ? HIGH : LOW);
   else ledcWriteTone(PIN_BUZ, freq > 0 ? (uint32_t)freq : 0);
 }
 
 void soundInit() {
+  if (cfgSd) return;
   if (BUZZER_ACTIVE) {
     pinMode(PIN_BUZ, OUTPUT);
     digitalWrite(PIN_BUZ, LOW);
@@ -1399,46 +1405,137 @@ int noteCount();
 bool addNote(const String& title, const String& text);
 String portalNote;                                   // что только что пришло с телефона (показать на экране)
 
-// ---------- Галерея: картинки в памяти платы ----------
+// ---------- microSD (по желанию) ----------
+// Карта подключается вместо ИК-пульта, фонарика и пищалки: SCK - GPIO8, MOSI - GPIO2, MISO - GPIO20, CS - GPIO9
+// (плюс 10 кОм от GPIO2 и от GPIO9 к 3V3). Включается в Настройках. Шина SPI у платы одна, а у экрана нет CS,
+// поэтому на время работы с картой выводы шины переключаются на карту, потом обратно на экран.
+const int SD_SCK = 8, SD_MOSI = 2, SD_MISO = 20, SD_CS = 9;
+bool sdOk = false;                                   // карта смонтирована
+int sdDepth = 0;
+
+void sdBusOn() {
+  if (sdDepth++ > 0) return;
+  SPI.end();
+  pinMode(PIN_SCK, OUTPUT);                          // экран без CS: держим его линии в покое
+  digitalWrite(PIN_SCK, LOW);
+  pinMode(PIN_MOSI, OUTPUT);
+  digitalWrite(PIN_MOSI, LOW);
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
+}
+
+void sdBusOff() {
+  if (--sdDepth > 0) return;
+  SPI.end();
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  SPI.begin(PIN_SCK, -1, PIN_MOSI, -1);
+}
+
+struct SdBus {                                       // на время жизни - шина у карты
+  SdBus() { sdBusOn(); }
+  ~SdBus() { sdBusOff(); }
+};
+
+struct PicBus {                                      // то же, но только если картинки на карте
+  bool on;
+  PicBus() : on(sdOk) {
+    if (on) sdBusOn();
+  }
+  ~PicBus() {
+    if (on) sdBusOff();
+  }
+};
+
+bool sdMount() {
+  if (!cfgSd) return false;
+  SdBus b;
+  sdOk = SD.begin(SD_CS, SPI, 20000000, "/sd", 4);
+  if (sdOk) {
+    SD.mkdir("/pics");
+    SD.mkdir("/fw");
+  }
+  Serial.printf("SD card: %s\n", sdOk ? "ok" : "not found");
+  return sdOk;
+}
+
+fs::FS& picFs() {
+  if (sdOk) return SD;
+  return LittleFS;
+}
+
+// ---------- Галерея: картинки в памяти платы или на SD-карте ----------
 // Телефон сам уменьшает фото под экран (до 240x200) и присылает маленький JPEG.
-const int MAX_PICS = 30;
 const size_t MAX_PIC_BYTES = 40000;
+int picMax() { return sdOk ? 99 : 30; }
 
 String picPath(int i) {
-  char b[20];
-  snprintf(b, sizeof(b), "/pic%02d.jpg", i);
+  char b[24];
+  snprintf(b, sizeof(b), sdOk ? "/pics/pic%02d.jpg" : "/pic%02d.jpg", i);
   return String(b);
 }
 
+bool picExists(int i) {
+  PicBus b;
+  return picFs().exists(picPath(i).c_str());
+}
+
+void picRemove(int i) {
+  PicBus b;
+  picFs().remove(picPath(i).c_str());
+}
+
+// Прочитать картинку в память (освободить free()). nullptr - не вышло.
+uint8_t* picLoad(int slot, size_t& n) {
+  PicBus b;
+  File f = picFs().open(picPath(slot).c_str(), "r");
+  n = f ? (size_t)f.size() : 0;
+  uint8_t* buf = (n > 0 && n <= MAX_PIC_BYTES) ? (uint8_t*)malloc(n) : nullptr;
+  if (buf && f.read(buf, n) != n) {
+    free(buf);
+    buf = nullptr;
+  }
+  if (f) f.close();
+  return buf;
+}
+
 int picCount() {
+  PicBus b;
   int n = 0;
-  for (int i = 0; i < MAX_PICS; i++)
-    if (LittleFS.exists(picPath(i).c_str())) n++;
+  for (int i = 0; i < picMax(); i++)
+    if (picExists(i)) n++;
   return n;
 }
 
 int picFreeSlot() {
-  for (int i = 0; i < MAX_PICS; i++)
-    if (!LittleFS.exists(picPath(i).c_str())) return i;
+  PicBus b;
+  for (int i = 0; i < picMax(); i++)
+    if (!picExists(i)) return i;
   return -1;
 }
 
 // Хватит ли места на картинку размером n байт (с запасом на служебные данные файловой системы).
-bool picRoomFor(size_t n) { return LittleFS.totalBytes() - LittleFS.usedBytes() > n + 12000; }
+bool picRoomFor(size_t n) {
+  if (sdOk) {
+    PicBus b;
+    return SD.totalBytes() - SD.usedBytes() > (uint64_t)n + 65536;
+  }
+  return LittleFS.totalBytes() - LittleFS.usedBytes() > n + 12000;
+}
 
 // Сохранить готовый JPEG из памяти (например, найденную в интернете картинку). Пустая строка - успех, иначе причина.
 String savePic(const uint8_t* data, size_t n) {
   if (n < 100 || data[0] != 0xFF || data[1] != 0xD8) return L3("это не JPEG", "not a JPEG", "不是JPEG");
   if (n > MAX_PIC_BYTES) return L3("файл слишком большой", "the file is too big", "文件太大");
   int slot = picFreeSlot();
-  if (slot < 0) return L3("галерея заполнена (30)", "the gallery is full (30)", "相册已满（30）");
+  if (slot < 0) return L3("галерея заполнена", "the gallery is full", "相册已满");
   if (!picRoomFor(n)) return L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
-  File f = LittleFS.open(picPath(slot).c_str(), "w");
+  PicBus b;
+  File f = picFs().open(picPath(slot).c_str(), "w");
   if (!f) return L3("не удалось записать", "cannot write the file", "无法写入");
   size_t w = f.write(data, n);
   f.close();
   if (w != n) {
-    LittleFS.remove(picPath(slot).c_str());
+    picFs().remove(picPath(slot).c_str());
     return L3("не удалось записать", "cannot write the file", "无法写入");
   }
   return "";
@@ -1451,8 +1548,9 @@ size_t picSize = 0;
 bool picOk = false;
 
 void picAbort(const char* why) {
+  PicBus b;
   if (picFile) picFile.close();
-  if (picFilePath.length()) LittleFS.remove(picFilePath.c_str());
+  if (picFilePath.length()) picFs().remove(picFilePath.c_str());
   picFilePath = "";
   picErr = why;
 }
@@ -1466,12 +1564,13 @@ void handlePicUpload() {
     picFilePath = "";
     int slot = picFreeSlot();
     if (slot < 0) {
-      picErr = L3("галерея заполнена (30). Удалите лишнее на устройстве.", "the gallery is full (30)", "相册已满（30）");
+      picErr = L3("галерея заполнена. Удалите лишнее на устройстве.", "the gallery is full", "相册已满");
     } else if (!picRoomFor(16000)) {                 // с телефона приходит до ~14 КБ
       picErr = L3("в памяти платы нет места", "no free memory on the device", "设备存储空间不足");
     } else {
       picFilePath = picPath(slot);
-      picFile = LittleFS.open(picFilePath.c_str(), "w");
+      PicBus b;
+      picFile = picFs().open(picFilePath.c_str(), "w");
       if (!picFile) picAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
     }
   } else if (up.status == UPLOAD_FILE_WRITE) {
@@ -1485,10 +1584,18 @@ void handlePicUpload() {
       picAbort(L3("файл слишком большой", "the file is too big", "文件太大"));
       return;
     }
-    if (picFile.write(up.buf, up.currentSize) != up.currentSize) picAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
+    size_t w;
+    {
+      PicBus b;
+      w = picFile.write(up.buf, up.currentSize);
+    }
+    if (w != up.currentSize) picAbort(L3("не удалось записать", "cannot write the file", "无法写入"));
   } else if (up.status == UPLOAD_FILE_END) {
     if (!picFilePath.length()) return;
-    picFile.close();
+    {
+      PicBus b;
+      picFile.close();
+    }
     if (picSize < 100) picAbort(L3("файл пустой", "the file is empty", "文件为空"));
     else picOk = true;
   } else {                                           // связь оборвалась посреди файла
@@ -4530,14 +4637,11 @@ void drawGalleryBars(int pos, int total) {
 
 void showGalleryPic(int slot, int pos, int total) {
   drawGalleryBars(pos, total);
-  File f = LittleFS.open(picPath(slot).c_str(), "r");
-  size_t n = f ? (size_t)f.size() : 0;
-  uint8_t* buf = (n > 0 && n <= MAX_PIC_BYTES) ? (uint8_t*)malloc(n) : nullptr;
-  if (buf && f.read(buf, n) == n) {
-    f.close();
+  size_t n = 0;
+  uint8_t* buf = picLoad(slot, n);
+  if (buf) {
     drawJpegFit(buf, n);
   } else {
-    if (f) f.close();
     tft.fillRect(0, IMG_Y0, 240, IMG_Y1 - IMG_Y0, C_BLACK);
     SmallFont small;
     const char* m = L3("Файл не читается", "Cannot read the file", "无法读取文件");
@@ -4550,8 +4654,11 @@ void runGallery() {
   int pos = 0;
   for (;;) {
     std::vector<int> slots;
-    for (int i = 0; i < MAX_PICS; i++)
-      if (LittleFS.exists(picPath(i).c_str())) slots.push_back(i);
+    {
+      PicBus b;
+      for (int i = 0; i < picMax(); i++)
+        if (picExists(i)) slots.push_back(i);
+    }
     if (slots.empty()) {
       std::vector<String> o = splitBar(L3("Загрузить с телефона|Назад", "Upload from phone|Back", "从手机上传|返回"));
       int k = choiceScreen(L3("В галерее пока пусто. Картинки загружаются с телефона или сохраняются из поиска картинок.",
@@ -4575,7 +4682,7 @@ void runGallery() {
                                             "返回|删除这张图片|从手机上传|退出"));
         int k = choiceScreen(L3("Галерея", "Gallery", "相册"), o);
         if (k == 3) return;
-        if (k == 1) LittleFS.remove(picPath(slots[(size_t)pos]).c_str());
+        if (k == 1) picRemove(slots[(size_t)pos]);
         if (k == 2) {
           runPortal();
           netIdx = 0;
@@ -4625,11 +4732,9 @@ bool avaCollect(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
 
 // Сделать аватарку 24x24 из картинки галереи. false - не получилось.
 bool makeAvatar(int slot, uint8_t* out) {
-  File f = LittleFS.open(picPath(slot).c_str(), "r");
-  size_t n = f ? (size_t)f.size() : 0;
-  uint8_t* buf = (n > 0 && n <= MAX_PIC_BYTES) ? (uint8_t*)malloc(n) : nullptr;
-  bool ok = buf && f.read(buf, n) == n;
-  if (f) f.close();
+  size_t n = 0;
+  uint8_t* buf = picLoad(slot, n);
+  bool ok = buf != nullptr;
   avaSum = ok ? (uint32_t*)calloc(mqtt::AVA_BYTES * 4, sizeof(uint32_t)) : nullptr;
   if (!avaSum) ok = false;
   if (ok) {
@@ -4661,8 +4766,11 @@ bool makeAvatar(int slot, uint8_t* out) {
 
 bool pickAvatar() {
   std::vector<int> slots;
-  for (int i = 0; i < MAX_PICS; i++)
-    if (LittleFS.exists(picPath(i).c_str())) slots.push_back(i);
+  {
+    PicBus b;
+    for (int i = 0; i < picMax(); i++)
+      if (picExists(i)) slots.push_back(i);
+  }
   std::vector<String> o = splitBar(L3("Выбрать из галереи|Убрать аватарку|Назад", "Choose from the gallery|Remove the avatar|Back", "从相册选择|移除头像|返回"));
   int k = choiceScreen(L3("Аватарка", "Avatar", "头像"), o);
   if (k == 1) {
@@ -4686,11 +4794,9 @@ bool pickAvatar() {
     drawUtf8(L3("Нажать - выбрать, держать - отмена", "Click - choose, hold - cancel", "按下：选择，长按：取消"), 2, IMG_Y1 + 2, C_LIGHT, C_BLACK);
   };
   auto pic = [&]() {
-    File f = LittleFS.open(picPath(slots[(size_t)pos]).c_str(), "r");
-    size_t sz = f ? (size_t)f.size() : 0;
-    uint8_t* buf = (sz > 0 && sz <= MAX_PIC_BYTES) ? (uint8_t*)malloc(sz) : nullptr;
-    if (buf && f.read(buf, sz) == sz) drawJpegFit(buf, sz);
-    if (f) f.close();
+    size_t sz = 0;
+    uint8_t* buf = picLoad(slots[(size_t)pos], sz);
+    if (buf) drawJpegFit(buf, sz);
     if (buf) free(buf);
   };
   show();
@@ -6530,6 +6636,10 @@ void runRemote() {
     notInEdition();
     return;
   }
+  if (cfgSd) {
+    viewAnswer(L3("Вывод ИК-светодиода занят SD-картой.", "The IR LED pin is used by the SD card.", "红外引脚已被SD卡占用。"), C_YELLOW);
+    return;
+  }
   int sel = 0;
   for (;;) {
     std::vector<int> slots;
@@ -6739,12 +6849,190 @@ void handleFwDone() {
   ESP.restart();
 }
 
+// ---------- Сборки прошивки на SD-карте ----------
+// Обе сборки (полная и с Bluetooth) скачиваются с GitHub на карту; переключаться между ними можно без интернета.
+String sdFwPath(bool ble) { return ble ? "/fw/ble.bin" : "/fw/full.bin"; }
+
+int sdFwVersion() {
+  SdBus b;
+  File f = SD.open("/fw/version.txt", "r");
+  int v = f ? f.readString().toInt() : 0;
+  if (f) f.close();
+  return v;
+}
+
+bool sdFwHas(bool ble) {
+  SdBus b;
+  File f = SD.open(sdFwPath(ble).c_str(), "r");
+  bool ok = f && f.size() > 100000;
+  if (f) f.close();
+  return ok;
+}
+
+// Скачать файл с GitHub на карту. Пустая строка - успех.
+String sdDownload(const String& url, const String& path) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+  HTTPClient http;
+  http.setUserAgent(APP_UA);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) return "begin";
+  int code = http.GET();
+  int len = http.getSize();
+  if (code != 200 || len < 100000) {
+    http.end();
+    return String(L3("файл не найден (код ", "file not found (code ", "找不到文件（代码 ")) + String(code) + ")";
+  }
+  String tmp = path + ".part";
+  File f;
+  {
+    SdBus b;
+    SD.remove(tmp.c_str());
+    f = SD.open(tmp.c_str(), "w");
+  }
+  if (!f) {
+    http.end();
+    return L3("не удалось создать файл на карте", "cannot create the file on the card", "无法在卡上创建文件");
+  }
+  uint8_t* buf = (uint8_t*)malloc(4096);
+  WiFiClient* st = http.getStreamPtr();
+  size_t done = 0;
+  bool ok = buf != nullptr;
+  uint32_t lastData = millis();
+  tft.fillRect(20, 150, 200, 16, C_BLACK);
+  while (ok && done < (size_t)len) {
+    size_t av = st->available();
+    if (!av) {
+      if (!http.connected() || millis() - lastData > 20000) ok = false;
+      delay(2);
+      continue;
+    }
+    int n = st->readBytes(buf, av > 4096 ? 4096 : av);
+    if (n <= 0) continue;
+    lastData = millis();
+    size_t w;
+    {
+      SdBus b;
+      w = f.write(buf, (size_t)n);
+    }
+    if (w != (size_t)n) ok = false;
+    done += (size_t)n;
+    otaBar(done, (size_t)len);
+  }
+  if (buf) free(buf);
+  http.end();
+  SdBus b;
+  f.close();
+  if (!ok || done != (size_t)len) {
+    SD.remove(tmp.c_str());
+    return L3("загрузка оборвалась", "the download was interrupted", "下载中断");
+  }
+  SD.remove(path.c_str());
+  SD.rename(tmp.c_str(), path.c_str());
+  return "";
+}
+
+String sdDownloadEditions() {
+  if (!waitWifi(false)) return "";
+  String base = String("https://raw.githubusercontent.com/") + OTA_REPO + "/" + OTA_BRANCH + "/firmware/";
+  String body;
+  int code = httpGetText(base + "version.txt", body);
+  if (code != 200) return String(L3("Не удалось узнать версию (код ", "Cannot get the version (code ", "无法获取版本（代码 ")) + String(code) + ")";
+  int remote = body.toInt();
+  for (int k = 0; k < 2; k++) {
+    bool ble = k == 1;
+    showMsg(String(L3("Скачиваю на карту: ", "Downloading to the card: ", "正在下载到卡：")) +
+                (ble ? L3("сборка с Bluetooth", "Bluetooth edition", "蓝牙版") : L3("полная сборка", "full edition", "完整版")) + " v" + String(remote),
+            C_YELLOW);
+    String err = sdDownload(base + (ble ? "firmware-ble.bin" : "firmware.bin"), sdFwPath(ble));
+    if (err.length()) return String(L3("Не получилось: ", "Failed: ", "失败：")) + err;
+  }
+  SdBus b;
+  File f = SD.open("/fw/version.txt", "w");
+  if (f) {
+    f.print(remote);
+    f.close();
+  }
+  return String(L3("Готово: на карте обе сборки версии ", "Done: both editions of version ", "完成：卡上有两个版本 ")) + String(remote);
+}
+
+// Поставить сборку с карты (без интернета). При успехе плата перезапускается.
+String sdInstall(bool ble) {
+  File f;
+  size_t len = 0;
+  {
+    SdBus b;
+    f = SD.open(sdFwPath(ble).c_str(), "r");
+    len = f ? (size_t)f.size() : 0;
+  }
+  if (!f || len < 100000) return L3("Этой сборки на карте нет.", "This edition is not on the card.", "卡上没有这个版本。");
+  if (!Update.begin(len)) {
+    SdBus b;
+    f.close();
+    return String(L3("Прошивка не помещается: ", "The firmware does not fit: ", "固件放不下：")) + Update.errorString();
+  }
+  showMsg(L3("Ставлю прошивку с карты... Не выключайте гаджет.", "Installing from the card... Do not switch off.", "正在从卡安装……请勿关机。"), C_YELLOW);
+  uint8_t* buf = (uint8_t*)malloc(4096);
+  size_t done = 0;
+  bool ok = buf != nullptr;
+  while (ok && done < len) {
+    int n;
+    {
+      SdBus b;
+      n = f.read(buf, 4096);
+    }
+    if (n <= 0 || (done == 0 && buf[0] != 0xE9) || Update.write(buf, (size_t)n) != (size_t)n) ok = false;
+    done += n > 0 ? (size_t)n : 0;
+    otaBar(done, len);
+  }
+  if (buf) free(buf);
+  {
+    SdBus b;
+    f.close();
+  }
+  if (!ok || done != len || !Update.end(true)) {
+    Update.abort();
+    return L3("Не удалось поставить прошивку. Старая осталась на месте.", "Could not install the firmware. The old one is still in place.", "安装失败，旧固件仍保留。");
+  }
+  showMsg(L3("Готово! Перезапускаюсь...", "Done! Restarting...", "完成！正在重启……"), C_GREEN);
+  delay(1200);
+  ESP.restart();
+  return "";
+}
+
+void runSdEditions() {
+  for (;;) {
+    int v = sdFwVersion();
+    bool hasFull = sdFwHas(false), hasBle = sdFwHas(true);
+    std::vector<String> o = splitBar(L3("Скачать обе сборки на карту|Поставить полную с карты|Поставить с Bluetooth с карты|Назад",
+                                        "Download both editions to the card|Install full from the card|Install Bluetooth from the card|Back",
+                                        "下载两个版本到卡|从卡安装完整版|从卡安装蓝牙版|返回"));
+    String head = String(L3("Сборки на SD-карте. ", "Editions on the SD card. ", "SD卡上的版本。")) +
+                  (v ? String(L3("На карте версия ", "Card version ", "卡上版本 ")) + String(v) : String(L3("На карте пока ничего нет.", "Nothing on the card yet.", "卡上还没有。"))) +
+                  (hasFull ? L3(", полная", ", full", "，完整版") : "") + (hasBle ? L3(", с Bluetooth", ", Bluetooth", "，蓝牙版") : "") +
+                  String(L3(". У вас: ", ". Installed: ", "。当前：")) + String(FW_VERSION) + (ENABLE_BLE ? L3(" с Bluetooth", " Bluetooth", " 蓝牙版") : L3(" полная", " full", " 完整版"));
+    int k = choiceScreen(head, o);
+    String msg;
+    if (k == 0) msg = sdDownloadEditions();
+    else if (k == 1 || k == 2) {
+      std::vector<String> yn = splitBar(L3("Поставить|Отмена", "Install|Cancel", "安装|取消"));
+      if (choiceScreen(L3("Поставить эту сборку с карты? Настройки сохранятся. Около 20 секунд.", "Install this edition from the card? Settings are kept. About 20 seconds.",
+                          "从卡安装此版本？设置会保留。约20秒。"), yn) == 0)
+        msg = sdInstall(k == 2);
+    } else return;
+    if (msg.length()) viewAnswer(msg, C_WHITE);
+  }
+}
+
 void runUpdate() {
   for (;;) {
     std::vector<String> o = splitBar(ENABLE_BLE ? L3("Проверить в интернете|Сменить на полную сборку|С телефона (файл .bin)|Назад",
                                                      "Check online|Switch to the full edition|From phone (.bin file)|Back", "联网检查|切换到完整版|从手机（.bin文件）|返回")
                                                 : L3("Проверить в интернете|Сменить на сборку с Bluetooth|С телефона (файл .bin)|Назад",
                                                      "Check online|Switch to the Bluetooth edition|From phone (.bin file)|Back", "联网检查|切换到蓝牙版|从手机（.bin文件）|返回"));
+    if (sdOk) o.insert(o.begin() + 3, L3("Сборки на SD-карте", "Editions on the SD card", "SD卡上的版本"));
     int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION) +
                              (ENABLE_BLE ? L3(", сборка с Bluetooth", ", Bluetooth edition", "，蓝牙版") : L3(", полная сборка", ", full edition", "，完整版")),
                          o);
@@ -6753,6 +7041,8 @@ void runUpdate() {
       String msg = otaFromInternet();
       otaSwitch = false;
       if (msg.length()) viewAnswer(msg, C_WHITE);
+    } else if (k == 3 && sdOk) {
+      runSdEditions();
     } else if (k == 2) {
       viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет раздел «Обновление прошивки» - выберите там файл .bin. "
                     "Чтобы отменить - нажмите кнопку на устройстве.",
@@ -7399,9 +7689,9 @@ bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -7418,6 +7708,7 @@ bool runSettings() {
     right[11] = cfgJoyInvY ? L3("обратная", "inverted", "反向") : L3("обычная", "normal", "正常");
     right[12] = admOn ? L3("вы админ", "signed in", "已登录") : "";
     right[13] = String(cfgRot * 90) + "\xC2\xB0";
+    right[15] = !cfgSd ? L3("нет", "off", "关") : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
@@ -7458,6 +7749,10 @@ bool runSettings() {
           notInEdition();
           break;
         }
+        if (cfgSd) {
+          viewAnswer(L3("Вывод фонарика занят SD-картой.", "The torch pin is used by the SD card.", "手电筒引脚已被SD卡占用。"), C_YELLOW);
+          break;
+        }
         torchOn = !torchOn;                          // после перезапуска фонарик всегда выключен
         digitalWrite(PIN_LED, torchOn ? HIGH : LOW);
         break;
@@ -7482,6 +7777,23 @@ bool runSettings() {
       case 12:
         runAdmin();
         break;
+      case 15: {
+        std::vector<String> yn = splitBar(L3("Да, перезапустить|Нет", "Yes, restart|No", "是，重启|否"));
+        String q = cfgSd ? L3("Выключить SD-карту? Вернутся пищалка, фонарик и ИК-пульт (если они подключены). Нужен перезапуск.",
+                              "Turn the SD card off? The buzzer, torch and IR remote come back (if wired). Needs a restart.", "关闭SD卡？需要重启。")
+                         : L3("Включить SD-карту? Её выводы: SCK - GPIO8, MOSI - GPIO2, MISO - GPIO20, CS - GPIO9 (+10 кОм от GPIO2 и GPIO9 к 3V3). "
+                              "Пищалка, фонарик и ИК-пульт отключатся. Нужен перезапуск.",
+                              "Turn the SD card on? Pins: SCK GPIO8, MOSI GPIO2, MISO GPIO20, CS GPIO9 (+10k from GPIO2 and GPIO9 to 3V3). "
+                              "The buzzer, torch and IR remote are turned off. Needs a restart.", "开启SD卡？需要重启。");
+        if (choiceScreen(q, yn) == 0) {
+          cfgSd = !cfgSd;
+          saveScreenSettings();
+          showMsg(L3("Перезапускаюсь...", "Restarting...", "正在重启……"), C_YELLOW);
+          delay(800);
+          ESP.restart();
+        }
+        break;
+      }
       case 14:
         if (ENABLE_BLE) bleSetEnabled(!cfgBle);
         else viewAnswer(L3("Bluetooth не помещается в эту прошивку (ENABLE_BLE 0).", "Bluetooth does not fit into this firmware (ENABLE_BLE 0).", "此固件不包含蓝牙。"), C_YELLOW);
@@ -9832,7 +10144,7 @@ void drawBoot() {
 
 // ========================= ОСНОВНАЯ ПРОГРАММА =========================
 void setup() {
-  pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик
+  pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик (с SD-картой здесь MOSI карты - тоже безопасно)
   digitalWrite(PIN_LED, LOW);
   Serial.begin(115200);
   delay(3000);                       // время на USB и питание
@@ -9864,6 +10176,7 @@ void setup() {
     loadLearned();
     loadAvatar();
   }
+  sdMount();                                 // SD-карта (если включена в настройках)
   Serial.printf("4: learned words: %u\n", (unsigned)sugg.learnedCount());
 
   if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
