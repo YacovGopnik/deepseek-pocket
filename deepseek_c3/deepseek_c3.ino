@@ -125,7 +125,8 @@ inline bool takeLine(std::string&) { return false; }
 }  // namespace wpad
 #endif
 // Текст с телефона: по Bluetooth или по Wi-Fi.
-inline bool phoneTakeLine(std::string& l) { return ble::takePhoneLine(l) || wpad::takeLine(l); }
+// (макрос, а не функция: функция здесь сбила бы Arduino IDE, которая вставляет объявления перед первой функцией)
+#define phoneTakeLine(l) (ble::takePhoneLine(l) || wpad::takeLine(l))
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "esp_random.h"
