@@ -1448,13 +1448,16 @@ struct PicBus {                                      // то же, но толь
 
 bool sdMount() {
   if (!cfgSd) return false;
+  uint32_t t0 = millis();
   SdBus b;
-  sdOk = SD.begin(SD_CS, SPI, 20000000, "/sd", 4);
+  // 8 МГц: на проводах и через преобразователь уровней модуля надёжнее, чем 20 МГц
+  sdOk = SD.begin(SD_CS, SPI, 8000000, "/sd", 4);
   if (sdOk) {
     SD.mkdir("/pics");
     SD.mkdir("/fw");
   }
-  Serial.printf("SD card: %s\n", sdOk ? "ok" : "not found");
+  Serial.printf("SD card: %s, type %d, %llu MB, %lu ms\n", sdOk ? "ok" : "not found", sdOk ? (int)SD.cardType() : -1,
+                sdOk ? (unsigned long long)(SD.cardSize() / (1024 * 1024)) : 0ULL, (unsigned long)(millis() - t0));
   return sdOk;
 }
 
