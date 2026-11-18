@@ -16,7 +16,7 @@ const int PIN_SCK = 4, PIN_MOSI = 6, PIN_DC = 5, PIN_RST = 21, PIN_BLK = 10;
 const int SD_SCK = 8, SD_MOSI = 2, SD_MISO = 20, SD_CS = 9;
 
 Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, -1, PIN_DC, -1);
-int round_ = 0;
+int round_ = 0, okCount = 0;
 bool mounted = false;
 
 void step(const char* s) { Serial.printf("[%lu] %s\n", (unsigned long)millis(), s); Serial.flush(); }
@@ -83,10 +83,11 @@ void loop() {
   step("1 switch to card");
   toCard();
   step("2 on card");
-  if (!mounted) {
-    mounted = SD.begin(SD_CS, SPI, 8000000, "/sd", 4);
-    step(mounted ? "3 SD.begin OK" : "3 SD.begin FAILED");
-  }
+  // каждый круг карта подключается заново - так видно, насколько надёжно она отвечает
+  SD.end();
+  mounted = SD.begin(SD_CS, SPI, 4000000, "/sd", 4);
+  step(mounted ? "3 SD.begin OK" : "3 SD.begin FAILED");
+  if (mounted) okCount++;
   int files = -1;
   uint32_t mb = 0;
   if (mounted) {
@@ -113,6 +114,8 @@ void loop() {
   tft.setTextSize(3);
   tft.printf("round %d", round_);
   tft.setTextSize(2);
+  tft.setCursor(10, 190);
+  tft.printf("OK %d of %d", okCount, round_);
   step("6 drawn");
   delay(5000);
 }
