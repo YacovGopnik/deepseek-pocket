@@ -1,10 +1,10 @@
-// Bluetooth LE: связь с телефоном, пульт для телефона и игры гаджет-гаджет.
+// Bluetooth LE: связь с телефоном и пульт для телефона.
 // Библиотека NimBLE-Arduino 1.4.x (Скетч -> Подключить библиотеку -> Управлять библиотеками).
+// build_opt.h в папке скетча отключает ненужные роли Bluetooth, иначе прошивка не помещается.
 //
-// Гаджет - BLE-устройство «DS-<метка>» с тремя сервисами:
+// Гаджет - BLE-устройство «DS-<метка>» с двумя сервисами:
 //  * UART (Nordic UART Service): телефон пишет строки - текст в поле ввода или уведомление;
-//  * HID (пульт): медиа-клавиши - пуск/пауза, следующий/предыдущий трек, громкость;
-//  * игра: строки между двумя гаджетами (у кого метка меньше - тот подключается к другому).
+//  * HID (пульт): медиа-клавиши - пуск/пауза, следующий/предыдущий трек, громкость.
 #pragma once
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
@@ -17,8 +17,6 @@ namespace ble {
 static const char* NUS_SVC = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char* NUS_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";   // телефон -> гаджет
 static const char* NUS_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";   // гаджет -> телефон
-static const char* GAME_SVC = "8D2A0001-5F3B-4C8E-9B6E-2C1D0E7F4A10";
-static const char* GAME_CHR = "8D2A0002-5F3B-4C8E-9B6E-2C1D0E7F4A10";
 
 // Медиа-клавиши (HID Consumer Page)
 const uint16_t KEY_PLAY = 0xCD, KEY_NEXT = 0xB5, KEY_PREV = 0xB6, KEY_VOL_UP = 0xE9, KEY_VOL_DOWN = 0xEA, KEY_MUTE = 0xE2;
@@ -43,17 +41,12 @@ struct State {
   std::string id;                       // своя метка
   NimBLEServer* server = nullptr;
   NimBLECharacteristic* nusTx = nullptr;
-  NimBLECharacteristic* gameChr = nullptr;
   NimBLECharacteristic* hidIn = nullptr;
   NimBLEHIDDevice* hid = nullptr;
-  int phones = 0;                       // подключённые не-игровые устройства
+  int phones = 0;                       // подключённые устройства
   bool hidSubscribed = false;
-  // игра
-  int gameConn = -1;                    // мы - сервер, к нам подключился гаджет
-  NimBLEClient* client = nullptr;       // мы подключились к гаджету
-  NimBLERemoteCharacteristic* peerChr = nullptr;
   std::mutex mu;
-  std::vector<std::string> phoneLines, gameMsgs;
+  std::vector<std::string> phoneLines;
   std::string rxPart;                   // недописанная строка от телефона
 };
 static State S;
@@ -75,19 +68,13 @@ inline void pushPhoneBytes(const std::string& v) {
   }
 }
 
-inline void pushGame(const std::string& v) {
-  std::lock_guard<std::mutex> lk(S.mu);
-  if (S.gameMsgs.size() < 16) S.gameMsgs.push_back(v);
-}
-
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* d) override {
     S.phones++;
     NimBLEDevice::startAdvertising();               // остаёмся видимыми для второго устройства
   }
   void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* d) override {
-    if (d && (int)d->conn_handle == S.gameConn) S.gameConn = -1;
-    else if (S.phones > 0) S.phones--;
+    if (S.phones > 0) S.phones--;
     if (S.phones == 0) S.hidSubscribed = false;
   }
 };
@@ -96,32 +83,13 @@ class NusCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) override { pushPhoneBytes(c->getValue()); }
 };
 
-class GameCB : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) override { pushGame(c->getValue()); }
-  void onSubscribe(NimBLECharacteristic* c, ble_gap_conn_desc* d, uint16_t sub) override {
-    if (!d) return;
-    if (sub) {
-      if (S.gameConn != (int)d->conn_handle && S.phones > 0) S.phones--;   // это гаджет, а не телефон
-      S.gameConn = d->conn_handle;
-    } else if (S.gameConn == (int)d->conn_handle) {
-      S.gameConn = -1;
-      S.phones++;
-    }
-  }
-};
-
 class HidCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, ble_gap_conn_desc* d, uint16_t sub) override { S.hidSubscribed = sub != 0; }
 };
 
 static ServerCB serverCB;
 static NusCB nusCB;
-static GameCB gameCB;
 static HidCB hidCB;
-
-inline void onPeerNotify(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
-  pushGame(std::string((const char*)data, len));
-}
 
 // Включить Bluetooth. id - метка гаджета (для имени «DS-<метка>»).
 inline bool begin(const std::string& id) {
@@ -139,11 +107,6 @@ inline bool begin(const std::string& id) {
   S.nusTx = nus->createCharacteristic(NUS_TX, NIMBLE_PROPERTY::NOTIFY);
   nus->start();
 
-  NimBLEService* game = S.server->createService(GAME_SVC);
-  S.gameChr = game->createCharacteristic(GAME_CHR, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY);
-  S.gameChr->setCallbacks(&gameCB);
-  game->start();
-
   S.hid = new NimBLEHIDDevice(S.server);
   S.hidIn = S.hid->inputReport(1);
   S.hidIn->setCallbacks(&hidCB);
@@ -157,7 +120,6 @@ inline bool begin(const std::string& id) {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->setAppearance(0x0180);                        // пульт
   adv->addServiceUUID(S.hid->hidService()->getUUID());
-  adv->addServiceUUID(NimBLEUUID(GAME_SVC));
   adv->setScanResponse(true);
   adv->start();
   S.on = true;
@@ -172,15 +134,11 @@ inline void end() {
   S.hid = nullptr;
   S.on = false;
   S.server = nullptr;
-  S.nusTx = S.gameChr = S.hidIn = nullptr;
+  S.nusTx = S.hidIn = nullptr;
   S.phones = 0;
   S.hidSubscribed = false;
-  S.gameConn = -1;
-  S.client = nullptr;
-  S.peerChr = nullptr;
   std::lock_guard<std::mutex> lk(S.mu);
   S.phoneLines.clear();
-  S.gameMsgs.clear();
   S.rxPart.clear();
 }
 
@@ -213,81 +171,6 @@ inline void media(uint16_t usage) {
   delay(20);
   S.hidIn->setValue(off, 2);
   S.hidIn->notify();
-}
-
-// ---------- игра ----------
-inline bool gameLinked() {
-  if (!S.on) return false;
-  if (S.client && S.client->isConnected() && S.peerChr) return true;
-  return S.gameConn >= 0;
-}
-
-inline void gameSend(const std::string& m) {
-  if (!S.on) return;
-  if (S.client && S.client->isConnected() && S.peerChr) {
-    S.peerChr->writeValue((const uint8_t*)m.data(), m.size(), true);
-  } else if (S.gameConn >= 0) {
-    S.gameChr->setValue(m);
-    S.gameChr->notify();
-  }
-}
-
-inline bool gameTake(std::string& m) {
-  std::lock_guard<std::mutex> lk(S.mu);
-  if (S.gameMsgs.empty()) return false;
-  m = S.gameMsgs.front();
-  S.gameMsgs.erase(S.gameMsgs.begin());
-  return true;
-}
-
-inline void gameDrop() {
-  if (S.client) {
-    if (S.client->isConnected()) S.client->disconnect();
-    NimBLEDevice::deleteClient(S.client);
-    S.client = nullptr;
-    S.peerChr = nullptr;
-  }
-  if (S.gameConn >= 0 && S.server) S.server->disconnect((uint16_t)S.gameConn);
-  S.gameConn = -1;
-  std::lock_guard<std::mutex> lk(S.mu);
-  S.gameMsgs.clear();
-}
-
-// Один шаг поиска соперника (около секунды). Подключаемся сами, только если наша метка меньше;
-// иначе ждём, пока подключатся к нам. Возвращает имя найденного гаджета («DS-...») или пустую строку.
-inline std::string gameSearchStep() {
-  if (!S.on || gameLinked()) return "";
-  NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);
-  NimBLEScanResults res = scan->start(1, false);
-  std::string found;
-  for (int i = 0; i < res.getCount(); i++) {
-    NimBLEAdvertisedDevice d = res.getDevice(i);
-    if (!d.isAdvertisingService(NimBLEUUID(GAME_SVC)) || !d.haveName()) continue;
-    std::string name = d.getName();
-    if (name.compare(0, 3, "DS-") != 0) continue;
-    std::string peer = name.substr(3);
-    if (peer == S.id) continue;
-    found = name;
-    if (S.id < peer) {                                // подключаемся мы
-      NimBLEClient* c = NimBLEDevice::createClient();
-      c->setConnectTimeout(5);
-      if (c->connect(d.getAddress())) {
-        NimBLERemoteService* rs = c->getService(GAME_SVC);
-        NimBLERemoteCharacteristic* rc = rs ? rs->getCharacteristic(GAME_CHR) : nullptr;
-        if (rc && rc->canNotify() && rc->subscribe(true, onPeerNotify)) {
-          S.client = c;
-          S.peerChr = rc;
-          break;
-        }
-        c->disconnect();
-      }
-      NimBLEDevice::deleteClient(c);
-    }
-    break;
-  }
-  scan->clearResults();
-  return found;
 }
 
 }  // namespace ble

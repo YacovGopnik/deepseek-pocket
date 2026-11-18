@@ -67,7 +67,9 @@
 #include "calc.h"
 #include "calc_solve.h"
 #include "admin.h"
-#include "ble_link.h"                              // Bluetooth: телефон, пульт, игры (библиотека NimBLE-Arduino 1.4.x)
+#include "ble_link.h"                              // Bluetooth: телефон и пульт (библиотека NimBLE-Arduino 1.4.x)
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include "esp_random.h"
 #include "tools.h"
 #include "games2.h"
@@ -3502,7 +3504,6 @@ extern String pendingInput;
 std::vector<String> bleNotes;                        // уведомления с телефона, ждут показа
 bool bleService();
 void bleSetEnabled(bool on);
-void runTttBle();
 bool g_kbChat = false;                               // следующий inputText - поле вопроса в чате (удержание - меню чата)
 bool g_goHome = false;                               // выбрано «Домой»: выйти из чата на главный экран
 
@@ -6698,7 +6699,7 @@ void runUpdate() {
 // ========================= BLUETOOTH =========================
 // Телефон подключается к гаджету «DS-<метка>»: печатает текст, присылает уведомления (страница
 // ble.html в Chrome на Android или приложение Serial Bluetooth Terminal), а гаджет служит пультом
-// для музыки на телефоне. Ещё - игры вдвоём с гаджетом рядом. Bluetooth включается в настройках.
+// для музыки на телефоне. Bluetooth включается в настройках. (Игры вдвоём рядом - ESP-NOW.)
 const char* BLE_PAGE = "yacovgopnik.github.io/deepseek-pocket/ble.html";
 
 void bleSetEnabled(bool on) {
@@ -6791,11 +6792,11 @@ void runPhoneRemote() {
 void runBluetooth() {
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Пульт для телефона|Связь с телефоном|Крестики по Bluetooth|Bluetooth|Назад",
-                                            "Phone remote|Phone link|Tic-tac-toe Bluetooth|Bluetooth|Back", "手机遥控器|手机连接|蓝牙井字棋|蓝牙|返回"));
+    std::vector<String> items = splitBar(L3("Пульт для телефона|Связь с телефоном|Bluetooth|Назад",
+                                            "Phone remote|Phone link|Bluetooth|Back", "手机遥控器|手机连接|蓝牙|返回"));
     std::vector<String> right(items.size());
     right[1] = ble::phoneConnected() ? L3("подключён", "connected", "已连接") : "";
-    right[3] = ble::active() ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
+    right[2] = ble::active() ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     sel = listScreen((String("Bluetooth  DS-") + roomId).c_str(), items, right, sel);
     if (sel == 0) {
       runPhoneRemote();
@@ -6812,8 +6813,6 @@ void runBluetooth() {
                         "\n并点击“连接”。也可以用 Serial Bluetooth Terminal 应用（蓝牙LE模式）。\n\n手机发来的文字会进入输入框，或在没有输入框时作为通知弹出。"),
                  C_WHITE);
     } else if (sel == 2) {
-      runTttBle();
-    } else if (sel == 3) {
       bleSetEnabled(!ble::active());
     } else {
       return;
@@ -8561,25 +8560,131 @@ void runFps3d() {
 // ========================= КРЕСТИКИ-НОЛИКИ ПО СЕТИ =========================
 // Два гаджета в одной комнате находят друг друга сами. Сообщения идут в <комната>/g:
 // «метка \t имя \t ttt \t команда \t кому \t число».
-bool g_netBle = false;                               // игра идёт по Bluetooth (гаджет-гаджет), а не через сервер
-void netSend(const String& body) {
-  std::string m = toStd(roomId) + "\t" + toStd(cfgNick) + "\t" + toStd(body);
-  if (g_netBle) ble::gameSend(m);
-  else mqWrite(mqtt::publish(roomBase() + "/g", m));
+// ---- Прямая связь гаджет-гаджет (ESP-NOW): без роутера и интернета, до ~100 м ----
+// На время игры Wi-Fi отключается от сети (оба гаджета должны быть на одном канале - берём 1-й),
+// после игры подключается снова.
+namespace enow {
+std::mutex mu;
+std::vector<std::string> inbox;
+struct Peer {
+  std::string id;
+  uint8_t mac[6];
+};
+std::vector<Peer> peers;
+bool on = false;
+const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len <= 0 || len > 250) return;
+  std::string m((const char*)data, (size_t)len);
+  std::lock_guard<std::mutex> lk(mu);
+  size_t t = m.find('\t');
+  if (t != std::string::npos && t > 0 && t <= 16 && info) {   // запомнить адрес отправителя по его метке
+    std::string id = m.substr(0, t);
+    bool known = false;
+    for (Peer& p : peers)
+      if (p.id == id) {
+        memcpy(p.mac, info->src_addr, 6);
+        known = true;
+      }
+    if (!known && peers.size() < 8) {
+      Peer p;
+      p.id = id;
+      memcpy(p.mac, info->src_addr, 6);
+      peers.push_back(p);
+    }
+  }
+  if (inbox.size() < 16) inbox.push_back(m);
 }
 
-// Принять новые сообщения игры (по Bluetooth или через сервер) в netInbox.
+void addPeer(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t pi;
+  memset(&pi, 0, sizeof(pi));
+  memcpy(pi.peer_addr, mac, 6);
+  pi.channel = 0;
+  pi.encrypt = false;
+  esp_now_add_peer(&pi);
+}
+
+bool begin() {
+  if (on) return true;
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) return false;
+  esp_now_register_recv_cb(onRecv);
+  addPeer(BCAST);
+  on = true;
+  return true;
+}
+
+void end() {
+  if (!on) return;
+  esp_now_deinit();
+  on = false;
+  std::lock_guard<std::mutex> lk(mu);
+  inbox.clear();
+  peers.clear();
+  WiFi.setAutoReconnect(true);
+  wifiStarted = false;                               // фоновый Wi-Fi подключится заново
+}
+
+// to - метка получателя (если известен его адрес - отправляем лично, с подтверждением доставки).
+void send(const std::string& m, const std::string& to) {
+  if (!on) return;
+  const uint8_t* mac = BCAST;
+  uint8_t buf[6];
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    for (const Peer& p : peers)
+      if (to.size() && p.id == to) {
+        memcpy(buf, p.mac, 6);
+        mac = buf;
+      }
+  }
+  if (mac != BCAST) addPeer(mac);
+  esp_now_send(mac, (const uint8_t*)m.data(), m.size() > 250 ? 250 : m.size());
+}
+
+bool take(std::string& m) {
+  std::lock_guard<std::mutex> lk(mu);
+  if (inbox.empty()) return false;
+  m = inbox.front();
+  inbox.erase(inbox.begin());
+  return true;
+}
+}  // namespace enow
+
+bool g_netDirect = false;                            // игра идёт напрямую (ESP-NOW), а не через сервер
+void netSend(const String& body) {
+  std::string m = toStd(roomId) + "\t" + toStd(cfgNick) + "\t" + toStd(body);
+  if (g_netDirect) {
+    std::string b = toStd(body), to;                 // «игра \t команда \t кому \t ...»
+    size_t t1 = b.find('\t'), t2 = t1 == std::string::npos ? t1 : b.find('\t', t1 + 1);
+    if (t2 != std::string::npos) {
+      size_t t3 = b.find('\t', t2 + 1);
+      to = b.substr(t2 + 1, t3 == std::string::npos ? std::string::npos : t3 - t2 - 1);
+    }
+    enow::send(m, to);
+  } else {
+    mqWrite(mqtt::publish(roomBase() + "/g", m));
+  }
+}
+
+// Принять новые сообщения игры в netInbox.
 void netPump() {
-  if (g_netBle) {
+  if (g_netDirect) {
     std::string m;
-    while (ble::gameTake(m)) netInbox.push_back(m);
+    while (enow::take(m)) netInbox.push_back(m);
   } else {
     wifiTick();
     roomTick();
   }
 }
 
-bool netLinkUp() { return g_netBle ? ble::gameLinked() : mqUp; }
+bool netLinkUp() { return g_netDirect ? enow::on : mqUp; }
 
 // Разобрать очередное сообщение игры. false - очередь пуста.
 bool netNext(String& id, String& nick, String& game, String& cmd, String& peer, int& arg) {
@@ -8606,17 +8711,16 @@ bool netNext(String& id, String& nick, String& game, String& cmd, String& peer, 
   return false;
 }
 
-void runTttNetVia(bool viaBle);
+void runTttNetVia(bool direct);
 void runTttNet() { runTttNetVia(false); }
-void runTttBle() { runTttNetVia(true); }
+void runTttNear() { runTttNetVia(true); }
 
-// Крестики-нолики вдвоём: через сервер комнаты или напрямую по Bluetooth (гаджеты рядом).
-void runTttNetVia(bool viaBle) {
-  bool bleWasOn = ble::active();
-  if (viaBle) {
-    if (!bleWasOn) {
-      showMsg(L3("Включаю Bluetooth...", "Turning Bluetooth on...", "正在打开蓝牙……"), C_YELLOW);
-      ble::begin(toStd(roomId));
+// Крестики-нолики вдвоём: через сервер комнаты или напрямую (гаджеты рядом, без интернета).
+void runTttNetVia(bool direct) {
+  if (direct) {
+    if (!enow::begin()) {
+      viewAnswer(L3("Не удалось включить прямую связь.", "Could not start the direct link.", "无法启动直连。"), C_RED);
+      return;
     }
   } else {
     if (inRoom) return;
@@ -8628,30 +8732,29 @@ void runTttNetVia(bool viaBle) {
     }
     inRoom = true;                                   // связь поддерживается, пока идёт игра
   }
-  g_netBle = viaBle;
+  g_netDirect = direct;
   struct Leave {
-    bool viaBle, bleWasOn;
+    bool direct;
     ~Leave() {
-      if (viaBle) {
-        ble::gameDrop();
-        if (!bleWasOn) ble::end();                   // Bluetooth был выключен - выключаем обратно
-        g_netBle = false;
+      if (direct) {
+        enow::end();
+        g_netDirect = false;
       } else {
         inRoom = false;
         if (!(cfgRoomBg && cfgNick.length())) mqDrop();
       }
     }
-  } leave{viaBle, bleWasOn};
+  } leave{direct};
   int wins = 0, losses = 0, round = 0;
   for (;;) {
     // --- поиск соперника ---
     String peer, peerNick;
     bool host = false, iAmX = true;
     netInbox.clear();
-    if (viaBle)
-      showMsg(String(L3("Ищу гаджет рядом по Bluetooth (", "Looking for a device nearby over Bluetooth (", "正在通过蓝牙寻找附近的设备（")) + "DS-" + roomId +
-                  L3("). Пусть друг откроет «Крестики по Bluetooth». Держать - выход.", "). Ask a friend to open Tic-tac-toe Bluetooth. Hold - exit.",
-                     "）。请朋友打开“蓝牙井字棋”。长按：退出。"), C_YELLOW);
+    if (direct)
+      showMsg(L3("Ищу гаджет рядом (без интернета, до ~100 м). Пусть друг откроет «Крестики рядом». Держать - выход.",
+                 "Looking for a device nearby (no internet, up to ~100 m). Ask a friend to open Tic-tac-toe nearby. Hold - exit.",
+                 "正在寻找附近的设备（无需网络，约100米内）。请朋友打开“附近井字棋”。长按：退出。"), C_YELLOW);
     else
       showMsg(String(L3("Ищу соперника в комнате #", "Looking for an opponent in room #", "正在房间里寻找对手 #")) + cfgRoom +
               L3(". Пусть друг тоже откроет «Крестики по сети». Держать - выход.", ". Ask a friend to open Tic-tac-toe online too. Hold - exit.",
@@ -8659,10 +8762,6 @@ void runTttNetVia(bool viaBle) {
     uint32_t lastSeek = 0;
     while (!peer.length()) {
       if (btnEvent() == EV_LONG) return;
-      if (viaBle && !ble::gameLinked()) {            // ещё не соединились: поиск (около секунды)
-        ble::gameSearchStep();
-        continue;
-      }
       netPump();
       if (netLinkUp() && millis() - lastSeek > 2000) {
         lastSeek = millis();
@@ -8730,7 +8829,7 @@ void runTttNetVia(bool viaBle) {
           status();
         }
       }
-      if (millis() - lastHeard > 120000UL || (!netLinkUp() && millis() - lastHeard > (viaBle ? 5000UL : 30000UL))) gone = true;
+      if (millis() - lastHeard > 120000UL || (!netLinkUp() && millis() - lastHeard > (direct ? 5000UL : 30000UL))) gone = true;
       uint8_t j = joyEvent();
       if (j != J_NONE) {
         int old = cur, x = cur % 3, y = cur / 3;
@@ -9238,7 +9337,7 @@ void runGamesMenu() {
                                  L3("Арканоид", "Breakout", "打砖块"), L3("Пришельцы", "Invaders", "太空侵略者"),
                                  L3("Сапёр", "Minesweeper", "扫雷"), L3("Повтори", "Repeat", "记忆重复"),
                                  L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), L3("Крестики по сети", "Tic-tac-toe online", "联网井字棋"),
-                                 L3("Крестики по Bluetooth", "Tic-tac-toe Bluetooth", "蓝牙井字棋"), L3("Шахматы", "Chess", "国际象棋"),
+                                 L3("Крестики рядом", "Tic-tac-toe nearby", "附近井字棋"), L3("Шахматы", "Chess", "国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
                                  L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
@@ -9266,7 +9365,7 @@ void runGamesMenu() {
       case 13: runSimon(); break;
       case 14: runTtt(); break;
       case 15: runTttNet(); break;
-      case 16: runTttBle(); break;
+      case 16: runTttNear(); break;
       case 17: runChess(); break;
       case 18: runQuiz(); break;
       case 19: runStory(); break;
