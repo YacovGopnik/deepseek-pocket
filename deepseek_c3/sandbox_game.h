@@ -88,6 +88,7 @@ struct Game {
   int spawnX = W / 2, spawnY = 0;
   bool won = false;
   int16_t surf[W];                  // верхний непрозрачный блок каждого столбца (для света)
+  int16_t g0[W];                    // где была земля при создании мира: ниже - фон пещеры, выше - небо
 
   uint32_t rnd() {
     rng ^= rng << 13;
@@ -110,7 +111,7 @@ struct Game {
   }
   void updSurf(int x) {
     int y = 0;
-    while (y < H && (w[y][x] == AIR || w[y][x] == TORCH)) y++;
+    while (y < H && (w[y][x] == AIR || w[y][x] == TORCH || w[y][x] == LEAVES || w[y][x] == LOG)) y++;   // деревья свет не заслоняют
     surf[x] = (int16_t)y;
   }
 
@@ -197,7 +198,10 @@ struct Game {
         for (int dx = -2; dx <= 2; dx++)
           if (abs(dx) + abs(dy) <= 3 && w[top + dy][x + dx] == AIR) w[top + dy][x + dx] = LEAVES;
     }
-    for (int x = 0; x < W; x++) updSurf(x);
+    for (int x = 0; x < W; x++) {
+      updSurf(x);
+      g0[x] = (int16_t)hgt[x];
+    }
     spawnX = W / 2;
     spawnY = surf[spawnX];
     memset(inv, 0, sizeof(inv));
@@ -545,7 +549,7 @@ struct Game {
     uint8_t won;
     Slot inv[SLOTS];
   };
-  static size_t saveSize() { return sizeof(Save) + (size_t)W * H; }
+  static size_t saveSize() { return sizeof(Save) + (size_t)W * H + sizeof(int16_t) * W; }
   void saveTo(uint8_t* buf) const {
     Save s;
     memset(&s, 0, sizeof(s));
@@ -561,6 +565,7 @@ struct Game {
     memcpy(s.inv, inv, sizeof(inv));
     memcpy(buf, &s, sizeof(s));
     memcpy(buf + sizeof(s), w, (size_t)W * H);
+    memcpy(buf + sizeof(s) + (size_t)W * H, g0, sizeof(g0));
   }
   bool loadFrom(const uint8_t* buf, size_t n) {
     if (n != saveSize()) return false;
@@ -568,6 +573,7 @@ struct Game {
     memcpy(&s, buf, sizeof(s));
     if (s.magic != MAGIC) return false;
     memcpy(w, buf + sizeof(s), (size_t)W * H);
+    memcpy(g0, buf + sizeof(s) + (size_t)W * H, sizeof(g0));
     px = s.px;
     py = s.py;
     hp = s.hp > 0 && s.hp <= MAX_HP ? s.hp : MAX_HP;

@@ -10104,7 +10104,7 @@ uint16_t sbRgb(int r, int g, int b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 uint16_t sbShade(uint16_t c, int lvl) {              // 4 - как есть, 0 - почти черно
-  static const int K[5] = {28, 80, 140, 200, 256};
+  static const int K[5] = {40, 90, 145, 200, 256};
   if (c == SB_KEY) return c;
   int r = (c >> 11) << 3, g = ((c >> 5) & 63) << 2, b = (c & 31) << 3;
   return sbRgb(r * K[lvl] >> 8, g * K[lvl] >> 8, b * K[lvl] >> 8);
@@ -10262,7 +10262,7 @@ void sbFrame() {
         if (x + n > 240) n = 240 - x;
         uint8_t b = g.at(tx, ty);
         int lv = sbX->light[ty - ty0][tx - tx0];
-        bool under = tx >= 0 && tx < sbx::W && ty >= g.surf[tx];
+        bool under = tx >= 0 && tx < sbx::W && ty > g.g0[tx];
         const uint16_t* bg = under ? &sbX->wall[lv][fy * 8] : nullptr;
         if (b == sbx::AIR || b == sbx::TORCH || b == sbx::BENCH) {
           const uint16_t* t = b != sbx::AIR ? &sbX->tex[b][b == sbx::TORCH ? 4 : lv][fy * 8] : nullptr;
