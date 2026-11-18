@@ -67,7 +67,26 @@
 #include "calc.h"
 #include "calc_solve.h"
 #include "admin.h"
-#include "ble_link.h"                              // Bluetooth: телефон и пульт (библиотека NimBLE-Arduino 1.4.x)
+// Bluetooth (телефон и пульт) занимает ~250 КБ и в разметку с обновлением по воздуху на 4 МБ не помещается.
+// 1 - включить (нужна библиотека NimBLE-Arduino 1.4.x и плата с флешем побольше или без части приложений).
+#ifndef ENABLE_BLE
+#define ENABLE_BLE 0
+#endif
+#if ENABLE_BLE
+#include "ble_link.h"
+#else
+namespace ble {                                      // заглушка: Bluetooth выключен при сборке
+const uint16_t KEY_PLAY = 0, KEY_NEXT = 0, KEY_PREV = 0, KEY_VOL_UP = 0, KEY_VOL_DOWN = 0;
+inline bool begin(const std::string&) { return false; }
+inline void end() {}
+inline bool active() { return false; }
+inline bool phoneConnected() { return false; }
+inline bool remoteReady() { return false; }
+inline bool takePhoneLine(std::string&) { return false; }
+inline void sendPhone(const std::string&) {}
+inline void media(uint16_t) {}
+}  // namespace ble
+#endif
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "esp_random.h"
@@ -7344,7 +7363,7 @@ bool runSettings() {
     right[11] = cfgJoyInvY ? L3("обратная", "inverted", "反向") : L3("обычная", "normal", "正常");
     right[12] = admOn ? L3("вы админ", "signed in", "已登录") : "";
     right[13] = String(cfgRot * 90) + "\xC2\xB0";
-    right[14] = cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
+    right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -7405,7 +7424,8 @@ bool runSettings() {
         runAdmin();
         break;
       case 14:
-        bleSetEnabled(!cfgBle);
+        if (ENABLE_BLE) bleSetEnabled(!cfgBle);
+        else viewAnswer(L3("Bluetooth не помещается в эту прошивку (ENABLE_BLE 0).", "Bluetooth does not fit into this firmware (ENABLE_BLE 0).", "此固件不包含蓝牙。"), C_YELLOW);
         break;
       case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
         cfgRot = (cfgRot + 1) & 3;
@@ -9522,6 +9542,7 @@ void homeApps(std::vector<uint8_t>& apps) {
   for (int a = 0; a < A_COUNT; a++) {
     if (a == A_ADMIN && !admOn) continue;
     if ((a == A_IMAGES || a == A_GALLERY) && !ENABLE_IMAGES) continue;
+    if (a == A_BT && !ENABLE_BLE) continue;
     apps.push_back((uint8_t)a);
   }
 }
@@ -9767,7 +9788,7 @@ void setup() {
 
   if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
   wifiStart();                                       // дальше Wi-Fi подключается в фоне
-  if (cfgBle) {                                      // Bluetooth включён в настройках
+  if (ENABLE_BLE && cfgBle) {                        // Bluetooth включён в настройках
     ble::begin(toStd(roomId));
     Serial.printf("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
   }
