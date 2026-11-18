@@ -1247,6 +1247,30 @@ void drawBigStr(const char* s, const char* prev, int x, int y, int scale, uint16
 }
 
 // ========================= ДЖОЙСТИК И КНОПКА =========================
+// Аварийный выход: кнопку держат 6 секунд - гаджет перезапускается и открывает главный экран.
+// Работает отдельной задачей, поэтому срабатывает, даже если основная программа зависла
+// (например, на SD-карте или в сети).
+const uint32_t HOLD_RESET_MS = 6000;
+const uint32_t HOLD_RESET_MAGIC = 0xB0071E5E;
+RTC_NOINIT_ATTR uint32_t holdReset;                  // перезапуск был по удержанию (переживает перезапуск)
+void holdWatchTask(void*) {
+  uint32_t down = 0;
+  for (;;) {
+    if (digitalRead(PIN_SW) == LOW) {
+      if (!down) down = millis();
+      else if (millis() - down > HOLD_RESET_MS) {
+        holdReset = HOLD_RESET_MAGIC;
+        analogWrite(PIN_BLK, 0);                     // экран гаснет - видно, что сработало
+        delay(200);
+        esp_restart();
+      }
+    } else {
+      down = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 int joyCx = 2048, joyCy = 2048;
 
 // Запоминаем положение ручки в покое (при включении джойстик не трогать).
@@ -1622,14 +1646,18 @@ void picSlots(std::vector<int>& out) {
   std::vector<bool> has(picMax(), false);
   File dir = picFs().open(sdOk ? "/pics" : "/");
   if (dir && dir.isDirectory()) {
-    for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
-      const char* nm = e.name();
-      const char* sl = strrchr(nm, '/');
-      if (sl) nm = sl + 1;
+    // только имена, без открытия каждого файла: на SD-карте открытие файла долгое
+    for (int guard = 0; guard < 400; guard++) {
+      bool isDir = false;
+      String full = dir.getNextFileName(&isDir);
+      if (!full.length()) break;
+      int sl = full.lastIndexOf('/');
+      String nm = sl >= 0 ? full.substring(sl + 1) : full;
       int i = -1;
-      if (!e.isDirectory() && sscanf(nm, "pic%d.jpg", &i) == 1 && i >= 0 && i < picMax() && e.size() > 0) has[i] = true;
+      if (!isDir && sscanf(nm.c_str(), "pic%d.jpg", &i) == 1 && i >= 0 && i < picMax()) has[i] = true;
     }
   }
+  if (dir) dir.close();
   for (int i = 0; i < picMax(); i++)
     if (has[i]) out.push_back(i);
 }
@@ -4812,6 +4840,8 @@ void runGallery() {
   int pos = 0;
   for (;;) {
     std::vector<int> slots;
+    showMsg(L3("Открываю галерею...\n\nЗависло - держите кнопку 6 секунд", "Opening the gallery...\n\nStuck? Hold the button for 6 seconds",
+               "正在打开相册……\n\n卡住了？按住按键6秒"), C_YELLOW);
     picSlots(slots);
     if (slots.empty()) {
       std::vector<String> o = splitBar(L3("Загрузить с телефона|Назад", "Upload from phone|Back", "从手机上传|返回"));
@@ -11270,6 +11300,10 @@ void setup() {
   analogReadResolution(12);
   if (BATTERY_ENABLED) analogSetPinAttenuation(PIN_BAT, ADC_11db);
   pinMode(PIN_SW, INPUT_PULLUP);
+  bool afterHoldReset = holdReset == HOLD_RESET_MAGIC;
+  holdReset = 0;
+  if (afterHoldReset) Serial.println("restarted by holding the button");
+  xTaskCreate(holdWatchTask, "hold", 2048, nullptr, 2, nullptr);
   joyCalibrate();
   Serial.printf("3: joystick center %d / %d\n", joyCx, joyCy);
 
@@ -11286,7 +11320,8 @@ void setup() {
     delay(5);
     prefs.begin("dsk", false);
     bool failed = prefs.getUChar("sdboot", 0) != 0;
-    if (failed || digitalRead(PIN_SW) == LOW) {
+    // кнопка всё ещё зажата после аварийного перезапуска - это не просьба выключить карту
+    if (failed || (digitalRead(PIN_SW) == LOW && !afterHoldReset)) {
       cfgSd = 0;
       prefs.putUChar("sd", 0);
       prefs.putUChar("sdboot", 0);
