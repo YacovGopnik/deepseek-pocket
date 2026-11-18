@@ -4973,6 +4973,7 @@ int httpGetText(const String& url, String& body) {
     if (url.startsWith("https://") && url.indexOf("open-meteo.com/") > 0) {
       WiFiClient plain;
       HTTPClient h2;
+      h2.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
       h2.setUserAgent(APP_UA);
       h2.setConnectTimeout(15000);
       h2.setTimeout(15000);
@@ -4988,7 +4989,34 @@ int httpGetText(const String& url, String& body) {
 }
 
 String httpErr(int code, const String& body) {
-  return String(T().errPrefix) + "HTTP " + String(code) + (code < 0 ? String(" ") + body : String(""));
+  String why;
+  if (code < 0) {
+    why = body;
+  } else {
+    int r = body.indexOf("\"reason\"");                // Open-Meteo и многие API пишут причину в поле reason
+    if (r >= 0) {
+      int a = body.indexOf('"', body.indexOf(':', r) + 1), b = a >= 0 ? body.indexOf('"', a + 1) : -1;
+      if (a >= 0 && b > a) why = body.substring(a + 1, b);
+    }
+    if (!why.length()) {
+      why = code == 429 ? L3("слишком много запросов, попробуйте через минуту", "too many requests, try again in a minute", "请求过多，请稍后再试")
+            : code >= 500 ? L3("сервер временно не работает", "the server is temporarily down", "服务器暂时不可用")
+            : code == 403 ? L3("сервер не пускает (доступ закрыт)", "the server refuses access", "服务器拒绝访问")
+                          : "";
+    }
+  }
+  if (why.length() > 120) why = why.substring(0, 120);
+  return String(T().errPrefix) + "HTTP " + String(code) + (why.length() ? String("\n") + why : String(""));
+}
+
+// Запрос с повтором: сеть или сервер иногда сбоят на секунду.
+int httpGetRetry(const String& url, String& body) {
+  int code = httpGetText(url, body);
+  for (int k = 0; k < 2 && code != 200 && code != 400 && code != 404; k++) {
+    delay(800 + 1200 * k);
+    code = httpGetText(url, body);
+  }
+  return code;
 }
 
 // Текст с прокруткой; удержание кнопки сохраняет его в «Сохранённое».
@@ -5426,7 +5454,7 @@ bool chooseCity() {
   showMsg(L3("Ищу город...", "Looking up the city...", "正在查找城市……"), C_YELLOW);
   const char* lang = cfgLang == LANG_RU ? "ru" : cfgLang == LANG_ZH ? "zh" : "en";
   String body;
-  int code = httpGetText(fromStd(tools::geoUrl(toStd(q), lang)), body);
+  int code = httpGetRetry(fromStd(tools::geoUrl(toStd(q), lang)), body);
   tools::Place pl;
   if (code != 200) {
     viewAnswer(httpErr(code, body), C_RED);
@@ -5459,7 +5487,7 @@ void runWeather() {
     if (!waitWifi(false)) return;
     showMsg(L3("Узнаю погоду...", "Getting the weather...", "正在获取天气……"), C_YELLOW);
     String body;
-    int code = httpGetText(fromStd(tools::forecastUrl(cfgLat, cfgLon)), body);
+    int code = httpGetRetry(fromStd(tools::forecastUrl(cfgLat, cfgLon)), body);
     tools::Forecast f;
     if (code != 200 || !tools::parseForecast(toStd(body), f)) {
       viewAnswer(code != 200 ? httpErr(code, body) : String(T().errBadReply), C_RED);
