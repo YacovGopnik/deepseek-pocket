@@ -1421,13 +1421,17 @@ void sdBusOn() {
   if (sdDepth++ > 0) return;
   spi_t* b = SPI.bus();
   SD_STAGE(1);
+  // У экрана нет CS: любой лишний фронт на SCK сдвигает ему байты, и он перестаёт понимать команды
+  // до сброса. В режиме 3 такт в покое = 1, поэтому вывод заранее держим в 1 - фронта не будет.
+  gpio_set_level((gpio_num_t)PIN_SCK, 1);
+  gpio_set_level((gpio_num_t)PIN_MOSI, 1);
   spiDetachSCK(b);
   spiDetachMOSI(b);
   SD_STAGE(2);
-  pinMode(PIN_SCK, OUTPUT);                          // экран без CS: держим его линии в покое
-  digitalWrite(PIN_SCK, LOW);
+  pinMode(PIN_SCK, OUTPUT);
+  digitalWrite(PIN_SCK, HIGH);
   pinMode(PIN_MOSI, OUTPUT);
-  digitalWrite(PIN_MOSI, LOW);
+  digitalWrite(PIN_MOSI, HIGH);
   SD_STAGE(3);
   spiAttachSCK(b, SD_SCK);
   spiAttachMISO(b, SD_MISO);
@@ -1445,6 +1449,7 @@ void sdBusOff() {
   SD_STAGE(6);
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
+  spiSetDataMode(b, SPI_MODE3);                      // карта работала в режиме 0 (такт в покое 0) - вернуть 1 до подключения экрана
   spiAttachSCK(b, PIN_SCK);
   spiAttachMOSI(b, PIN_MOSI);
   SD_STAGE(7);
