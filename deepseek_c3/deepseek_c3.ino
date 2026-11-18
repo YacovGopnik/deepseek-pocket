@@ -72,6 +72,27 @@
 #ifndef ENABLE_BLE
 #define ENABLE_BLE 0
 #endif
+// Сборка «с Bluetooth» (ENABLE_BLE 1) не помещается целиком: в ней нет части приложений (ниже).
+// Полная сборка - всё, кроме Bluetooth. Обе собирает GitHub; на гаджете: Настройки -> Обновление -> Сменить сборку.
+#define FULL_EDITION (!ENABLE_BLE)
+#ifndef ENABLE_WEBIMG
+#define ENABLE_WEBIMG FULL_EDITION                   // картинки из интернета (галерея с телефона есть всегда)
+#endif
+#ifndef ENABLE_CHESS
+#define ENABLE_CHESS FULL_EDITION
+#endif
+#ifndef ENABLE_BIGGAMES
+#define ENABLE_BIGGAMES FULL_EDITION                 // Подземелье 3D, Гонки, Райдер
+#endif
+#ifndef ENABLE_AIGAMES
+#define ENABLE_AIGAMES FULL_EDITION                  // Викторина и История с DeepSeek
+#endif
+#ifndef ENABLE_IR
+#define ENABLE_IR FULL_EDITION                       // ИК-пульт (GPIO8)
+#endif
+#ifndef ENABLE_TORCH
+#define ENABLE_TORCH FULL_EDITION                    // фонарик (GPIO2)
+#endif
 #if ENABLE_BLE
 #include "ble_link.h"
 #else
@@ -1773,6 +1794,13 @@ void buildScanList() {
 }
 
 void viewAnswer(const String& utf8, uint16_t fg);
+// Приложение есть только в полной сборке.
+void notInEdition() {
+  viewAnswer(L3("Этого нет в сборке «с Bluetooth»: она не вмещает всё. Полная сборка: Настройки -> Обновление -> Сменить сборку.",
+                "Not available in the Bluetooth edition: it cannot hold everything. Full edition: Settings -> Update -> Switch edition.",
+                "蓝牙版不包含此功能。完整版：设置 -> 更新 -> 切换版本。"),
+             C_YELLOW);
+}
 // Точка доступа + страница настройки. Возвращается при отмене кнопкой,
 // после сохранения перезапускает плату.
 void runPortal() {
@@ -3405,6 +3433,10 @@ void drawRaceBar(const race::Game& rg, const char* msg, uint16_t msgCol) {
 }
 
 void runRace() {
+  if (!ENABLE_BIGGAMES) {
+    notInEdition();
+    return;
+  }
   // кадр и трасса берут ~45 КБ памяти - только на время игры
   uint16_t* fb = (uint16_t*)malloc(race::W * race::H * sizeof(uint16_t));
   race::Game* rg = new race::Game();
@@ -4408,6 +4440,10 @@ void showImage(const std::vector<pixabay::Hit>& hits, int i) {
 }
 
 void runImages() {
+  if (!ENABLE_WEBIMG) {
+    notInEdition();
+    return;
+  }
   struct FreeLast {                                  // при выходе освобождаем память последней картинки
     ~FreeLast() {
       if (lastJpg) free(lastJpg);
@@ -6490,6 +6526,10 @@ bool runRemoteDownload() {
 }
 
 void runRemote() {
+  if (!ENABLE_IR) {
+    notInEdition();
+    return;
+  }
   int sel = 0;
   for (;;) {
     std::vector<int> slots;
@@ -6577,6 +6617,7 @@ class OtaSink : public Stream {
 };
 
 // Проверить и поставить обновление из интернета. Возвращает текст для показа (при успехе плата перезапускается).
+bool otaSwitch = false;                              // true - поставить другую сборку (полная <-> с Bluetooth)
 bool otaNoAsk = false;                               // true - не спрашивать «Обновить?» (обновление по просьбе админа)
 String otaFromInternet() {
   if (!waitWifi(false)) return "";
@@ -6589,10 +6630,17 @@ String otaFromInternet() {
            L3("). Можно обновиться с телефона.", "). You can update from your phone.", "）。可以从手机更新。");
   body.trim();
   int remote = atoi(body.c_str());
-  if (remote <= FW_VERSION)
+  bool wantBle = otaSwitch ? !ENABLE_BLE : ENABLE_BLE;
+  const char* fwFile = wantBle ? "firmware-ble.bin" : "firmware.bin";
+  if (!otaSwitch && remote <= FW_VERSION)
     return String(L3("У вас последняя версия: ", "You have the latest version: ", "已是最新版本：")) + String(FW_VERSION);
   std::vector<String> yn = splitBar(L3("Обновить|Не сейчас", "Update|Not now", "更新|以后再说"));
-  if (!otaNoAsk && choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
+  if (otaSwitch && choiceScreen(String(wantBle ? L3("Поставить сборку «с Bluetooth» (без части игр, картинок из интернета, ИК-пульта и фонарика)? ",
+                                                   "Install the Bluetooth edition (without some games, web images, IR remote and torch)? ", "安装蓝牙版？")
+                                               : L3("Поставить полную сборку (без Bluetooth)? ", "Install the full edition (no Bluetooth)? ", "安装完整版（无蓝牙）？")) +
+                                    L3("Настройки сохранятся.", "Settings are kept.", "设置会保留。"), yn) != 0)
+    return "";
+  if (!otaSwitch && !otaNoAsk && choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
                    L3("). Не выключайте гаджет, пока идёт обновление.", "). Do not switch the device off during the update.", "）。更新时请勿关机。"), yn) != 0)
     return "";
   showMsg(L3("Скачиваю прошивку...", "Downloading the firmware...", "正在下载固件……"), C_YELLOW);
@@ -6604,7 +6652,7 @@ String otaFromInternet() {
   http.setConnectTimeout(15000);
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, base + "firmware.bin")) return "begin";
+  if (!http.begin(client, base + fwFile)) return "begin";
   code = http.GET();
   int len = http.getSize();
   if (code != 200 || len < 100000) {
@@ -6693,12 +6741,19 @@ void handleFwDone() {
 
 void runUpdate() {
   for (;;) {
-    std::vector<String> o = splitBar(L3("Проверить в интернете|С телефона (файл .bin)|Назад", "Check online|From phone (.bin file)|Back", "联网检查|从手机（.bin文件）|返回"));
-    int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION), o);
-    if (k == 0) {
+    std::vector<String> o = splitBar(ENABLE_BLE ? L3("Проверить в интернете|Сменить на полную сборку|С телефона (файл .bin)|Назад",
+                                                     "Check online|Switch to the full edition|From phone (.bin file)|Back", "联网检查|切换到完整版|从手机（.bin文件）|返回")
+                                                : L3("Проверить в интернете|Сменить на сборку с Bluetooth|С телефона (файл .bin)|Назад",
+                                                     "Check online|Switch to the Bluetooth edition|From phone (.bin file)|Back", "联网检查|切换到蓝牙版|从手机（.bin文件）|返回"));
+    int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION) +
+                             (ENABLE_BLE ? L3(", сборка с Bluetooth", ", Bluetooth edition", "，蓝牙版") : L3(", полная сборка", ", full edition", "，完整版")),
+                         o);
+    if (k == 0 || k == 1) {
+      otaSwitch = k == 1;
       String msg = otaFromInternet();
+      otaSwitch = false;
       if (msg.length()) viewAnswer(msg, C_WHITE);
-    } else if (k == 1) {
+    } else if (k == 2) {
       viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет раздел «Обновление прошивки» - выберите там файл .bin. "
                     "Чтобы отменить - нажмите кнопку на устройстве.",
                     "The device will now create a Wi-Fi network. Join it from your phone; the \"Firmware update\" section is at the bottom of the page. "
@@ -7399,6 +7454,10 @@ bool runSettings() {
         saveScreenSettings();
         break;
       case 7:
+        if (!ENABLE_TORCH) {
+          notInEdition();
+          break;
+        }
         torchOn = !torchOn;                          // после перезапуска фонарик всегда выключен
         digitalWrite(PIN_LED, torchOn ? HIGH : LOW);
         break;
@@ -8214,6 +8273,10 @@ void drawRiderBar(bool full) {
 }
 
 void runRider() {
+  if (!ENABLE_BIGGAMES) {
+    notInEdition();
+    return;
+  }
   rdr.best = loadBestKey("brider");
   for (;;) {
     rdr.reset();
@@ -8498,6 +8561,10 @@ void f3Hud(bool full) {
 }
 
 void runFps3d() {
+  if (!ENABLE_BIGGAMES) {
+    notInEdition();
+    return;
+  }
   static bool inited = false;
   if (!inited) {
     f3Init();
@@ -9012,6 +9079,10 @@ chess::Move chessOpponentMove(int opp, String& say) {
 }
 
 void runChess() {
+  if (!ENABLE_CHESS) {
+    notInEdition();
+    return;
+  }
   int opp = 2;
   prefs.begin("dsk", true);
   String saved = prefs.getString("chfen", "");
@@ -9206,6 +9277,10 @@ void keepLast(std::vector<ChatMsg>& h, size_t n) {
 
 // ---------- Викторина: 10 вопросов на выбранную тему ----------
 void runQuiz() {
+  if (!ENABLE_AIGAMES) {
+    notInEdition();
+    return;
+  }
   if (!waitWifi(false)) return;                       // без связи эти игры не работают
   String topic = chooseTopic(T().topicTitle, T().quizTopics);
   if (!topic.length()) return;
@@ -9243,6 +9318,10 @@ void runQuiz() {
 
 // ---------- Приключение: DeepSeek ведёт историю, вы выбираете действия ----------
 void runStory() {
+  if (!ENABLE_AIGAMES) {
+    notInEdition();
+    return;
+  }
   if (!waitWifi(false)) return;                       // без связи эти игры не работают
   String genre = chooseTopic(T().genreTitle, T().storyGenres);
   if (!genre.length()) return;
@@ -9543,6 +9622,7 @@ void homeApps(std::vector<uint8_t>& apps) {
     if (a == A_ADMIN && !admOn) continue;
     if ((a == A_IMAGES || a == A_GALLERY) && !ENABLE_IMAGES) continue;
     if (a == A_BT && !ENABLE_BLE) continue;
+    if ((a == A_REMOTE && !ENABLE_IR) || (a == A_IMAGES && !ENABLE_WEBIMG)) continue;
     apps.push_back((uint8_t)a);
   }
 }
