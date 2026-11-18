@@ -1596,18 +1596,37 @@ uint8_t* picLoad(int slot, size_t& n) {
   return buf;
 }
 
-int picCount() {
+// Номера всех картинок по возрастанию. Папка читается один раз: проверять 99 файлов по одному
+// на SD-карте долго (каждая проверка - поиск по FAT), отсюда и были паузы при открытии галереи.
+void picSlots(std::vector<int>& out) {
+  out.clear();
   PicBus b;
-  int n = 0;
+  std::vector<bool> has(picMax(), false);
+  File dir = picFs().open(sdOk ? "/pics" : "/");
+  if (dir && dir.isDirectory()) {
+    for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
+      const char* nm = e.name();
+      const char* sl = strrchr(nm, '/');
+      if (sl) nm = sl + 1;
+      int i = -1;
+      if (!e.isDirectory() && sscanf(nm, "pic%d.jpg", &i) == 1 && i >= 0 && i < picMax() && e.size() > 0) has[i] = true;
+    }
+  }
   for (int i = 0; i < picMax(); i++)
-    if (picExists(i)) n++;
-  return n;
+    if (has[i]) out.push_back(i);
+}
+
+int picCount() {
+  std::vector<int> v;
+  picSlots(v);
+  return (int)v.size();
 }
 
 int picFreeSlot() {
-  PicBus b;
+  std::vector<int> v;
+  picSlots(v);
   for (int i = 0; i < picMax(); i++)
-    if (!picExists(i)) return i;
+    if (i >= (int)v.size() || v[i] != i) return i;  // первый пропуск в нумерации
   return -1;
 }
 
@@ -1894,7 +1913,7 @@ void handleRoot() {
   h += L3("Открыть эту страницу в Chrome", "Open this page in Chrome", "在Chrome中打开此页面");
   h += "</a></p>";
   h += "<input type='file' id='pf' accept='image/*' multiple><p><small id='ps'>";
-  h += L3("В галерее: ", "In the gallery: ", "相册中："); h += String(picCount()); h += " / 30</small></p>";
+  h += L3("В галерее: ", "In the gallery: ", "相册中："); h += String(picCount()); h += " / "; h += String(picMax()); h += "</small></p>";
   h += "<script>var T1='"; h += L3("Отправляю", "Sending", "正在发送");
   h += "',T2='"; h += L3("Загружено картинок: ", "Pictures uploaded: ", "已上传图片：");
   h += "',T3='"; h += L3("Не получилось: ", "Failed: ", "失败：");
@@ -4760,11 +4779,7 @@ void runGallery() {
   int pos = 0;
   for (;;) {
     std::vector<int> slots;
-    {
-      PicBus b;
-      for (int i = 0; i < picMax(); i++)
-        if (picExists(i)) slots.push_back(i);
-    }
+    picSlots(slots);
     if (slots.empty()) {
       std::vector<String> o = splitBar(L3("Загрузить с телефона|Назад", "Upload from phone|Back", "从手机上传|返回"));
       int k = choiceScreen(L3("В галерее пока пусто. Картинки загружаются с телефона или сохраняются из поиска картинок.",
@@ -4872,11 +4887,7 @@ bool makeAvatar(int slot, uint8_t* out) {
 
 bool pickAvatar() {
   std::vector<int> slots;
-  {
-    PicBus b;
-    for (int i = 0; i < picMax(); i++)
-      if (picExists(i)) slots.push_back(i);
-  }
+  picSlots(slots);
   std::vector<String> o = splitBar(L3("Выбрать из галереи|Убрать аватарку|Назад", "Choose from the gallery|Remove the avatar|Back", "从相册选择|移除头像|返回"));
   int k = choiceScreen(L3("Аватарка", "Avatar", "头像"), o);
   if (k == 1) {
