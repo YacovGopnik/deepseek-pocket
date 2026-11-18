@@ -43,12 +43,18 @@ jobs:
             --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs" \
             --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER" \
             --output-dir out deepseek_c3
-          ls -la out
+          # Сборка «с Bluetooth»: без части приложений, иначе не помещается
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=$VER -DENABLE_BLE=1" \
+            --build-path build-ble --output-dir out-ble deepseek_c3
+          ls -la out out-ble
 
       - name: Publish firmware
         run: |
           mkdir -p firmware
           cp out/deepseek_c3.ino.bin firmware/firmware.bin
+          cp out-ble/deepseek_c3.ino.bin firmware/firmware-ble.bin
           echo "$VER" > firmware/version.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
