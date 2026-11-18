@@ -1450,8 +1450,15 @@ bool sdMount() {
   if (!cfgSd) return false;
   uint32_t t0 = millis();
   SdBus b;
-  // 8 МГц: на проводах и через преобразователь уровней модуля надёжнее, чем 20 МГц
-  sdOk = SD.begin(SD_CS, SPI, 8000000, "/sd", 4);
+  // 8 МГц: на проводах и через преобразователь уровней модуля надёжнее, чем 20 МГц.
+  // Первая попытка после включения часто не удаётся - карте нужно время, поэтому пробуем дважды.
+  for (int k = 0; k < 2 && !sdOk; k++) {
+    if (k) {
+      SD.end();
+      delay(200);
+    }
+    sdOk = SD.begin(SD_CS, SPI, 8000000, "/sd", 4);
+  }
   if (sdOk) {
     SD.mkdir("/pics");
     SD.mkdir("/fw");
@@ -10135,6 +10142,13 @@ void runHome() {
   }
 }
 
+// Строка состояния на заставке: видно, на каком шаге запуск (если что-то зависнет).
+void bootStage(const char* t) {
+  SmallFont small;
+  tft.fillRect(0, 214, 240, 20, C_BLACK);
+  drawUtf8(t, 120 - textWidth(t) / 2, 216, C_LIGHT, C_BLACK);
+}
+
 // Заставка при включении.
 void drawBoot() {
   tft.fillScreen(C_BLACK);
@@ -10198,9 +10212,16 @@ void setup() {
     }
     prefs.end();
   }
-  sdMount();
+  if (cfgSd) {
+    bootStage("SD: 1/3");
+    { SdBus test; }                                  // переключение шины туда-обратно: экран должен остаться живым
+    bootStage("SD: 2/3");
+    sdMount();
+    bootStage(sdOk ? "SD: 3/3 ok" : "SD: 3/3 -");
+  }
   Serial.printf("4: learned words: %u\n", (unsigned)sugg.learnedCount());
 
+  bootStage("Wi-Fi");
   if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
   wifiStart();                                       // дальше Wi-Fi подключается в фоне
   if (ENABLE_BLE && cfgBle) {                        // Bluetooth включён в настройках
