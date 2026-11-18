@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek pocket — экран ПК</title>
+<style>
+  :root { --bg: #f4f5f7; --card: #fff; --text: #1d2228; --muted: #69727d; --accent: #2b67f6; --ok: #1f9d55; --err: #d64545; --line: #dfe3e8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171b; --card: #1d2127; --text: #e9edf1; --muted: #98a1ab; --accent: #6b9bff; --ok: #4cc785; --err: #ff7b7b; --line: #2d333b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 10px 14px; background: var(--accent); color: #fff; cursor: pointer; }
+  button.sec { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  select, input[type=range] { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  #state { color: var(--muted); margin-left: 10px; }
+  #state.ok { color: var(--ok); }
+  #state.err { color: var(--err); }
+  .hint, small { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 1fr 260px; gap: 12px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+  #preview { width: 240px; height: 240px; background: #000; border-radius: 8px; image-rendering: pixelated; display: block; }
+  #drop { border: 2px dashed var(--line); border-radius: 12px; padding: 18px; text-align: center; color: var(--muted); cursor: pointer; }
+  #drop.over { border-color: var(--accent); color: var(--accent); }
+  #log { font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); max-height: 120px; overflow: auto; white-space: pre-wrap; }
+  #fps { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DeepSeek в кармане — экран ПК</h1>
+
+  <div class="card">
+    <button id="connect">Подключить</button><span id="state">не подключено</span>
+    <p class="hint">Нужен Chrome или Edge на компьютере. Гаджет подключите по USB и откройте на нём приложение <b>«Экран ПК»</b>. Монитор порта в Arduino IDE должен быть закрыт: порт может занять только одна программа.</p>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>Картинка</h2>
+        <div id="drop">Перетащите картинку сюда, вставьте (Ctrl+V) или нажмите, чтобы выбрать файл</div>
+        <input id="file" type="file" accept="image/*" hidden>
+        <div class="row">
+          <button id="show" disabled>Показать на гаджете</button>
+          <button id="save" class="sec" disabled>Сохранить в галерею</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Трансляция экрана</h2>
+        <p class="hint" style="margin-top:0">Гаджет показывает окно, вкладку или весь экран компьютера.</p>
+        <div class="row">
+          <button id="cast" disabled>Начать трансляцию</button>
+          <span id="fps" class="hint"></span>
+        </div>
+        <div class="row">
+          <label>Кадров в секунду <select id="rate"><option>2</option><option>5</option><option selected>10</option><option>20</option></select></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="margin-top:0">
+          <label>Размещение <select id="fit"><option value="contain">вписать целиком</option><option value="cover">заполнить экран (обрезать края)</option></select></label>
+          <label>Качество <input id="q" type="range" min="30" max="95" value="70"></label>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <small>Так будет на гаджете</small>
+        <canvas id="preview" width="240" height="240"></canvas>
+      </div>
+      <div class="card">
+        <small>Журнал</small>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let port = null, writer = null, ready = false, busy = false;
+let pending = null;                // ожидание ответа гаджета
+let picture = null;                // выбранная картинка (ImageBitmap)
+let stream = null, video = null, casting = false;
+
+function log(s) {
+  const el = $("log");
+  el.textContent = (new Date().toLocaleTimeString() + "  " + s + "\n" + el.textContent).slice(0, 4000);
+}
+function setState(t, cls) {
+  $("state").textContent = t;
+  $("state").className = cls || "";
+  const can = !!writer;
+  $("show").disabled = $("save").disabled = !(can && picture);
+  $("cast").disabled = !can && !casting;
+}
+
+// ---------- связь ----------
+async function connect() {
+  if (!("serial" in navigator)) {
+    setState("этот браузер не умеет работать с USB-портом — откройте страницу в Chrome или Edge на компьютере", "err");
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
+    await port.open({ baudRate: 115200, bufferSize: 8192 });
+    // DTR=1, RTS=0: так ESP32-C3 не перезагружается при подключении
+    await port.setSignals({ dataTerminalReady: true, requestToSend: false }).catch(() => {});
+    writer = port.writable.getWriter();
+    ready = false;
+    setState("подключено — откройте на гаджете «Экран ПК»", "");
+    log("порт открыт");
+    readLoop();
+  } catch (e) {
+    setState("не получилось: " + e.message, "err");
+  }
+}
+
+async function readLoop() {
+  const dec = new TextDecoder();
+  let part = "";
+  const reader = port.readable.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      part += dec.decode(value, { stream: true });
+      let i;
+      while ((i = part.indexOf("\n")) >= 0) {
+        const line = part.slice(0, i).replace(/\r$/, "");
+        part = part.slice(i + 1);
+        onLine(line);
+      }
+      if (part.length > 2000) part = "";
+    }
+  } catch (e) {
+    log("связь потеряна: " + e.message);
+  }
+  reader.releaseLock();
+  writer = null;
+  ready = false;
+  stopCast();
+  setState("отключено", "err");
+}
+
+function onLine(line) {
+  const i = line.indexOf("DSPC ");
+  if (i < 0) return;                                  // прочие строки - журнал прошивки
+  const msg = line.slice(i + 5);
+  if (msg.startsWith("READY")) {
+    if (!ready) { ready = true; setState("гаджет готов", "ok"); log("гаджет готов"); }
+    return;
+  }
+  if (msg.startsWith("BYE")) {
+    ready = false;
+    setState("на гаджете закрыли «Экран ПК»", "");
+    log("гаджет вышел из приложения");
+    if (pending) { pending.reject(new Error("гаджет вышел из приложения")); pending = null; }
+    return;
+  }
+  if (pending) { const p = pending; pending = null; clearTimeout(p.t); p.resolve(msg); }
+}
+
+function waitReply(ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { pending = null; reject(new Error("гаджет не отвечает")); }, ms);
+    pending = { resolve, reject, t };
+  });
+}
+
+// Отправить JPEG. save=true - ещё и сохранить в галерею гаджета.
+async function sendJpeg(bytes, save) {
+  if (!writer) throw new Error("не подключено");
+  const head = new Uint8Array(9);
+  head.set([0x44, 0x53, 0x4a, 0x31]);                 // "DSJ1"
+  new DataView(head.buffer).setUint32(4, bytes.length, true);
+  head[8] = save ? 1 : 0;
+  let r = waitReply(1500);
+  await writer.write(head);
+  let msg = await r;
+  if (msg !== "GO") throw new Error(msg.replace(/^ERR /, ""));
+  for (let off = 0; off < bytes.length; off += 2048) {
+    const end = Math.min(off + 2048, bytes.length);
+    r = waitReply(3000);
+    await writer.write(bytes.subarray(off, end));
+    msg = await r;
+    if (end < bytes.length && msg !== "A") throw new Error(msg.replace(/^ERR /, ""));
+  }
+  if (msg.startsWith("ERR")) throw new Error(msg.slice(4));
+  return msg;
+}
+
+// ---------- картинка ----------
+function drawFit(ctx, src, sw, sh, W, H) {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  const k = $("fit").value === "cover" ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
+  const w = sw * k, h = sh * k;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, (W - w) / 2, (H - h) / 2, w, h);
+}
+
+async function toJpeg(canvas, quality) {
+  const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", quality));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+function renderPicture(W, H) {
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  drawFit(c.getContext("2d"), picture, picture.width, picture.height, W, H);
+  return c;
+}
+
+function updatePreview() {
+  if (!picture || casting) return;
+  const ctx = $("preview").getContext("2d");
+  ctx.drawImage(renderPicture(240, 240), 0, 0);
+}
+
+async function setPicture(fileOrBlob) {
+  try {
+    picture = await createImageBitmap(fileOrBlob);
+    updatePreview();
+    setState($("state").textContent, $("state").className);
+    log("картинка " + picture.width + "×" + picture.height);
+  } catch (e) {
+    log("это не картинка");
+  }
+}
+
+async function showPicture(save) {
+  if (!picture || busy) return;
+  busy = true;
+  try {
+    // галерея гаджета показывает картинки 240×200 и хранит файлы до 40 КБ
+    const c = save ? renderPicture(240, 200) : renderPicture(240, 240);
+    let q = $("q").value / 100, bytes = await toJpeg(c, q);
+    while (bytes.length > (save ? 38000 : 58000) && q > 0.2) { q -= 0.1; bytes = await toJpeg(c, q); }
+    const res = await sendJpeg(bytes, save);
+    log(res === "SAVED" ? "сохранено в галерею (" + Math.round(bytes.length / 1024) + " КБ)" : "показано (" + Math.round(bytes.length / 1024) + " КБ)");
+  } catch (e) {
+    log("ошибка: " + e.message);
+  }
+  busy = false;
+}
+
+// ---------- трансляция ----------
+async function startCast() {
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+  } catch (e) {
+    log("трансляция отменена");
+    return;
+  }
+  video = document.createElement("video");
+  video.srcObject = stream;
+  video.muted = true;
+  await video.play();
+  stream.getVideoTracks()[0].addEventListener("ended", stopCast);
+  casting = true;
+  $("cast").textContent = "Остановить трансляцию";
+  log("трансляция началась");
+  castLoop();
+}
+
+function stopCast() {
+  if (!casting) return;
+  casting = false;
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  $("cast").textContent = "Начать трансляцию";
+  $("fps").textContent = "";
+  log("трансляция остановлена");
+  setState($("state").textContent, $("state").className);
+}
+
+async function castLoop() {
+  const c = $("preview"), ctx = c.getContext("2d");
+  let frames = 0, t0 = performance.now();
+  while (casting) {
+    const start = performance.now();
+    if (video.videoWidth && writer && ready) {
+      drawFit(ctx, video, video.videoWidth, video.videoHeight, 240, 240);
+      try {
+        await sendJpeg(await toJpeg(c, $("q").value / 100), false);
+        frames++;
+      } catch (e) {
+        log("кадр не дошёл: " + e.message);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    } else {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    const now = performance.now();
+    if (now - t0 > 1000) { $("fps").textContent = (frames * 1000 / (now - t0)).toFixed(1) + " кадр/с"; frames = 0; t0 = now; }
+    const wait = 1000 / +$("rate").value - (performance.now() - start);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
+// ---------- кнопки ----------
+$("connect").onclick = connect;
+$("show").onclick = () => showPicture(false);
+$("save").onclick = () => showPicture(true);
+$("cast").onclick = () => (casting ? stopCast() : startCast());
+$("fit").onchange = updatePreview;
+$("drop").onclick = () => $("file").click();
+$("file").onchange = (e) => e.target.files[0] && setPicture(e.target.files[0]);
+$("drop").ondragover = (e) => { e.preventDefault(); $("drop").classList.add("over"); };
+$("drop").ondragleave = () => $("drop").classList.remove("over");
+$("drop").ondrop = (e) => {
+  e.preventDefault();
+  $("drop").classList.remove("over");
+  const f = e.dataTransfer.files[0];
+  if (f) setPicture(f);
+};
+document.addEventListener("paste", (e) => {
+  for (const it of e.clipboardData.items) if (it.type.startsWith("image/")) { setPicture(it.getAsFile()); break; }
+});
+if ("serial" in navigator) navigator.serial.addEventListener("disconnect", () => log("гаджет отключён от USB"));
+setState("не подключено");
+</script>
+</body>
+</html>

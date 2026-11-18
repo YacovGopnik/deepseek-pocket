@@ -10,6 +10,7 @@ on:
       - '**.md'
       - 'room.html'
       - 'ble.html'
+      - 'pc.html'
       - 'hardware/**'
   workflow_dispatch:
 

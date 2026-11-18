@@ -9850,6 +9850,148 @@ void runGamesMenu() {
   }
 }
 
+// ========================= ЭКРАН ПК (картинки с компьютера по USB) =========================
+// На компьютере страница pc.html в Chrome пишет в USB-порт гаджета (Web Serial).
+// ПК -> "DSJ1" + длина JPEG (4 байта, младший первым) + флаги (1 = ещё и сохранить в галерею);
+// гаджет -> "DSPC GO"; ПК шлёт JPEG кусками по 2048 байт, после каждого куска кроме последнего гаджет
+// отвечает "DSPC A"; в конце "DSPC OK" / "DSPC SAVED" / "DSPC ERR <причина>".
+// Пока открыто приложение, гаджет раз в 2 с пишет "DSPC READY 240 240".
+const size_t PC_CHUNK = 2048, PC_MAX = 60000;
+
+bool pcJpgOut(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+  if (y >= 240 || x >= 240 || x + (int)w <= 0 || y + (int)h <= 0) return true;
+  int x0 = x < 0 ? 0 : x, x1 = x + w > 240 ? 240 : x + w;
+  int y0 = y < 0 ? 0 : y, y1 = y + h > 240 ? 240 : y + h;
+  tft.startWrite();
+  tft.setAddrWindow(x0, y0, x1 - x0, y1 - y0);
+  for (int yy = y0; yy < y1; yy++) tft.writePixels(bmp + (yy - y) * w + (x0 - x), (uint32_t)(x1 - x0), true);
+  tft.endWrite();
+  return true;
+}
+
+// Прочитать ровно n байт; ms - сколько ждать, если данные перестали приходить.
+bool pcRead(uint8_t* dst, size_t n, uint32_t ms) {
+  size_t got = 0;
+  uint32_t t = millis();
+  while (got < n) {
+    int a = Serial.available();
+    if (a > 0) {
+      got += Serial.read(dst + got, n - got < (size_t)a ? n - got : (size_t)a);
+      t = millis();
+    } else if (millis() - t > ms) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
+}
+
+void pcIntro() {
+  tft.fillScreen(C_BLACK);
+  SmallFont small;
+  drawUtf8(L3("Экран ПК", "PC screen", "电脑屏幕"), 8, 10, C_WHITE, C_BLACK);
+  drawUtf8(L3("1. Подключите USB к ПК.", "1. Plug USB into the PC.", "1. 用USB连接电脑。"), 8, 44, C_LIGHT, C_BLACK);
+  drawUtf8(L3("2. На ПК откройте в Chrome:", "2. On the PC open in Chrome:", "2. 在电脑的Chrome中打开："), 8, 66, C_LIGHT, C_BLACK);
+  drawUtf8("yacovgopnik.github.io/", 8, 90, C_YELLOW, C_BLACK);
+  drawUtf8("deepseek-pocket/pc.html", 8, 108, C_YELLOW, C_BLACK);
+  drawUtf8(L3("3. Нажмите «Подключить» и", "3. Press Connect and pick", "3. 点“连接”，"), 8, 134, C_LIGHT, C_BLACK);
+  drawUtf8(L3("выберите порт гаджета.", "the gadget's port.", "选择设备端口。"), 8, 152, C_LIGHT, C_BLACK);
+  drawUtf8(L3("Нажатие ручки - выход", "Press the stick to leave", "按下摇杆退出"), 8, 214, C_LIGHT, C_BLACK);
+}
+
+// Принять один кадр (метка "DSJ1" уже прочитана).
+void pcFrame(int& lastW, int& lastH) {
+  uint8_t hdr[5];
+  if (!pcRead(hdr, 5, 500)) {
+    Serial.println("DSPC ERR header");
+    return;
+  }
+  uint32_t n = hdr[0] | (hdr[1] << 8) | ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+  uint8_t flags = hdr[4];
+  if (n < 100 || n > PC_MAX) {
+    Serial.println("DSPC ERR size");
+    return;
+  }
+  uint8_t* buf = (uint8_t*)malloc(n);
+  if (!buf) {
+    Serial.println("DSPC ERR memory");
+    return;
+  }
+  Serial.println("DSPC GO");
+  size_t got = 0;
+  while (got < n) {
+    size_t k = n - got < PC_CHUNK ? n - got : PC_CHUNK;
+    if (!pcRead(buf + got, k, 1500)) {
+      free(buf);
+      Serial.println("DSPC ERR timeout");
+      return;
+    }
+    got += k;
+    if (got < n) Serial.println("DSPC A");
+  }
+  if (screenAsleep) wakeScreen();
+  noteActivity();
+  uint16_t w = 0, h = 0;
+  bool jpeg = buf[0] == 0xFF && buf[1] == 0xD8;
+  if (jpeg) TJpgDec.getJpgSize(&w, &h, buf, n);
+  int sc = 1;
+  while (sc < 8 && ((int)w / sc > 240 || (int)h / sc > 240)) sc *= 2;
+  int dw = w / sc, dh = h / sc;
+  if (dw != lastW || dh != lastH) tft.fillScreen(C_BLACK);   // новый размер - убрать остатки прошлого кадра
+  lastW = dw;
+  lastH = dh;
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setJpgScale((uint8_t)sc);
+  TJpgDec.setCallback(pcJpgOut);
+  int rc = (jpeg && w && h) ? TJpgDec.drawJpg((240 - dw) / 2, (240 - dh) / 2, buf, n) : -1;
+  TJpgDec.setCallback(jpgOutput);
+  TJpgDec.setJpgScale(1);
+  if (rc != 0) {
+    free(buf);
+    Serial.println("DSPC ERR decode");
+    return;
+  }
+  if (flags & 1) {
+    String err = savePic(buf, n);
+    free(buf);
+    if (err.length()) Serial.println("DSPC ERR " + err);
+    else Serial.println("DSPC SAVED");
+    return;
+  }
+  free(buf);
+  Serial.println("DSPC OK");
+}
+
+void runPcScreen() {
+  pcIntro();
+  KeepAwake awake;
+  static const char MAGIC[4] = {'D', 'S', 'J', '1'};
+  int mi = 0, lastW = -1, lastH = -1;
+  uint32_t lastReady = 0;
+  for (;;) {
+    BtnEvent e = btnEvent();
+    joyEvent();
+    if (e != EV_NONE) break;
+    if (millis() - lastReady > 2000) {
+      Serial.println("DSPC READY 240 240");
+      lastReady = millis();
+    }
+    while (Serial.available() > 0) {
+      int c = Serial.read();
+      if (c == MAGIC[mi]) mi++;
+      else mi = c == 'D' ? 1 : 0;
+      if (mi == 4) {
+        mi = 0;
+        pcFrame(lastW, lastH);
+        lastReady = millis();
+      }
+    }
+    delay(2);
+  }
+  Serial.println("DSPC BYE");
+}
+
 // ========================= ГЛАВНЫЙ ЭКРАН =========================
 void runChat();
 void runAdmin();
@@ -9857,14 +9999,14 @@ void runAdmin();
 // Ручка - выбор (влево/вправо у края - соседняя страница), нажатие - открыть приложение.
 enum AppId : uint8_t {
   A_CHAT, A_ROOM, A_GAMES, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
-  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_SETTINGS, A_ADMIN, A_COUNT
+  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_PCSCR, A_SETTINGS, A_ADMIN, A_COUNT
 };
 const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
-                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Настройки", "Админ"};
+                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Экран ПК", "Настройки", "Админ"};
 const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
-                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "Settings", "Admin"};
+                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "PC screen", "Settings", "Admin"};
 const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
-                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x636F, 0xB0A6};
+                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x2A2F, 0x636F, 0xB0A6};
 const int HOME_TOP = 22, CELL_W = 80, CELL_H = 70, TILE = 46;
 
 const char* appName(int a) { return cfgLang == LANG_RU ? APP_RU[a] : APP_EN[a]; }
@@ -9969,6 +10111,12 @@ void drawAppIcon(int a, int x, int y) {
         tft.drawLine(cx - 1 + k, y + 39, cx + 10 + k, y + 30, W);
         tft.drawLine(cx + 10 + k, y + 30, cx - 10 + k, y + 15, W);
       }
+      break;
+    case A_PCSCR:                                    // монитор на подставке
+      tft.fillRoundRect(x + 6, y + 8, 34, 24, 3, W);
+      tft.fillRect(x + 9, y + 11, 28, 18, col);
+      tft.fillRect(x + 21, y + 32, 4, 5, W);
+      tft.fillRoundRect(x + 14, y + 36, 18, 3, 1, W);
       break;
     case A_SETTINGS:                                 // шестерёнка
       for (int k = 0; k < 8; k++) {
@@ -10094,6 +10242,7 @@ void launchApp(int a) {
     case A_STOPW: runStopwatch(); break;
     case A_REMOTE: runRemote(); break;
     case A_BT: runBluetooth(); break;
+    case A_PCSCR: runPcScreen(); break;
     case A_SETTINGS: runSettings(); break;
     case A_ADMIN: runAdmin(); break;
   }
@@ -10215,6 +10364,7 @@ void drawBoot() {
 void setup() {
   pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик (с SD-картой здесь MOSI карты - тоже безопасно)
   digitalWrite(PIN_LED, LOW);
+  Serial.setRxBufferSize(4096);      // «Экран ПК» присылает картинки кусками по 2 КБ
   Serial.begin(115200);
   delay(3000);                       // время на USB и питание
   Serial.println("1: start");
