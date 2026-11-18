@@ -1449,7 +1449,11 @@ void sdBusOff() {
   SD_STAGE(6);
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
-  spiSetDataMode(b, SPI_MODE3);                      // карта работала в режиме 0 (такт в покое 0) - вернуть 1 до подключения экрана
+  // spiSetDataMode на C3 не применяет режим сразу, поэтому пустая передача в режиме 3 без подключённых выводов:
+  // после неё такт в покое = 1, и подключение экрана не даст лишнего фронта.
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+  SPI.transfer(0xFF);
+  SPI.endTransaction();
   spiAttachSCK(b, PIN_SCK);
   spiAttachMOSI(b, PIN_MOSI);
   SD_STAGE(7);
