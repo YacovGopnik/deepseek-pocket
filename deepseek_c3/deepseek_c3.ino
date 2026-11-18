@@ -67,6 +67,7 @@
 #include "calc.h"
 #include "calc_solve.h"
 #include "admin.h"
+#include "ble_link.h"                              // Bluetooth: телефон, пульт, игры (библиотека NimBLE-Arduino 1.4.x)
 #include "esp_random.h"
 #include "tools.h"
 #include "games2.h"
@@ -743,6 +744,7 @@ int cfgBright = 4;        // яркость: 0..4 (8, 25, 50, 75, 100 %)
 int cfgSound = 1;         // звук: 0 - нет, 1 - только сигналы, 2 - сигналы и щелчки клавиш
 int cfgIdle = 2;          // гасить экран: 0 - нет, 1 - 30 с, 2 - 1 мин, 3 - 2 мин, 4 - 5 мин
 int cfgJoy = 2;           // чувствительность ручки: 0 (надо отклонять до упора) .. 4 (хватает лёгкого наклона)
+int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
 // Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
@@ -803,6 +805,7 @@ void loadSettings() {
   if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
   cfgRot = prefs.getUChar("rot", 0) & 3;
+  cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
   cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
   cfgCity = prefs.getString("city", "");
   cfgLat = prefs.getString("lat", "0").toFloat();
@@ -823,6 +826,7 @@ void saveScreenSettings() {
   prefs.putUChar("joy", (uint8_t)cfgJoy);
   prefs.putUChar("joyiy", (uint8_t)cfgJoyInvY);
   prefs.putUChar("rot", (uint8_t)cfgRot);
+  prefs.putUChar("ble", (uint8_t)cfgBle);
   prefs.putUChar("tz", (uint8_t)(cfgTz + 12));
   prefs.end();
 }
@@ -3495,6 +3499,10 @@ BtnEvent viewText(const String& utf8, uint16_t fg);
 int choiceScreen(const String& header, const std::vector<String>& opts);
 extern String pendingInput;
 
+std::vector<String> bleNotes;                        // уведомления с телефона, ждут показа
+bool bleService();
+void bleSetEnabled(bool on);
+void runTttBle();
 bool g_kbChat = false;                               // следующий inputText - поле вопроса в чате (удержание - меню чата)
 bool g_goHome = false;                               // выбрано «Домой»: выйти из чата на главный экран
 
@@ -3707,6 +3715,27 @@ String inputText() {
       redraw = false;
     }
     if (g_bgTick) g_bgTick();
+    {                                                // текст с телефона по Bluetooth
+      std::string line;
+      bool submit = false;
+      while (!submit && ble::takePhoneLine(line)) {
+        if (line.compare(0, 2, "N:") == 0) {         // уведомление - покажем после
+          bleNotes.push_back(fromStd(line.substr(2)));
+          continue;
+        }
+        bool insertOnly = line.compare(0, 2, "T:") == 0;
+        if (insertOnly || line.compare(0, 2, "S:") == 0) line = line.substr(2);
+        std::vector<uint16_t> cps;
+        utf8ToCps(line.c_str(), cps);
+        text.insert(text.end(), cps.begin(), cps.end());
+        submit = !insertOnly;
+      }
+      if (submit && text.size()) return String(cpsToUtf8(text.data(), text.size()).c_str());
+      if (line.size()) {
+        drawInput(text);
+        refreshSuggestions();
+      }
+    }
     if (admService()) {                              // объявление или команда администратора заняли экран
       redraw = true;
       continue;
@@ -6666,6 +6695,132 @@ void runUpdate() {
 
 // ---------- Меню «Настройки» ----------
 // true - поменялся язык или сеть (нужно перерисовать клавиатуру).
+// ========================= BLUETOOTH =========================
+// Телефон подключается к гаджету «DS-<метка>»: печатает текст, присылает уведомления (страница
+// ble.html в Chrome на Android или приложение Serial Bluetooth Terminal), а гаджет служит пультом
+// для музыки на телефоне. Ещё - игры вдвоём с гаджетом рядом. Bluetooth включается в настройках.
+const char* BLE_PAGE = "yacovgopnik.github.io/deepseek-pocket/ble.html";
+
+void bleSetEnabled(bool on) {
+  if (on) {
+    showMsg(L3("Включаю Bluetooth...", "Turning Bluetooth on...", "正在打开蓝牙……"), C_YELLOW);
+    ble::begin(toStd(roomId));
+  } else {
+    ble::end();
+  }
+  cfgBle = on ? 1 : 0;
+  saveScreenSettings();
+  Serial.printf("Bluetooth %s, heap %u, largest block %u\n", on ? "on" : "off", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+}
+
+// Уведомления и текст с телефона, пришедшие не в поле ввода. true - экран занят.
+bool bleService() {
+  std::string line;
+  while (ble::takePhoneLine(line)) {
+    if (line.compare(0, 2, "N:") == 0 || line.compare(0, 2, "T:") == 0 || line.compare(0, 2, "S:") == 0) line = line.substr(2);
+    if (line.size()) bleNotes.push_back(fromStd(line));
+  }
+  if (bleNotes.empty()) return false;
+  String t = bleNotes.front();
+  bleNotes.erase(bleNotes.begin());
+  wakeScreen();
+  sndMessage();
+  viewAnswer(String(L3("Сообщение с телефона\n\n", "Message from the phone\n\n", "来自手机的消息\n\n")) + t, C_WHITE);
+  ble::sendPhone("OK\n");
+  return true;
+}
+
+void drawRemoteScreen() {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, 240, 28, C_BAR);
+  drawUtf8(L3("Пульт для телефона", "Phone remote", "手机遥控器"), 6, 2, C_WHITE, C_BAR);
+  const int cx = 120, cy = 118;
+  tft.fillCircle(cx, cy, 30, C_SEL);                 // пуск/пауза
+  tft.fillTriangle(cx - 8, cy - 12, cx - 8, cy + 12, cx + 4, cy, C_WHITE);
+  tft.fillRect(cx + 6, cy - 11, 3, 22, C_WHITE);
+  tft.fillRect(cx + 11, cy - 11, 3, 22, C_WHITE);
+  tft.fillTriangle(cx, cy - 72, cx - 14, cy - 50, cx + 14, cy - 50, C_GREEN);    // громче
+  tft.fillTriangle(cx, cy + 72, cx - 14, cy + 50, cx + 14, cy + 50, C_YELLOW);   // тише
+  for (int k = 0; k < 2; k++) {                      // предыдущий / следующий
+    tft.fillTriangle(cx - 52 - k * 12, cy, cx - 40 - k * 12, cy - 10, cx - 40 - k * 12, cy + 10, C_WHITE);
+    tft.fillTriangle(cx + 52 + k * 12, cy, cx + 40 + k * 12, cy - 10, cx + 40 + k * 12, cy + 10, C_WHITE);
+  }
+  SmallFont small;
+  drawUtf8(L3("громче", "vol +", "音量+"), cx + 20, cy - 66, C_LIGHT, C_BLACK);
+  drawUtf8(L3("тише", "vol -", "音量-"), cx + 20, cy + 54, C_LIGHT, C_BLACK);
+  drawUtf8(L3("Нажать - пауза, держать - выход", "Click - pause, hold - exit", "按下：暂停，长按：退出"), 4, 222, C_LIGHT, C_BLACK);
+}
+
+void runPhoneRemote() {
+  if (!ble::active()) bleSetEnabled(true);
+  KeepAwake awake;
+  uint32_t t0 = millis();
+  while (!ble::remoteReady()) {                      // ждём, пока телефон подключит гаджет как пульт
+    if (millis() - t0 < 300 || (millis() - t0) % 4000 < 30)
+      showMsg(String(L3("На телефоне: Настройки -> Bluetooth -> найдите ", "On the phone: Settings -> Bluetooth -> find ", "在手机上：设置 -> 蓝牙 -> 找到 ")) +
+                  "DS-" + roomId +
+                  L3(" и подключитесь (подтвердите сопряжение). Держать кнопку - выход.", " and connect (confirm pairing). Hold the button - exit.",
+                     " 并连接（确认配对）。长按按钮：退出。"),
+              C_YELLOW);
+    if (btnEvent() == EV_LONG) return;
+    delay(20);
+  }
+  sndOk();
+  drawRemoteScreen();
+  for (;;) {
+    if (!ble::remoteReady()) {
+      showMsg(L3("Телефон отключился.", "The phone disconnected.", "手机已断开。"), C_YELLOW);
+      delay(1500);
+      return;
+    }
+    uint8_t j = joyEvent();
+    if (j == J_UP) ble::media(ble::KEY_VOL_UP);
+    else if (j == J_DOWN) ble::media(ble::KEY_VOL_DOWN);
+    else if (j == J_LEFT) ble::media(ble::KEY_PREV);
+    else if (j == J_RIGHT) ble::media(ble::KEY_NEXT);
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (e == EV_CLICK) ble::media(ble::KEY_PLAY);
+    if (j != J_NONE || e == EV_CLICK) beep(2, 2200, 5);
+    noteActivity();
+    delay(10);
+  }
+}
+
+// Приложение «Bluetooth».
+void runBluetooth() {
+  int sel = 0;
+  for (;;) {
+    std::vector<String> items = splitBar(L3("Пульт для телефона|Связь с телефоном|Крестики по Bluetooth|Bluetooth|Назад",
+                                            "Phone remote|Phone link|Tic-tac-toe Bluetooth|Bluetooth|Back", "手机遥控器|手机连接|蓝牙井字棋|蓝牙|返回"));
+    std::vector<String> right(items.size());
+    right[1] = ble::phoneConnected() ? L3("подключён", "connected", "已连接") : "";
+    right[3] = ble::active() ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
+    sel = listScreen((String("Bluetooth  DS-") + roomId).c_str(), items, right, sel);
+    if (sel == 0) {
+      runPhoneRemote();
+    } else if (sel == 1) {
+      if (!ble::active()) bleSetEnabled(true);
+      viewAnswer(String(L3("Гаджет виден по Bluetooth как ", "The device is visible over Bluetooth as ", "设备的蓝牙名称：")) + "DS-" + roomId +
+                     L3(".\n\nНа Android откройте в Chrome страницу\n", ".\n\nOn Android open this page in Chrome:\n", "。\n\n在安卓手机的Chrome中打开：\n") + BLE_PAGE +
+                     L3("\nи нажмите «Подключить». Можно и приложение Serial Bluetooth Terminal (режим Bluetooth LE).\n\n"
+                        "Текст с телефона попадает в поле ввода (например, вопрос DeepSeek) или всплывает как уведомление, если поле ввода не открыто. "
+                        "Строка, начатая с N:, - всегда уведомление; с T: - только вставить, не отправлять.",
+                        "\nand press Connect. The Serial Bluetooth Terminal app (Bluetooth LE mode) works too.\n\n"
+                        "Text from the phone goes into the open input field (e.g. a DeepSeek question) or pops up as a notification. "
+                        "A line starting with N: is always a notification; T: only inserts the text without sending.",
+                        "\n并点击“连接”。也可以用 Serial Bluetooth Terminal 应用（蓝牙LE模式）。\n\n手机发来的文字会进入输入框，或在没有输入框时作为通知弹出。"),
+                 C_WHITE);
+    } else if (sel == 2) {
+      runTttBle();
+    } else if (sel == 3) {
+      bleSetEnabled(!ble::active());
+    } else {
+      return;
+    }
+  }
+}
+
 // ========================= АДМИНИСТРАТОР =========================
 // Админ входит по логину и паролю (Настройки -> Администратор). Из них получается ключ подписи; гаджеты
 // принимают только команды с верной подписью (открытый ключ - ADMIN_PUBKEY в начале скетча).
@@ -6851,7 +7006,7 @@ bool admCountdown(const String& what) {
 // Показать объявление и выполнить команду админа. Вызывается там, где можно занять экран
 // (главный экран, ввод текста, комната). true - экран занят, его нужно перерисовать.
 bool admService() {
-  bool used = false;
+  bool used = bleService();                          // заодно: уведомления с телефона по Bluetooth
   if (admPendingAnn.length()) {
     String t = admPendingAnn;
     admPendingAnn = "";
@@ -7171,9 +7326,9 @@ bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -7190,6 +7345,7 @@ bool runSettings() {
     right[11] = cfgJoyInvY ? L3("обратная", "inverted", "反向") : L3("обычная", "normal", "正常");
     right[12] = admOn ? L3("вы админ", "signed in", "已登录") : "";
     right[13] = String(cfgRot * 90) + "\xC2\xB0";
+    right[14] = cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -7248,6 +7404,9 @@ bool runSettings() {
         break;
       case 12:
         runAdmin();
+        break;
+      case 14:
+        bleSetEnabled(!cfgBle);
         break;
       case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
         cfgRot = (cfgRot + 1) & 3;
@@ -8402,9 +8561,25 @@ void runFps3d() {
 // ========================= КРЕСТИКИ-НОЛИКИ ПО СЕТИ =========================
 // Два гаджета в одной комнате находят друг друга сами. Сообщения идут в <комната>/g:
 // «метка \t имя \t ttt \t команда \t кому \t число».
+bool g_netBle = false;                               // игра идёт по Bluetooth (гаджет-гаджет), а не через сервер
 void netSend(const String& body) {
-  mqWrite(mqtt::publish(roomBase() + "/g", toStd(roomId) + "\t" + toStd(cfgNick) + "\t" + toStd(body)));
+  std::string m = toStd(roomId) + "\t" + toStd(cfgNick) + "\t" + toStd(body);
+  if (g_netBle) ble::gameSend(m);
+  else mqWrite(mqtt::publish(roomBase() + "/g", m));
 }
+
+// Принять новые сообщения игры (по Bluetooth или через сервер) в netInbox.
+void netPump() {
+  if (g_netBle) {
+    std::string m;
+    while (ble::gameTake(m)) netInbox.push_back(m);
+  } else {
+    wifiTick();
+    roomTick();
+  }
+}
+
+bool netLinkUp() { return g_netBle ? ble::gameLinked() : mqUp; }
 
 // Разобрать очередное сообщение игры. false - очередь пуста.
 bool netNext(String& id, String& nick, String& game, String& cmd, String& peer, int& arg) {
@@ -8431,36 +8606,65 @@ bool netNext(String& id, String& nick, String& game, String& cmd, String& peer, 
   return false;
 }
 
-void runTttNet() {
-  if (inRoom) return;
-  if (!waitWifi(false)) return;
-  if (!cfgNick.length() && !askNick()) return;
-  if (!mqUp) {
-    showMsg(L3("Подключаюсь...", "Connecting...", "正在连接……"), C_YELLOW);
-    mqConnect(6000);
-  }
-  inRoom = true;                                     // связь поддерживается, пока идёт игра
-  struct Leave {
-    ~Leave() {
-      inRoom = false;
-      if (!(cfgRoomBg && cfgNick.length())) mqDrop();
+void runTttNetVia(bool viaBle);
+void runTttNet() { runTttNetVia(false); }
+void runTttBle() { runTttNetVia(true); }
+
+// Крестики-нолики вдвоём: через сервер комнаты или напрямую по Bluetooth (гаджеты рядом).
+void runTttNetVia(bool viaBle) {
+  bool bleWasOn = ble::active();
+  if (viaBle) {
+    if (!bleWasOn) {
+      showMsg(L3("Включаю Bluetooth...", "Turning Bluetooth on...", "正在打开蓝牙……"), C_YELLOW);
+      ble::begin(toStd(roomId));
     }
-  } leave;
+  } else {
+    if (inRoom) return;
+    if (!waitWifi(false)) return;
+    if (!cfgNick.length() && !askNick()) return;
+    if (!mqUp) {
+      showMsg(L3("Подключаюсь...", "Connecting...", "正在连接……"), C_YELLOW);
+      mqConnect(6000);
+    }
+    inRoom = true;                                   // связь поддерживается, пока идёт игра
+  }
+  g_netBle = viaBle;
+  struct Leave {
+    bool viaBle, bleWasOn;
+    ~Leave() {
+      if (viaBle) {
+        ble::gameDrop();
+        if (!bleWasOn) ble::end();                   // Bluetooth был выключен - выключаем обратно
+        g_netBle = false;
+      } else {
+        inRoom = false;
+        if (!(cfgRoomBg && cfgNick.length())) mqDrop();
+      }
+    }
+  } leave{viaBle, bleWasOn};
   int wins = 0, losses = 0, round = 0;
   for (;;) {
     // --- поиск соперника ---
     String peer, peerNick;
     bool host = false, iAmX = true;
     netInbox.clear();
-    showMsg(String(L3("Ищу соперника в комнате #", "Looking for an opponent in room #", "正在房间里寻找对手 #")) + cfgRoom +
-            L3(". Пусть друг тоже откроет «Крестики по сети». Держать - выход.", ". Ask a friend to open Tic-tac-toe online too. Hold - exit.",
-               "。请朋友也打开“联网井字棋”。长按：退出。"), C_YELLOW);
+    if (viaBle)
+      showMsg(String(L3("Ищу гаджет рядом по Bluetooth (", "Looking for a device nearby over Bluetooth (", "正在通过蓝牙寻找附近的设备（")) + "DS-" + roomId +
+                  L3("). Пусть друг откроет «Крестики по Bluetooth». Держать - выход.", "). Ask a friend to open Tic-tac-toe Bluetooth. Hold - exit.",
+                     "）。请朋友打开“蓝牙井字棋”。长按：退出。"), C_YELLOW);
+    else
+      showMsg(String(L3("Ищу соперника в комнате #", "Looking for an opponent in room #", "正在房间里寻找对手 #")) + cfgRoom +
+              L3(". Пусть друг тоже откроет «Крестики по сети». Держать - выход.", ". Ask a friend to open Tic-tac-toe online too. Hold - exit.",
+                 "。请朋友也打开“联网井字棋”。长按：退出。"), C_YELLOW);
     uint32_t lastSeek = 0;
     while (!peer.length()) {
       if (btnEvent() == EV_LONG) return;
-      wifiTick();
-      roomTick();
-      if (mqUp && millis() - lastSeek > 2000) {
+      if (viaBle && !ble::gameLinked()) {            // ещё не соединились: поиск (около секунды)
+        ble::gameSearchStep();
+        continue;
+      }
+      netPump();
+      if (netLinkUp() && millis() - lastSeek > 2000) {
         lastSeek = millis();
         netSend("ttt\tseek");
       }
@@ -8486,6 +8690,7 @@ void runTttNet() {
       delay(10);
     }
     sndOk();
+    if (!peerNick.length()) peerNick = peer;
     // --- партия ---
     uint8_t b[9] = {0};
     int cur = 4, mine = iAmX ? 1 : 2;
@@ -8510,8 +8715,7 @@ void runTttNet() {
     int w = 0;
     bool gone = false;
     while (!(w = games2::ttt::winner(b)) && !gone) {
-      wifiTick();
-      roomTick();
+      netPump();
       String id, nick, game, cmd, to;
       int arg;
       while (netNext(id, nick, game, cmd, to, arg)) {
@@ -8526,7 +8730,7 @@ void runTttNet() {
           status();
         }
       }
-      if (millis() - lastHeard > 120000UL || (!mqUp && millis() - lastHeard > 30000UL)) gone = true;
+      if (millis() - lastHeard > 120000UL || (!netLinkUp() && millis() - lastHeard > (viaBle ? 5000UL : 30000UL))) gone = true;
       uint8_t j = joyEvent();
       if (j != J_NONE) {
         int old = cur, x = cur % 3, y = cur / 3;
@@ -9034,11 +9238,11 @@ void runGamesMenu() {
                                  L3("Арканоид", "Breakout", "打砖块"), L3("Пришельцы", "Invaders", "太空侵略者"),
                                  L3("Сапёр", "Minesweeper", "扫雷"), L3("Повтори", "Repeat", "记忆重复"),
                                  L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), L3("Крестики по сети", "Tic-tac-toe online", "联网井字棋"),
-                                 L3("Шахматы", "Chess", "国际象棋"),
+                                 L3("Крестики по Bluetooth", "Tic-tac-toe Bluetooth", "蓝牙井字棋"), L3("Шахматы", "Chess", "国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
                                  L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "bchess", "bquiz", "", "bguess", "bfps", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bquiz", "", "bguess", "bfps", "", ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
@@ -9062,12 +9266,13 @@ void runGamesMenu() {
       case 13: runSimon(); break;
       case 14: runTtt(); break;
       case 15: runTttNet(); break;
-      case 16: runChess(); break;
-      case 17: runQuiz(); break;
-      case 18: runStory(); break;
-      case 19: runGuess(); break;
-      case 20: runFps3d(); break;
-      case 21: runHiScores(); break;
+      case 16: runTttBle(); break;
+      case 17: runChess(); break;
+      case 18: runQuiz(); break;
+      case 19: runStory(); break;
+      case 20: runGuess(); break;
+      case 21: runFps3d(); break;
+      case 22: runHiScores(); break;
       default: return;                               // «Назад» или удержание
     }
   }
@@ -9080,14 +9285,14 @@ void runAdmin();
 // Ручка - выбор (влево/вправо у края - соседняя страница), нажатие - открыть приложение.
 enum AppId : uint8_t {
   A_CHAT, A_ROOM, A_GAMES, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
-  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_SETTINGS, A_ADMIN, A_COUNT
+  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_SETTINGS, A_ADMIN, A_COUNT
 };
 const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
-                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Настройки", "Админ"};
+                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Настройки", "Админ"};
 const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
-                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Settings", "Admin"};
+                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "Settings", "Admin"};
 const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
-                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x636F, 0xB0A6};
+                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x636F, 0xB0A6};
 const int HOME_TOP = 22, CELL_W = 80, CELL_H = 70, TILE = 46;
 
 const char* appName(int a) { return cfgLang == LANG_RU ? APP_RU[a] : APP_EN[a]; }
@@ -9184,6 +9389,15 @@ void drawAppIcon(int a, int x, int y) {
       tft.drawFastHLine(x + 18, y + 8, 11, W);
       tft.drawFastHLine(x + 20, y + 5, 7, W);
       break;
+    case A_BT:                                       // знак Bluetooth
+      for (int k = 0; k < 3; k++) {
+        tft.drawLine(cx - 1 + k, y + 7, cx - 1 + k, y + 39, W);
+        tft.drawLine(cx - 1 + k, y + 7, cx + 10 + k, y + 16, W);
+        tft.drawLine(cx + 10 + k, y + 16, cx - 10 + k, y + 31, W);
+        tft.drawLine(cx - 1 + k, y + 39, cx + 10 + k, y + 30, W);
+        tft.drawLine(cx + 10 + k, y + 30, cx - 10 + k, y + 15, W);
+      }
+      break;
     case A_SETTINGS:                                 // шестерёнка
       for (int k = 0; k < 8; k++) {
         float an = k * 0.785398f;
@@ -9232,6 +9446,8 @@ void drawHomeStatus() {
     String n = roomUnread > 9 ? String("9+") : String(roomUnread);
     drawUtf8(n.c_str(), ex + 17, 2, C_YELLOW, C_BAR);
   }
+  if (ble::active())                                 // Bluetooth: «B», голубая - телефон подключён
+    drawUtf8("B", 164, 2, ble::phoneConnected() ? 0x5DFF : 0x8410, C_BAR);
   int ws = wifiState();                              // Wi-Fi: три полоски
   uint16_t wc = ws == 0 ? C_WHITE : ws == 1 ? C_YELLOW : 0x8410;
   for (int k = 0; k < 3; k++) tft.fillRect(178 + k * 5, 14 - k * 4, 3, 3 + k * 4, ws == 0 || k == 0 ? wc : 0x4208);
@@ -9303,6 +9519,7 @@ void launchApp(int a) {
     case A_TIMER: runTimer(); break;
     case A_STOPW: runStopwatch(); break;
     case A_REMOTE: runRemote(); break;
+    case A_BT: runBluetooth(); break;
     case A_SETTINGS: runSettings(); break;
     case A_ADMIN: runAdmin(); break;
   }
@@ -9451,6 +9668,10 @@ void setup() {
 
   if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
   wifiStart();                                       // дальше Wi-Fi подключается в фоне
+  if (cfgBle) {                                      // Bluetooth включён в настройках
+    ble::begin(toStd(roomId));
+    Serial.printf("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
+  }
   Serial.println("5: ready (Wi-Fi in background)");
 }
 
