@@ -10991,6 +10991,7 @@ String raspDownload() {
   WiFiClient* st = http.getStreamPtr();
   int total = http.getSize();
   rasp::Parser p;
+  std::string head;                                  // начало страницы - показать, если не разобралась
   String tmp = "/rasp.tmp";
   size_t got = 0;
   bool wrOk = true;
@@ -11011,27 +11012,35 @@ String raspDownload() {
       if (n <= 0) continue;
       last = millis();
       got += n;
+      if (head.size() < 400)
+        for (int k = 0; k < n && head.size() < 400; k++)
+          if (buf[k] >= 0x20 || buf[k] == '\n') rasp::cp1251(buf[k], head);
       p.feed(buf, n);
       if (!p.out.empty()) {
         if (f.write((const uint8_t*)p.out.data(), p.out.size()) != p.out.size()) wrOk = false;
         p.out.clear();
       }
     }
+    p.finish();
+    if (f && !p.out.empty() && f.write((const uint8_t*)p.out.data(), p.out.size()) != p.out.size()) wrOk = false;
+    p.out.clear();
     if (f) f.close();
   }
   http.end();
-  Serial.printf("[rasp] %u bytes, %d weeks\n", (unsigned)got, p.weeks);
+  Serial.printf("[rasp] %u bytes, %d weeks, %d days\n", (unsigned)got, p.weeks, p.days);
   PicBus b;
   if (!wrOk) {
     raspFs().remove(tmp.c_str());
     return L3("не удалось записать (нет места?)", "cannot write (no space?)", "无法写入");
   }
-  if (p.weeks == 0) {
+  if (p.weeks == 0 || p.days == 0) {
     raspFs().remove(tmp.c_str());
-    return L3("на странице не нашлось расписания - проверьте адрес", "no schedule on the page - check the address", "页面上没有课表");
+    return String(L3("на странице не нашлось расписания (", "no schedule on the page (", "页面上没有课表（")) + String((unsigned)got) +
+           L3(" байт, недель ", " bytes, weeks ", " 字节，周 ") + String(p.weeks) + L3(", дней ", ", days ", "，天 ") + String(p.days) +
+           L3("). Начало страницы:\n", "). Page starts with:\n", "）。页面开头：\n") + String(head.substr(0, 300).c_str());
   }
   raspFs().remove("/rasp.txt");
-  raspFs().rename(tmp.c_str(), "/rasp.txt");
+  if (!raspFs().rename(tmp.c_str(), "/rasp.txt")) return L3("не удалось сохранить файл расписания", "cannot save the schedule file", "无法保存课表文件");
   struct tm t;
   prefs.begin("dsk", false);
   prefs.putULong("raspts", timeNow(t) ? (uint32_t)time(nullptr) : 1);

@@ -90,21 +90,37 @@ struct Parser {
       if (c == ' ' || c == '\t' || c == '\n' || c == '\r') break;
       t += (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
     }
+    // Закрывающие </td> и </tr> в старом HTML (Word 97) часто опущены - новая ячейка/строка/таблица
+    // сама закрывает предыдущую.
     if (t == "td" || t == "th") {
+      endCell();
       inCell = true;
       cell.clear();
     } else if (t == "/td" || t == "/th") {
-      if (inCell) row.push_back(squash(cell));
-      inCell = false;
+      endCell();
     } else if (t == "br" || t == "br/" || t == "/p" || t == "p") {
       addText("\n");
-    } else if (t == "/tr") {
-      onRow();
-      row.clear();
+    } else if (t == "tr" || t == "/tr") {
+      endRow();
+    } else if (t == "/table") {
+      endRow();
     } else if (t == "table") {
+      endRow();
       onTableStart();
     }
   }
+  void endCell() {
+    if (inCell) row.push_back(squash(cell));
+    inCell = false;
+  }
+  void endRow() {
+    endCell();
+    if (!row.empty()) onRow();
+    row.clear();
+  }
+  int days = 0;                      // сколько строк-дней нашлось (для проверки)
+  // Конец страницы: дописать то, что не закрыто
+  void finish() { endRow(); }
 
   // Перед каждой таблицей: «Расписание занятий учебной группы: ЭЭ-11 / Неделя: 12-я (16.11.2026-22.11.2026)»
   void onTableStart() {
@@ -158,6 +174,7 @@ struct Parser {
     size_t comma = day.find(',');
     if (comma != std::string::npos && comma + 1 < day.size() && day[comma + 1] == ' ') day.erase(comma + 1, 1);
     out += "D\t" + day + "\n";
+    days++;
     for (size_t i = 1; i < row.size() && i <= 7; i++) {
       std::string c = row[i];
       if (c.empty()) continue;
