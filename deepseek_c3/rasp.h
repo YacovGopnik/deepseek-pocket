@@ -234,6 +234,12 @@ struct Parser {
   }
 };
 
+// Строка экрана расписания: текст и цвет
+struct VLine {
+  std::string s;
+  uint16_t c;
+};
+
 // ---------- чтение готового текста ----------
 struct Pair {
   int num;

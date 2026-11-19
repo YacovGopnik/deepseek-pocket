@@ -10993,12 +10993,7 @@ bool raspSpan(const std::string& t, int& a, int& b) {
   return true;
 }
 
-struct RaspLine {
-  String s;
-  uint16_t c;
-};
-
-void raspAddWrapped(std::vector<RaspLine>& out, const String& s, uint16_t c, int indent) {
+void raspAddWrapped(std::vector<rasp::VLine>& out, const String& s, uint16_t c, int indent) {
   std::vector<uint16_t> cps;
   utf8ToCps(s.c_str(), cps);
   std::vector<Line> lines;
@@ -11007,16 +11002,16 @@ void raspAddWrapped(std::vector<RaspLine>& out, const String& s, uint16_t c, int
     String t;
     for (int i = 0; i < indent; i++) t += ' ';
     t += cpsToUtf8(cps.data() + l.start, l.len).c_str();
-    out.push_back({t, c});
+    out.push_back({std::string(t.c_str()), c});
   }
 }
 
-void raspBuild(const rasp::Schedule& s, int di, long today, int nowMin, std::vector<RaspLine>& out) {
+void raspBuild(const rasp::Schedule& s, int di, long today, int nowMin, std::vector<rasp::VLine>& out) {
   out.clear();
   const rasp::Day& d = s.days[(size_t)di];
   bool isToday = rasp::dayNum(d.y, d.m, d.d) == today;
   if (d.pairs.empty()) {
-    out.push_back({L3("Пар нет", "No classes", "没有课"), C_GREEN});
+    out.push_back({std::string(L3("Пар нет", "No classes", "没有课")), C_GREEN});
     return;
   }
   bool nextMarked = false;
@@ -11037,14 +11032,14 @@ void raspBuild(const rasp::Schedule& s, int di, long today, int nowMin, std::vec
     std::string rest;
     String type = raspType(p.subj, rest);
     String head = String(p.num) + ". " + String(tm.c_str()) + (type.length() ? String("  ") + type : String("")) + mark;
-    out.push_back({head, hc});
+    out.push_back({std::string(head.c_str()), hc});
     raspAddWrapped(out, String(rest.c_str()), C_WHITE, 2);
     if (!p.who.empty()) raspAddWrapped(out, String(p.who.c_str()), 0x8C71, 2);
     out.push_back({"", C_BLACK});
   }
 }
 
-void raspDraw(const rasp::Schedule& s, int di, const std::vector<RaspLine>& lines, int top, bool isToday) {
+void raspDraw(const rasp::Schedule& s, int di, const std::vector<rasp::VLine>& lines, int top, bool isToday) {
   const rasp::Day& d = s.days[(size_t)di];
   tft.fillRect(0, 0, 240, 28, isToday ? C_SEL : C_BAR);
   char date[8];
@@ -11102,7 +11097,7 @@ void runRasp() {
         di = (int)i;
         break;
       }
-  std::vector<RaspLine> lines;
+  std::vector<rasp::VLine> lines;
   int top = 0;
   bool redraw = true;
   uint32_t lastTick = millis();
