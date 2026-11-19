@@ -871,6 +871,7 @@ int cfgJoy = 2;           // чувствительность ручки: 0 (н�
 int cfgSd = 0;            // подключена SD-карта (вместо ИК-пульта, фонарика и пищалки)
 int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
+int cfgTilt = 0;          // 1 - наклон гаджета управляет в играх (датчик ADXL345, только S3)
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
 // Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
 int joyThr() {
@@ -929,6 +930,7 @@ void loadSettings() {
   cfgJoy = (int)prefs.getUChar("joy", 2);
   if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
+  cfgTilt = prefs.getUChar("tilt", 0) ? 1 : 0;
   cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
   cfgSd = prefs.getUChar("sd", 0) ? 1 : 0;
@@ -951,6 +953,7 @@ void saveScreenSettings() {
   prefs.putUChar("idle", (uint8_t)cfgIdle);
   prefs.putUChar("joy", (uint8_t)cfgJoy);
   prefs.putUChar("joyiy", (uint8_t)cfgJoyInvY);
+  prefs.putUChar("tilt", (uint8_t)cfgTilt);
   prefs.putUChar("rot", (uint8_t)cfgRot);
   prefs.putUChar("ble", (uint8_t)cfgBle);
   prefs.putUChar("sd", (uint8_t)cfgSd);
@@ -1386,6 +1389,105 @@ void joyRotate(int& dx, int& dy) {
   }
 }
 
+// ========================= ДАТЧИК НАКЛОНА ADXL345 (только S3) =========================
+// I2C: SDA - 38, SCL - 39, питание 3V3. Адрес 0x53 (SDO на GND) или 0x1D (SDO на 3V3) - находится сам.
+// Как датчик повёрнут относительно экрана, неизвестно, поэтому оси задаются калибровкой (Настройки -> Наклон).
+#if BOARD_S3
+#include <Wire.h>
+const int ACC_SDA = 38, ACC_SCL = 39;
+#endif
+bool accOk = false;
+uint8_t accAddr = 0;
+int accZero[3] = {0, 0, 0};                          // показания, когда гаджет лежит ровно
+int8_t accAxX = 0, accSgX = 1, accAxY = 1, accSgY = 1;   // какая ось датчика - «вправо» и «к себе»
+
+uint8_t accReg(uint8_t r) {
+#if BOARD_S3
+  Wire.beginTransmission(accAddr);
+  Wire.write(r);
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom((int)accAddr, 1) != 1) return 0;
+  return Wire.read();
+#else
+  (void)r;
+  return 0;
+#endif
+}
+void accSet(uint8_t r, uint8_t v) {
+#if BOARD_S3
+  Wire.beginTransmission(accAddr);
+  Wire.write(r);
+  Wire.write(v);
+  Wire.endTransmission();
+#else
+  (void)r;
+  (void)v;
+#endif
+}
+
+void accInit() {
+#if BOARD_S3
+  Wire.begin(ACC_SDA, ACC_SCL, 400000);
+  for (uint8_t a : {(uint8_t)0x53, (uint8_t)0x1D}) {
+    accAddr = a;
+    if (accReg(0x00) == 0xE5) {                      // DEVID
+      accSet(0x31, 0x08);                            // полное разрешение, +-2g: 256 на 1g
+      accSet(0x2C, 0x0A);                            // 100 измерений в секунду
+      accSet(0x2D, 0x08);                            // измерять
+      accOk = true;
+      break;
+    }
+  }
+  Serial.printf("ADXL345: %s\n", accOk ? "ok" : "not found");
+  prefs.begin("dsk", true);
+  accZero[0] = prefs.getShort("az0", 0);
+  accZero[1] = prefs.getShort("az1", 0);
+  accZero[2] = prefs.getShort("az2", 0);
+  accAxX = prefs.getChar("aax", 0);
+  accSgX = prefs.getChar("asx", 1);
+  accAxY = prefs.getChar("aay", 1);
+  accSgY = prefs.getChar("asy", 1);
+  prefs.end();
+#endif
+}
+
+// Сырые показания трёх осей (256 = 1g).
+bool accRaw(int v[3]) {
+#if BOARD_S3
+  if (!accOk) return false;
+  Wire.beginTransmission(accAddr);
+  Wire.write(0x32);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)accAddr, 6) != 6) return false;
+  uint8_t b[6];
+  for (int i = 0; i < 6; i++) b[i] = Wire.read();
+  for (int i = 0; i < 3; i++) v[i] = (int16_t)(b[i * 2] | (b[i * 2 + 1] << 8));
+  return true;
+#else
+  (void)v;
+  return false;
+#endif
+}
+
+// Наклон в осях экрана: tx > 0 - вправо, ty > 0 - к себе (вниз по экрану). 256 = 90 градусов примерно.
+bool accTilt(int& tx, int& ty) {
+  static uint32_t last = 0;
+  static int cx = 0, cy = 0;
+  static bool ok = false;
+  if (millis() - last >= 10) {                       // не чаще 100 раз в секунду
+    last = millis();
+    int v[3];
+    ok = accRaw(v);
+    if (ok) {
+      cx = (v[accAxX] - accZero[accAxX]) * accSgX;
+      cy = (v[accAxY] - accZero[accAxY]) * accSgY;
+    }
+  }
+  tx = cx;
+  ty = cy;
+  return ok;
+}
+
 // Ручка, которую держат на телефоне (пульт по Wi-Fi): J_NONE, если не держат.
 uint8_t padDir() {
   wpad::poll();
@@ -1417,6 +1519,21 @@ void joyAnalog(int& dx, int& dy) {
     case J_DOWN: dx = 0; dy = 2000; break;
     case J_LEFT: dx = -2000; dy = 0; break;
     case J_RIGHT: dx = 2000; dy = 0; break;
+  }
+  // наклон гаджета (если включён и ручку не трогают): ~30 градусов - до упора
+  if (cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
+    int tx, ty;
+    if (accTilt(tx, ty)) {
+      auto conv = [](int t) {
+        int a = abs(t);
+        if (a < 20) return 0;                        // мёртвая зона ~5 градусов
+        int v = (a - 20) * 2048 / 108;
+        if (v > 2047) v = 2047;
+        return t < 0 ? -v : v;
+      };
+      dx = conv(tx);
+      dy = conv(ty);
+    }
   }
   int half = joyThr() / 2;
   if (dx > half || dx < -half || dy > half || dy < -half) {
@@ -8406,13 +8523,145 @@ void runAdmin() {
   }
 }
 
+// Настройки -> Наклон: уровень-«пузырёк», калибровка осей, управление наклоном в играх.
+void accSaveCal() {
+  prefs.begin("dsk", false);
+  prefs.putShort("az0", accZero[0]);
+  prefs.putShort("az1", accZero[1]);
+  prefs.putShort("az2", accZero[2]);
+  prefs.putChar("aax", accAxX);
+  prefs.putChar("asx", accSgX);
+  prefs.putChar("aay", accAxY);
+  prefs.putChar("asy", accSgY);
+  prefs.end();
+}
+
+// Ждать нажатия, показывая подсказку; вернуть средние показания за полсекунды.
+bool accCapture(const char* hint, int out[3]) {
+  showMsg(hint, C_WHITE);
+  for (;;) {
+    BtnEvent e = btnEvent();
+    joyEvent();
+    if (e == EV_LONG) return false;
+    if (e == EV_CLICK) break;
+    delay(10);
+  }
+  long sum[3] = {0, 0, 0};
+  int n = 0;
+  for (int i = 0; i < 25; i++) {
+    int v[3];
+    if (accRaw(v)) {
+      for (int k = 0; k < 3; k++) sum[k] += v[k];
+      n++;
+    }
+    delay(20);
+  }
+  if (!n) return false;
+  for (int k = 0; k < 3; k++) out[k] = (int)(sum[k] / n);
+  return true;
+}
+
+void accCalibrate() {
+  int flat[3], right[3], down[3];
+  if (!accCapture(L3("1/3. Положите гаджет ровно экраном вверх и нажмите кнопку.", "1/3. Lay the device flat, screen up, and press the button.", "1/3. 平放后按键。"), flat)) return;
+  if (!accCapture(L3("2/3. Наклоните гаджет ВПРАВО (градусов на 30-45), держите и нажмите кнопку.", "2/3. Tilt the device to the RIGHT (30-45 degrees), hold and press.",
+                     "2/3. 向右倾斜后按键。"), right))
+    return;
+  if (!accCapture(L3("3/3. Наклоните гаджет К СЕБЕ (нижним краем вниз), держите и нажмите кнопку.", "3/3. Tilt the device TOWARDS you (bottom edge down), hold and press.",
+                     "3/3. 向自己倾斜后按键。"), down))
+    return;
+  auto pick = [&](const int a[3], int skip, int8_t& ax, int8_t& sg) {
+    int best = -1, bv = 0;
+    for (int k = 0; k < 3; k++) {
+      if (k == skip) continue;
+      int d = a[k] - flat[k];
+      if (abs(d) > bv) { bv = abs(d); best = k; }
+    }
+    if (best < 0 || bv < 40) return false;          // почти не наклонили
+    ax = (int8_t)best;
+    sg = (int8_t)(a[best] - flat[best] > 0 ? 1 : -1);
+    return true;
+  };
+  int8_t ax, sx, ay, sy;
+  if (!pick(right, -1, ax, sx) || !pick(down, ax, ay, sy)) {
+    viewAnswer(L3("Не понял наклон - наклоняйте сильнее. Попробуйте ещё раз.", "Could not detect the tilt - tilt more. Try again.", "未检测到倾斜，请再试一次。"), C_YELLOW);
+    return;
+  }
+  for (int k = 0; k < 3; k++) accZero[k] = flat[k];
+  accAxX = ax;
+  accSgX = sx;
+  accAxY = ay;
+  accSgY = sy;
+  accSaveCal();
+  viewAnswer(L3("Готово! Наклон откалиброван.", "Done! Tilt calibrated.", "完成！"), C_GREEN);
+}
+
+void runTilt() {
+  if (!accOk) {
+    viewAnswer(BOARD_S3 ? L3("Датчик ADXL345 не найден. Подключение: SDA - 38, SCL - 39, VCC - 3V3, GND - GND, CS - 3V3 (режим I2C), SDO - GND. Потом перезапустите гаджет.",
+                             "ADXL345 not found. Wiring: SDA 38, SCL 39, VCC 3V3, GND GND, CS to 3V3 (I2C mode), SDO to GND. Then restart.", "未找到ADXL345。")
+                        : L3("Датчик наклона подключается только к гаджету на ESP32-S3.", "The tilt sensor works only on the ESP32-S3 gadget.", "倾斜传感器仅支持ESP32-S3。"),
+               C_YELLOW);
+    return;
+  }
+  tft.fillScreen(C_BLACK);
+  int bx = -1, by = -1;
+  uint32_t lastTxt = 0;
+  for (;;) {
+    int tx, ty;
+    if (accTilt(tx, ty)) {
+      // пузырёк: круг радиуса 90, наклон 45 градусов (~181) - до края
+      int nx = 120 + constrain(tx * 90 / 181, -90, 90), ny = 120 + constrain(ty * 90 / 181, -90, 90);
+      if (nx != bx || ny != by) {
+        if (bx >= 0) tft.fillCircle(bx, by, 12, C_BLACK);
+        tft.drawCircle(120, 120, 102, C_LIGHT);
+        tft.drawCircle(120, 120, 16, C_LIGHT);
+        tft.drawFastHLine(18, 120, 204, 0x31A6);
+        tft.drawFastVLine(120, 18, 204, 0x31A6);
+        bool level = abs(tx) < 9 && abs(ty) < 9;
+        tft.fillCircle(nx, ny, 12, level ? C_GREEN : C_YELLOW);
+        bx = nx;
+        by = ny;
+      }
+      if (millis() - lastTxt > 250) {
+        lastTxt = millis();
+        SmallFont small;
+        char b[48];
+        snprintf(b, sizeof(b), "X %+3d  Y %+3d     ", (int)(asinf(constrain(tx / 256.0f, -1.f, 1.f)) * 57.3f),
+                 (int)(asinf(constrain(ty / 256.0f, -1.f, 1.f)) * 57.3f));
+        drawUtf8(b, 4, 2, C_WHITE, C_BLACK);
+        drawUtf8(cfgTilt ? L3("игры: наклон ВКЛ ", "games: tilt ON  ", "游戏：开") : L3("игры: наклон выкл", "games: tilt off ", "游戏：关"), 4, 222, cfgTilt ? C_GREEN : C_LIGHT, C_BLACK);
+      }
+    }
+    joyEvent();
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (e == EV_CLICK) {
+      std::vector<String> o = splitBar(cfgTilt ? L3("Выключить наклон в играх|Калибровать|Выйти", "Turn tilt off in games|Calibrate|Leave", "关闭|校准|退出")
+                                               : L3("Включить наклон в играх|Калибровать|Выйти", "Turn tilt on in games|Calibrate|Leave", "开启|校准|退出"));
+      int k = choiceScreen(L3("Наклон", "Tilt", "倾斜"), o);
+      if (k == 0) {
+        cfgTilt = !cfgTilt;
+        saveScreenSettings();
+      } else if (k == 1) {
+        accCalibrate();
+      } else if (k == 2) {
+        return;
+      }
+      tft.fillScreen(C_BLACK);
+      bx = by = -1;
+    }
+    delay(10);
+  }
+}
+
 bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Наклон|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Tilt|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|倾斜|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -8434,6 +8683,7 @@ bool runSettings() {
     prefs.end();
     right[15] = !cfgSd ? (sdDiag != -9 ? String(L3("сбой ", "fail ", "失败 ")) + String(sdDiag) : String(L3("нет", "off", "关"))) : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
+    right[16] = !accOk ? L3("нет датчика", "no sensor", "无传感器") : cfgTilt ? L3("в играх", "in games", "游戏中") : L3("выкл", "off", "关");
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -8521,6 +8771,9 @@ bool runSettings() {
       case 14:
         if (ENABLE_BLE) bleSetEnabled(!cfgBle);
         else viewAnswer(L3("Bluetooth не помещается в эту прошивку (ENABLE_BLE 0).", "Bluetooth does not fit into this firmware (ENABLE_BLE 0).", "此固件不包含蓝牙。"), C_YELLOW);
+        break;
+      case 16:
+        runTilt();
         break;
       case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
         cfgRot = (cfgRot + 1) & 3;
@@ -12000,6 +12253,7 @@ void setup() {
   pinMode(PIN_BLK, OUTPUT);
   applyBrightness();                 // подсветка с выбранной яркостью
   soundInit();                       // после подсветки: у пищалки свой канал
+  accInit();                         // датчик наклона (S3)
   g_bgTick = roomTick;               // комната принимает сообщения в фоне, пока вы на экране ввода
   noteActivity();
 
