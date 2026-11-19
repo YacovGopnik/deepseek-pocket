@@ -7075,8 +7075,10 @@ class OtaSink : public Stream {
  public:
   size_t n = 0, total = 0;
   bool failed = false, badType = false;
+  uint8_t head[8] = {0};                             // первые байты - чтобы показать, что пришло вместо прошивки
   size_t write(uint8_t c) override { return write(&c, 1); }
   size_t write(const uint8_t* b, size_t len) override {
+    if (n == 0) memcpy(head, b, len < 8 ? len : 8);
     if (n == 0 && (len == 0 || b[0] != 0xE9)) badType = true;      // прошивка ESP32 начинается с байта E9
     if (!badType && !failed && Update.write((uint8_t*)b, len) != len) failed = true;
     n += len;
@@ -7113,36 +7115,56 @@ String otaFromInternet() {
   if (!otaSwitch && !otaNoAsk && choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
                    L3("). Не выключайте гаджет, пока идёт обновление.", "). Do not switch the device off during the update.", "）。更新时请勿关机。"), yn) != 0)
     return "";
-  showMsg(L3("Скачиваю прошивку...", "Downloading the firmware...", "正在下载固件……"), C_YELLOW);
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(15);
-  HTTPClient http;
-  http.setUserAgent(APP_UA);
-  http.setConnectTimeout(15000);
-  http.setTimeout(15000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, base + fwFile)) return "begin";
-  code = http.GET();
-  int len = http.getSize();
-  if (code != 200 || len < 100000) {
+  // Скачать и записать. Иногда сеть отдаёт не файл (страницу-заглушку, обрыв) - тогда пробуем ещё раз.
+  String lastErr;
+  bool done = false;
+  for (int attempt = 1; attempt <= 3 && !done; attempt++) {
+    showMsg(String(L3("Скачиваю прошивку...", "Downloading the firmware...", "正在下载固件……")) + (attempt > 1 ? String(" (") + String(attempt) + "/3)" : String("")),
+            C_YELLOW);
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(15);
+    HTTPClient http;
+    http.setUserAgent(APP_UA);
+    http.setConnectTimeout(15000);
+    http.setTimeout(15000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    // ?a=N - чтобы промежуточный кэш не отдал тот же испорченный ответ
+    if (!http.begin(client, base + fwFile + "?a=" + String(attempt) + String(millis() % 100000))) {
+      lastErr = "begin";
+      continue;
+    }
+    code = http.GET();
+    int len = http.getSize();
+    if (code != 200 || len < 100000) {
+      http.end();
+      lastErr = String(L3("Файл прошивки не найден (код ", "Firmware file not found (code ", "找不到固件文件（代码 ")) + String(code) + ", " + String(len) + ")";
+      delay(1500);
+      continue;
+    }
+    if (!Update.begin((size_t)len)) {
+      http.end();
+      return String(L3("Прошивка не помещается: ", "The firmware does not fit: ", "固件放不下：")) + Update.errorString();
+    }
+    OtaSink sink;
+    sink.total = (size_t)len;
+    int got = http.writeToStream(&sink);
     http.end();
-    return String(L3("Файл прошивки не найден (код ", "Firmware file not found (code ", "找不到固件文件（代码 ")) + String(code) + ")";
+    if (got < 0 || sink.failed || sink.badType || sink.n != (size_t)len || !Update.end(true)) {
+      Update.abort();
+      char hx[40];
+      snprintf(hx, sizeof(hx), "%02X %02X %02X %02X %02X %02X", sink.head[0], sink.head[1], sink.head[2], sink.head[3], sink.head[4], sink.head[5]);
+      Serial.printf("[ota] attempt %d: got %d of %d, bad %d, failed %d, head %s\n", attempt, (int)sink.n, len, sink.badType, sink.failed, hx);
+      lastErr = sink.badType ? String(L3("Пришёл не файл прошивки (начало: ", "Received something that is not firmware (starts with: ", "收到的不是固件（开头：")) + hx + ")"
+                             : String(L3("Обновление оборвалось (", "The update was interrupted (", "更新中断（")) + String((int)sink.n) + " / " + String(len) + ")";
+      delay(1500);
+      continue;
+    }
+    done = true;
   }
-  if (!Update.begin((size_t)len)) {
-    http.end();
-    return String(L3("Прошивка не помещается: ", "The firmware does not fit: ", "固件放不下：")) + Update.errorString();
-  }
-  OtaSink sink;
-  sink.total = (size_t)len;
-  int got = http.writeToStream(&sink);
-  http.end();
-  if (got < 0 || sink.failed || sink.badType || sink.n != (size_t)len || !Update.end(true)) {
-    Update.abort();
-    return sink.badType ? String(L3("Это не файл прошивки.", "This is not a firmware file.", "这不是固件文件。"))
-                        : String(L3("Обновление не удалось (связь оборвалась?). Старая прошивка осталась на месте.",
-                                    "The update failed (connection lost?). The old firmware is still in place.", "更新失败（连接中断？）。旧固件仍然保留。"));
-  }
+  if (!done)
+    return lastErr + L3(". Старая прошивка осталась на месте. Попробуйте позже или обновитесь с телефона.",
+                        ". The old firmware is still in place. Try later or update from your phone.", "。旧固件仍保留。");
   showMsg(L3("Готово! Перезапускаюсь...", "Done! Restarting...", "完成！正在重启……"), C_GREEN);
   delay(1500);
   ESP.restart();
