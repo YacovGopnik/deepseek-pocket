@@ -1178,13 +1178,59 @@ void showMsg(const String& s, uint16_t fg) {
 // Когда экран спрятан или погас, гаджет молчит.
 extern bool screenAsleep;
 
+#if BOARD_S3
+// S3: кроме пищалки, звук идёт на I2S-усилитель MAX98357A (BCLK 14, LRC 15, DIN 16; микрофон INMP441 - SD 17).
+// Отдельная задача всё время отдаёт усилителю звук: синус нужной частоты с плавным нарастанием (без щелчков)
+// или тишину.
+#include <ESP_I2S.h>
+const int I2S_BCLK = 14, I2S_WS = 15, I2S_DOUT = 16, I2S_DIN = 17;
+const int AUD_RATE = 22050;
+I2SClass audioI2s;
+volatile int audFreq = 0;
+volatile int audVol = 6000;                          // громкость (амплитуда, до 32767)
+bool audOk = false;
+
+void audioTask(void*) {
+  static int16_t SINE[64];
+  for (int i = 0; i < 64; i++) SINE[i] = (int16_t)(sinf(i * 6.2831853f / 64) * 32767);
+  int16_t buf[256];
+  uint32_t phase = 0;
+  int amp = 0;                                       // текущая амплитуда - плавно идёт к нужной
+  for (;;) {
+    int f = audFreq;
+    int target = f > 0 ? audVol : 0;
+    uint32_t step = f > 0 ? (uint32_t)((uint64_t)f * 4294967296ULL / AUD_RATE) : 0;
+    for (int i = 0; i < 256; i++) {
+      if (amp < target) amp = amp + 40 > target ? target : amp + 40;
+      else if (amp > target) amp = amp - 40 < target ? target : amp - 40;
+      phase += step;
+      buf[i] = amp ? (int16_t)((int32_t)SINE[phase >> 26] * amp / 32767) : 0;
+    }
+    audioI2s.write((uint8_t*)buf, sizeof(buf));
+  }
+}
+
+void audioInit() {
+  audioI2s.setPins(I2S_BCLK, I2S_WS, I2S_DOUT);
+  audOk = audioI2s.begin(I2S_MODE_STD, AUD_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+  Serial.printf("I2S audio: %s\n", audOk ? "ok" : "failed");
+  if (audOk) xTaskCreate(audioTask, "audio", 4096, nullptr, 3, nullptr);
+}
+#endif
+
 void sndTone(int freq) {
+#if BOARD_S3
+  audFreq = freq > 0 ? freq : 0;
+#endif
   if (cfgSd && !BOARD_S3) return;                                 // вывод пищалки занят SD-картой
   if (BUZZER_ACTIVE) digitalWrite(PIN_BUZ, freq > 0 ? HIGH : LOW);
   else ledcWriteTone(PIN_BUZ, freq > 0 ? (uint32_t)freq : 0);
 }
 
 void soundInit() {
+#if BOARD_S3
+  audioInit();
+#endif
   if (cfgSd && !BOARD_S3) return;
   if (BUZZER_ACTIVE) {
     pinMode(PIN_BUZ, OUTPUT);
