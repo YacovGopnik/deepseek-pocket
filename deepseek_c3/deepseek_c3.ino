@@ -36,6 +36,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_ota_ops.h>
+#include <esp_image_format.h>
 #include <Update.h>
 #include "driver/gpio.h"
 #include <WebServer.h>
@@ -7174,6 +7176,7 @@ String otaFromInternet() {
   if (!otaSwitch && !otaNoAsk && choiceScreen(String(L3("Есть новая версия ", "New version ", "有新版本 ")) + String(remote) + L3(" (у вас ", " (you have ", "（当前 ") + String(FW_VERSION) +
                    L3("). Не выключайте гаджет, пока идёт обновление.", "). Do not switch the device off during the update.", "）。更新时请勿关机。"), yn) != 0)
     return "";
+  fwBeforeInstall();
   // Скачать и записать. Иногда сеть отдаёт не файл (страницу-заглушку, обрыв) - тогда пробуем ещё раз.
   String lastErr;
   bool done = false;
@@ -7403,12 +7406,14 @@ String sdDownloadEditions() {
 }
 
 // Поставить сборку с карты (без интернета). При успехе плата перезапускается.
-String sdInstall(int e) {
+String sdInstallPath(const String& path);
+String sdInstall(int e) { return sdInstallPath(sdFwPath(e)); }
+String sdInstallPath(const String& path) {
   File f;
   size_t len = 0;
   {
     SdBus b;
-    f = SD.open(sdFwPath(e).c_str(), "r");
+    f = SD.open(path.c_str(), "r");
     len = f ? (size_t)f.size() : 0;
   }
   if (!f || len < 100000) return L3("Этой сборки на карте нет.", "This edition is not on the card.", "卡上没有这个版本。");
@@ -7468,18 +7473,212 @@ void runSdEditions() {
       int e = eds[(size_t)(k - 1)];
       std::vector<String> yn = splitBar(L3("Поставить|Отмена", "Install|Cancel", "安装|取消"));
       if (choiceScreen(String(edAbout(e)) + L3(" Поставить с карты? Настройки сохранятся. Около 20 секунд.", " Install from the card? Settings are kept. About 20 seconds.",
-                                               " 从卡安装？约20秒。"), yn) == 0)
+                                               " 从卡安装？约20秒。"), yn) == 0) {
+        fwBeforeInstall();
         msg = sdInstall(e);
+      }
     } else return;
     if (msg.length()) viewAnswer(msg, C_WHITE);
   }
 }
 
+// ---------- Откат прошивки ----------
+// 1) В памяти у платы два места под прошивку: после обновления прошлая версия остаётся во втором,
+//    вернуться на неё можно мгновенно (пока её не затёрло следующее обновление).
+// 2) Перед каждым обновлением текущая прошивка копируется на SD-карту (папка fw/, три последние).
+// 3) Если новая прошивка 3 раза подряд не запустилась дольше чем на 20 секунд - плата сама вернёт прошлую.
+const char* edTag(int e) {
+#if BOARD_S3
+  return e == 1 ? "s3-ble" : e == 2 ? "s3-games" : "s3-full";
+#else
+  return e == 1 ? "ble" : e == 2 ? "games" : "full";
+#endif
+}
+
+uint32_t fwImageSize(const esp_partition_t* p) {
+  if (!p) return 0;
+  esp_partition_pos_t pos = {p->address, p->size};
+  esp_image_metadata_t md;
+  if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &pos, &md) == ESP_OK) return md.image_len;
+  return 0;
+}
+
+// Копия работающей прошивки на карту. "" - сделано (или карты нет), иначе ошибка.
+String fwBackupToSd() {
+  if (!sdOk) return "";
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  uint32_t n = fwImageSize(run);
+  if (!n) return L3("не удалось прочитать текущую прошивку", "cannot read the current firmware", "无法读取当前固件");
+  String path = String("/fw/bak-") + edTag(EDITION_ID) + "-v" + String(FW_VERSION) + ".bin";
+  {
+    SdBus b;
+    SD.mkdir("/fw");
+    File old = SD.open(path.c_str(), "r");
+    bool same = old && old.size() == n;
+    if (old) old.close();
+    if (same) return "";                             // такая копия уже есть
+  }
+  showMsg(L3("Сохраняю текущую прошивку на карту...", "Saving the current firmware to the card...", "正在把当前固件保存到卡……"), C_YELLOW);
+  uint8_t* buf = (uint8_t*)malloc(4096);
+  if (!buf) return L3("не хватило памяти", "out of memory", "内存不足");
+  String tmp = path + ".part";
+  bool ok;
+  {
+    SdBus b;
+    File f = SD.open(tmp.c_str(), "w");
+    ok = (bool)f;
+    for (uint32_t off = 0; ok && off < n; off += 4096) {
+      uint32_t k = n - off < 4096 ? n - off : 4096;
+      ok = esp_partition_read(run, off, buf, k) == ESP_OK && f.write(buf, k) == k;
+      if ((off & 0x3FFFF) == 0) otaBar(off, n);
+    }
+    if (f) f.close();
+    if (ok) {
+      SD.remove(path.c_str());
+      ok = SD.rename(tmp.c_str(), path.c_str());
+    } else {
+      SD.remove(tmp.c_str());
+    }
+    // оставить три последние копии
+    std::vector<String> baks;
+    File dir = SD.open("/fw");
+    if (dir) {
+      for (int g = 0; g < 100; g++) {
+        bool isDir = false;
+        String nm = dir.getNextFileName(&isDir);
+        if (!nm.length()) break;
+        int sl = nm.lastIndexOf('/');
+        if (sl >= 0) nm = nm.substring(sl + 1);
+        if (!isDir && nm.startsWith("bak-") && nm.endsWith(".bin")) baks.push_back(nm);
+      }
+      dir.close();
+    }
+    auto ver = [](const String& nm) { int v = nm.lastIndexOf("-v"); return v >= 0 ? nm.substring(v + 2).toInt() : 0; };
+    std::sort(baks.begin(), baks.end(), [&](const String& a, const String& b) { return ver(a) > ver(b); });
+    for (size_t i = 3; i < baks.size(); i++) SD.remove((String("/fw/") + baks[i]).c_str());
+  }
+  free(buf);
+  return ok ? "" : String(L3("не удалось записать копию на карту", "cannot write the copy to the card", "无法写入卡"));
+}
+
+// Перед установкой новой прошивки: копия на карту и запомнить, что стояло.
+void fwBeforeInstall() {
+  String e = fwBackupToSd();
+  if (e.length()) Serial.printf("[backup] %s\n", e.c_str());
+  prefs.begin("dsk", false);
+  prefs.putInt("prevver", FW_VERSION);
+  prefs.putUChar("preved", (uint8_t)EDITION_ID);
+  prefs.end();
+}
+
+void runRollback() {
+  for (;;) {
+    std::vector<String> o;
+    std::vector<String> paths;                       // "" - прошлая версия из памяти платы
+    prefs.begin("dsk", true);
+    int pv = prefs.getInt("prevver", 0);
+    int pe = prefs.getUChar("preved", 0);
+    prefs.end();
+    if (Update.canRollBack()) {
+      o.push_back(String(L3("Прошлая версия из памяти", "Previous version from memory", "内存中的上一版本")) +
+                  (pv ? String(" v") + String(pv) + ", " + edName(pe) : String("")));
+      paths.push_back("");
+    }
+    if (sdOk) {
+      SdBus b;
+      File dir = SD.open("/fw");
+      if (dir) {
+        for (int g = 0; g < 100; g++) {
+          bool isDir = false;
+          String nm = dir.getNextFileName(&isDir);
+          if (!nm.length()) break;
+          int sl = nm.lastIndexOf('/');
+          if (sl >= 0) nm = nm.substring(sl + 1);
+          if (isDir || !nm.startsWith("bak-") || !nm.endsWith(".bin")) continue;
+          String tag = nm.substring(4, nm.lastIndexOf("-v"));
+          int e = -1;
+          for (int k = 0; k < 3; k++)
+            if (tag == edTag(k)) e = k;
+          if (e < 0) continue;                       // копия для другой платы
+          o.push_back(String(L3("С карты: v", "From card: v", "从卡：v")) + nm.substring(nm.lastIndexOf("-v") + 2, nm.length() - 4) + ", " + edName(e));
+          paths.push_back(String("/fw/") + nm);
+        }
+        dir.close();
+      }
+    }
+    if (o.empty()) {
+      viewAnswer(L3("Откатываться пока не на что. Прошлая версия появится в памяти после следующего обновления, "
+                    "а с SD-картой перед каждым обновлением текущая прошивка ещё и копируется на карту.",
+                    "Nothing to roll back to yet. The previous version appears in memory after the next update; with an SD card the current "
+                    "firmware is also copied to the card before every update.", "暂时没有可回退的版本。"),
+                 C_WHITE);
+      return;
+    }
+    o.push_back(L3("Сохранить текущую на карту", "Save the current one to the card", "把当前固件保存到卡"));
+    o.push_back(L3("Назад", "Back", "返回"));
+    int k = choiceScreen(String(L3("Откат прошивки. Сейчас: v", "Roll back firmware. Now: v", "固件回退。当前：v")) + String(FW_VERSION) + ", " + edName(EDITION_ID), o);
+    if (k < 0 || k == (int)o.size() - 1) return;
+    if (k == (int)o.size() - 2) {
+      if (!sdOk) viewAnswer(L3("SD-карта не подключена.", "No SD card.", "没有SD卡。"), C_YELLOW);
+      else {
+        String e = fwBackupToSd();
+        viewAnswer(e.length() ? e : String(L3("Готово: текущая прошивка на карте.", "Done: the current firmware is on the card.", "完成。")), e.length() ? C_RED : C_GREEN);
+      }
+      continue;
+    }
+    std::vector<String> yn = splitBar(L3("Вернуть|Отмена", "Roll back|Cancel", "回退|取消"));
+    if (choiceScreen(String(L3("Поставить «", "Install \"", "安装“")) + o[(size_t)k] + L3("»? Настройки и файлы сохранятся.", "\"? Settings and files are kept.", "”？设置会保留。"), yn) != 0)
+      continue;
+    if (paths[(size_t)k].length() == 0) {
+      prefs.begin("dsk", false);
+      prefs.putInt("prevver", FW_VERSION);
+      prefs.putUChar("preved", (uint8_t)EDITION_ID);
+      prefs.end();
+      if (Update.rollBack()) {
+        showMsg(L3("Возвращаю прошлую версию...", "Rolling back...", "正在回退……"), C_GREEN);
+        delay(1200);
+        ESP.restart();
+      }
+      viewAnswer(L3("Не получилось: прошлая версия в памяти испорчена или уже затёрта.", "Failed: the previous version in memory is damaged or overwritten.", "失败。"), C_RED);
+      continue;
+    }
+    fwBeforeInstall();
+    String msg = sdInstallPath(paths[(size_t)k]);   // при успехе плата перезапускается
+    if (msg.length()) viewAnswer(msg, C_RED);
+  }
+}
+
+// Новая прошивка не запускается: счётчик неудачных запусков. Сбрасывается через 20 с нормальной работы.
+void bootGuard() {
+  prefs.begin("dsk", false);
+  int bf = prefs.getUChar("bootfail", 0);
+  if (bf >= 3 && Update.canRollBack()) {
+    prefs.putUChar("bootfail", 0);
+    prefs.putUChar("rolledback", 1);
+    prefs.end();
+    Serial.println("3 failed starts in a row - rolling back to the previous firmware");
+    Update.rollBack();
+    ESP.restart();
+  }
+  prefs.putUChar("bootfail", (uint8_t)(bf + 1));
+  prefs.end();
+  xTaskCreate(
+      [](void*) {
+        vTaskDelay(pdMS_TO_TICKS(20000));
+        Preferences p;
+        p.begin("dsk", false);
+        p.putUChar("bootfail", 0);
+        p.end();
+        vTaskDelete(nullptr);
+      },
+      "bootok", 3072, nullptr, 1, nullptr);
+}
+
 void runUpdate() {
   for (;;) {
-    std::vector<String> o = splitBar(L3("Проверить в интернете|Сменить сборку|С телефона (файл .bin)|Назад",
-                                        "Check online|Switch edition|From phone (.bin file)|Back", "联网检查|切换版本|从手机（.bin文件）|返回"));
-    if (sdOk) o.insert(o.begin() + 3, L3("Сборки на SD-карте", "Editions on the SD card", "SD卡上的版本"));
+    std::vector<String> o = splitBar(L3("Проверить в интернете|Сменить сборку|С телефона (файл .bin)|Откат прошивки|Назад",
+                                        "Check online|Switch edition|From phone (.bin file)|Roll back firmware|Back", "联网检查|切换版本|从手机（.bin文件）|固件回退|返回"));
+    if (sdOk) o.insert(o.begin() + 4, L3("Сборки на SD-карте", "Editions on the SD card", "SD卡上的版本"));
     int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION) +
                              String(L3(", сборка: ", ", edition: ", "，版本：")) + edName(EDITION_ID),
                          o);
@@ -7501,9 +7700,12 @@ void runUpdate() {
       String msg = otaFromInternet();
       otaTarget = -1;
       if (msg.length()) viewAnswer(msg, C_WHITE);
-    } else if (k == 3 && sdOk) {
+    } else if (k == 3) {
+      runRollback();
+    } else if (k == 4 && sdOk) {
       runSdEditions();
     } else if (k == 2) {
+      fwBeforeInstall();
       viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет раздел «Обновление прошивки» - выберите там файл .bin. "
                     "Чтобы отменить - нажмите кнопку на устройстве.",
                     "The device will now create a Wi-Fi network. Join it from your phone; the \"Firmware update\" section is at the bottom of the page. "
@@ -11733,6 +11935,7 @@ void setup() {
   Serial.begin(115200);
   delay(3000);                       // время на USB и питание
   Serial.println("1: start");
+  bootGuard();
   loadSettings();
   pinMode(PIN_BLK, OUTPUT);
   applyBrightness();                 // подсветка с выбранной яркостью
@@ -11814,6 +12017,14 @@ void setup() {
     prefs.end();
   }
   Serial.println("5: ready (Wi-Fi in background)");
+  prefs.begin("dsk", false);
+  bool rolled = prefs.getUChar("rolledback", 0);
+  if (rolled) prefs.putUChar("rolledback", 0);
+  prefs.end();
+  if (rolled)
+    viewAnswer(L3("Новая прошивка 3 раза подряд не смогла запуститься, поэтому вернулась прошлая версия. Напишите автору, что случилось.",
+                  "The new firmware failed to start 3 times in a row, so the previous version was restored.", "新固件连续3次无法启动，已恢复上一版本。"),
+               C_YELLOW);
 }
 
 // Один вопрос DeepSeek и сколько угодно «по шагам» / «проще».
