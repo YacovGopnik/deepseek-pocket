@@ -1656,7 +1656,7 @@ void joyAnalog(int& dx, int& dy) {
     case J_RIGHT: dx = 2000; dy = 0; break;
   }
   // наклон гаджета (если включён и ручку не трогают): ~30 градусов - до упора
-  if (cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
+  if (BOARD_S3 && cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
     int tx, ty;
     if (accTilt(tx, ty)) {
       auto conv = [](int t) {
@@ -8658,6 +8658,7 @@ void runAdmin() {
   }
 }
 
+#if BOARD_S3
 // Настройки -> Наклон: уровень-«пузырёк», калибровка осей, управление наклоном в играх.
 void accSaveCal() {
   prefs.begin("dsk", false);
@@ -8836,6 +8837,12 @@ void runTilt() {
     delay(10);
   }
 }
+
+#else
+void runTilt() {
+  viewAnswer(L3("Датчик наклона подключается только к гаджету на ESP32-S3.", "The tilt sensor works only on the ESP32-S3 gadget.", "倾斜传感器仅支持ESP32-S3。"), C_YELLOW);
+}
+#endif
 
 bool runSettings() {
   bool changed = false;
