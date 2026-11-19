@@ -12430,6 +12430,21 @@ void drawBoot() {
 }
 
 // ========================= ОСНОВНАЯ ПРОГРАММА =========================
+// Шаги запуска - переживают перезапуск: если плата упала при запуске, на следующем видно, на каком шаге,
+// и этот шаг один раз пропускается (гаджет запустится без звука / датчика / Wi-Fi, но запустится).
+RTC_NOINIT_ATTR uint32_t initStage;
+const char* const INIT_NAMES[] = {"", "zvuk", "datchik naklona", "fajly", "SD-karta", "Wi-Fi", "Bluetooth"};
+int initSkip = 0;                                    // какой шаг пропустить в этот раз
+void initStep(int n) { initStage = 0x1A170000u | (uint32_t)n; }
+bool initRun(int n) {
+  initStep(n);
+  if (initSkip == n) {
+    Serial.printf("init step %d (%s) skipped after a crash\n", n, INIT_NAMES[n]);
+    return false;
+  }
+  return true;
+}
+
 void setup() {
   pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик (с SD-картой здесь MOSI карты - тоже безопасно)
   digitalWrite(PIN_LED, LOW);
@@ -12437,12 +12452,17 @@ void setup() {
   Serial.begin(115200);
   delay(3000);                       // время на USB и питание
   Serial.println("1: start");
+  {
+    esp_reset_reason_t why = esp_reset_reason();
+    bool crashed = why == ESP_RST_PANIC || why == ESP_RST_INT_WDT || why == ESP_RST_TASK_WDT || why == ESP_RST_WDT;
+    if (crashed && (initStage >> 16) == 0x1A17 && (initStage & 0xFF) > 0 && (initStage & 0xFF) < 7) initSkip = (int)(initStage & 0xFF);
+    Serial.printf("reset reason %d, last init step %u, skip %d\n", (int)why, (unsigned)(initStage & 0xFF), initSkip);
+    initStep(0);
+  }
   bootGuard();
   loadSettings();
   pinMode(PIN_BLK, OUTPUT);
   applyBrightness();                 // подсветка с выбранной яркостью
-  soundInit();                       // после подсветки: у пищалки свой канал
-  accInit();                         // датчик наклона (S3)
   g_bgTick = roomTick;               // комната принимает сообщения в фоне, пока вы на экране ввода
   noteActivity();
 
@@ -12453,6 +12473,16 @@ void setup() {
   tft.setSPISpeed(TFT_SPI_HZ);       // быстрее шина - быстрее экран (особенно в гонке)
   drawBoot();                        // заставка «DeepSeek OS»
   Serial.println("2: display ok");
+  if (initSkip) {
+    char b[64];
+    snprintf(b, sizeof(b), "Upalo na shage: %s - propuskayu", INIT_NAMES[initSkip]);
+    bootStage(b);
+    delay(3000);
+  }
+  bootStage("Zvuk");
+  if (initRun(1)) soundInit();       // после подсветки: у пищалки свой канал
+  bootStage("Datchiki");
+  if (initRun(2)) accInit();         // датчик наклона (S3)
 
   analogReadResolution(12);
   if (BATTERY_ENABLED) analogSetPinAttenuation(PIN_BAT, ADC_11db);
@@ -12466,7 +12496,8 @@ void setup() {
 
   sugg.addDict(DICT_RU);
   sugg.addDict(DICT_EN);
-  if (LittleFS.begin(true)) {                // true = отформатировать при первом запуске
+  bootStage("Fajly");
+  if (initRun(3) && LittleFS.begin(true)) {  // true = отформатировать при первом запуске
     loadLearned();
     loadAvatar();
   }
@@ -12497,6 +12528,7 @@ void setup() {
     }
     prefs.end();
   }
+  if (cfgSd && !initRun(4)) cfgSd = 0;
   if (cfgSd) {
     bootStage("SD: 1/3");
     { SdBus test; }                                  // переключение шины туда-обратно: экран должен остаться живым
@@ -12507,9 +12539,11 @@ void setup() {
   Serial.printf("4: learned words: %u\n", (unsigned)sugg.learnedCount());
 
   bootStage("Wi-Fi");
-  if (netSsid.empty()) runPortal();                 // первый запуск: настроить сеть (можно отменить кнопкой)
-  wifiStart();                                       // дальше Wi-Fi подключается в фоне
-  if (ENABLE_BLE && cfgBle) {                        // Bluetooth включён в настройках
+  if (initRun(5)) {
+    if (netSsid.empty()) runPortal();               // первый запуск: настроить сеть (можно отменить кнопкой)
+    wifiStart();                                     // дальше Wi-Fi подключается в фоне
+  }
+  if (ENABLE_BLE && cfgBle && initRun(6)) {          // Bluetooth включён в настройках
     ble::begin(toStd(roomId));
     Serial.printf("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
   }
@@ -12519,6 +12553,7 @@ void setup() {
     prefs.putUChar("sdboot", 0);
     prefs.end();
   }
+  initStep(0);                                       // запуск прошёл
   Serial.println("5: ready (Wi-Fi in background)");
   prefs.begin("dsk", false);
   bool rolled = prefs.getUChar("rolledback", 0);
