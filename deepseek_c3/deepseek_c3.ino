@@ -7454,6 +7454,7 @@ String sdInstallPath(const String& path) {
   return "";
 }
 
+#if ENABLE_FWBACKUP
 void runSdEditions() {
   for (;;) {
     int v = sdFwVersion();
@@ -7484,6 +7485,9 @@ void runSdEditions() {
     if (msg.length()) viewAnswer(msg, C_WHITE);
   }
 }
+#else
+void runSdEditions() { notInEdition(); }
+#endif
 
 // ---------- Откат прошивки ----------
 // 1) В памяти у платы два места под прошивку: после обновления прошлая версия остаётся во втором,
@@ -7592,7 +7596,7 @@ void runRollback() {
                   (pv ? String(" v") + String(pv) + ", " + edName(pe) : String("")));
       paths.push_back("");
     }
-    if (sdOk) {
+    if (sdOk && ENABLE_FWBACKUP) {
       SdBus b;
       File dir = SD.open("/fw");
       if (dir) {
@@ -7622,11 +7626,11 @@ void runRollback() {
                  C_WHITE);
       return;
     }
-    o.push_back(L3("Сохранить текущую на карту", "Save the current one to the card", "把当前固件保存到卡"));
+    if (ENABLE_FWBACKUP) o.push_back(L3("Сохранить текущую на карту", "Save the current one to the card", "把当前固件保存到卡"));
     o.push_back(L3("Назад", "Back", "返回"));
     int k = choiceScreen(String(L3("Откат прошивки. Сейчас: v", "Roll back firmware. Now: v", "固件回退。当前：v")) + String(FW_VERSION) + ", " + edName(EDITION_ID), o);
     if (k < 0 || k == (int)o.size() - 1) return;
-    if (k == (int)o.size() - 2) {
+    if (ENABLE_FWBACKUP && k == (int)o.size() - 2) {
       if (!sdOk) viewAnswer(L3("SD-карта не подключена.", "No SD card.", "没有SD卡。"), C_YELLOW);
       else {
         String e = fwBackupToSd();
@@ -7686,7 +7690,7 @@ void runUpdate() {
   for (;;) {
     std::vector<String> o = splitBar(L3("Проверить в интернете|Сменить сборку|С телефона (файл .bin)|Откат прошивки|Назад",
                                         "Check online|Switch edition|From phone (.bin file)|Roll back firmware|Back", "联网检查|切换版本|从手机（.bin文件）|固件回退|返回"));
-    if (sdOk) o.insert(o.begin() + 4, L3("Сборки на SD-карте", "Editions on the SD card", "SD卡上的版本"));
+    if (sdOk && ENABLE_FWBACKUP) o.insert(o.begin() + 4, L3("Сборки на SD-карте", "Editions on the SD card", "SD卡上的版本"));
     int k = choiceScreen(String(L3("Обновление прошивки. Сейчас стоит версия ", "Firmware update. Installed version: ", "固件更新。当前版本：")) + String(FW_VERSION) +
                              String(L3(", сборка: ", ", edition: ", "，版本：")) + edName(EDITION_ID),
                          o);
@@ -7710,7 +7714,7 @@ void runUpdate() {
       if (msg.length()) viewAnswer(msg, C_WHITE);
     } else if (k == 3) {
       runRollback();
-    } else if (k == 4 && sdOk) {
+    } else if (k == 4 && sdOk && ENABLE_FWBACKUP) {
       runSdEditions();
     } else if (k == 2) {
       fwBeforeInstall();
