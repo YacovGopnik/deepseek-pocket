@@ -92,6 +92,9 @@ struct Parser {
     }
     // Закрывающие </td> и </tr> в старом HTML (Word 97) часто опущены - новая ячейка/строка/таблица
     // сама закрывает предыдущую.
+    if (t == "td" || t == "th") nTd++;
+    if (t == "tr") nTr++;
+    if (t == "table") nTable++;
     if (t == "td" || t == "th") {
       endCell();
       inCell = true;
@@ -119,6 +122,8 @@ struct Parser {
     row.clear();
   }
   int days = 0;                      // сколько строк-дней нашлось (для проверки)
+  int nTd = 0, nTr = 0, nTable = 0, nComment = 0;    // для диагностики
+  size_t commentLen = 0, maxComment = 0;
   // Конец страницы: дописать то, что не закрыто
   void finish() { endRow(); }
 
@@ -203,7 +208,9 @@ struct Parser {
       if (inComment) {                               // <!-- ... -->
         commentTail += (char)c;
         if (commentTail.size() > 3) commentTail.erase(0, commentTail.size() - 3);
-        if (commentTail == "-->") inComment = false;
+        commentLen++;
+        if (commentLen > maxComment) maxComment = commentLen;
+        if (commentTail == "-->" || (c == '>' && commentLen > 4000)) inComment = false;   // слишком длинный - видимо, не комментарий
         continue;
       }
       if (inTag) {
@@ -216,6 +223,8 @@ struct Parser {
             inTag = false;
             inComment = true;
             commentTail.clear();
+            commentLen = 0;
+            nComment++;
           }
         }
         continue;

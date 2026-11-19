@@ -11247,7 +11247,9 @@ String raspDownload() {
     raspFs().remove(tmp.c_str());
     return String(L3("на странице не нашлось расписания (", "no schedule on the page (", "页面上没有课表（")) + String((unsigned)got) +
            L3(" байт, недель ", " bytes, weeks ", " 字节，周 ") + String(p.weeks) + L3(", дней ", ", days ", "，天 ") + String(p.days) +
-           L3("). Начало страницы:\n", "). Page starts with:\n", "）。页面开头：\n") + String(head.substr(0, 300).c_str());
+           "; td " + String(p.nTd) + ", tr " + String(p.nTr) + ", table " + String(p.nTable) + ", <!-- " + String(p.nComment) + "/" +
+           String((unsigned)p.maxComment) + (p.inComment ? " !" : "") + L3("). Начало страницы:\n", "). Page starts with:\n", "）。页面开头：\n") +
+           String(head.substr(0, 300).c_str());
   }
   raspFs().remove("/rasp.txt");
   if (!raspFs().rename(tmp.c_str(), "/rasp.txt")) return L3("не удалось сохранить файл расписания", "cannot save the schedule file", "无法保存课表文件");
