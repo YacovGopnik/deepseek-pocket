@@ -117,6 +117,12 @@ inline void sendPhone(const std::string&) {}
 inline void media(uint16_t) {}
 }  // namespace ble
 #endif
+#ifndef ENABLE_RASP
+#define ENABLE_RASP (FULL_EDITION && !GAMES_EDITION)  // расписание занятий с сайта вуза
+#endif
+#if ENABLE_RASP
+#include "rasp.h"
+#endif
 #ifndef ENABLE_SANDBOX
 #define ENABLE_SANDBOX FULL_EDITION                  // «Песочница» (мир из блоков)
 #endif
@@ -10856,6 +10862,340 @@ void runPcScreen() {
   Serial.println("DSPC BYE");
 }
 
+// ========================= РАСПИСАНИЕ (с сайта вуза) =========================
+// Страница группы скачивается и разбирается по кусочкам (rasp.h), результат хранится в /rasp.txt -
+// смотреть можно и без интернета. Обновляется само при открытии, если прошло больше 6 часов.
+#if ENABLE_RASP
+const char* RASP_URL_DEFAULT = "http://rasp2.achgaa.ru/4.html";
+String raspUrl() {
+  prefs.begin("dsk", true);
+  String u = prefs.getString("raspurl", RASP_URL_DEFAULT);
+  prefs.end();
+  return u.length() ? u : String(RASP_URL_DEFAULT);
+}
+fs::FS& raspFs() {
+  if (sdOk) return SD;
+  return LittleFS;
+}
+
+// Скачать и разобрать. "" - получилось, иначе причина.
+String raspDownload() {
+  if (!wifiOk()) return L3("нет Wi-Fi", "no Wi-Fi", "没有Wi-Fi");
+  String url = raspUrl();
+  WiFiClientSecure sc;
+  sc.setInsecure();
+  WiFiClient pc;
+  HTTPClient http;
+  http.useHTTP10(true);                              // без «chunked»: поток читаем как есть
+  http.setUserAgent("Mozilla/5.0 (DeepSeek pocket)");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+  bool ok = url.startsWith("https://") ? http.begin(sc, url) : http.begin(pc, url);
+  if (!ok) return L3("неверный адрес страницы", "bad page address", "地址错误");
+  int code = http.GET();
+  if (code != 200) {
+    String e = httpErr(code, code < 0 ? HTTPClient::errorToString(code) : String(""));
+    http.end();
+    return e;
+  }
+  WiFiClient* st = http.getStreamPtr();
+  int total = http.getSize();
+  rasp::Parser p;
+  String tmp = "/rasp.tmp";
+  size_t got = 0;
+  bool wrOk = true;
+  {
+    PicBus b;
+    File f = raspFs().open(tmp.c_str(), "w");
+    if (!f) wrOk = false;
+    uint8_t buf[512];
+    uint32_t last = millis();
+    while (wrOk && (http.connected() || st->available()) && (total < 0 || (int)got < total)) {
+      int a = st->available();
+      if (a <= 0) {
+        if (millis() - last > 15000) break;
+        delay(2);
+        continue;
+      }
+      int n = st->readBytes(buf, a > (int)sizeof(buf) ? sizeof(buf) : a);
+      if (n <= 0) continue;
+      last = millis();
+      got += n;
+      p.feed(buf, n);
+      if (!p.out.empty()) {
+        if (f.write((const uint8_t*)p.out.data(), p.out.size()) != p.out.size()) wrOk = false;
+        p.out.clear();
+      }
+    }
+    if (f) f.close();
+  }
+  http.end();
+  Serial.printf("[rasp] %u bytes, %d weeks\n", (unsigned)got, p.weeks);
+  PicBus b;
+  if (!wrOk) {
+    raspFs().remove(tmp.c_str());
+    return L3("не удалось записать (нет места?)", "cannot write (no space?)", "无法写入");
+  }
+  if (p.weeks == 0) {
+    raspFs().remove(tmp.c_str());
+    return L3("на странице не нашлось расписания - проверьте адрес", "no schedule on the page - check the address", "页面上没有课表");
+  }
+  raspFs().remove("/rasp.txt");
+  raspFs().rename(tmp.c_str(), "/rasp.txt");
+  struct tm t;
+  prefs.begin("dsk", false);
+  prefs.putULong("raspts", timeNow(t) ? (uint32_t)time(nullptr) : 1);
+  prefs.end();
+  return "";
+}
+
+bool raspLoad(rasp::Schedule& s, long fromDay) {
+  std::string txt;
+  {
+    PicBus b;
+    File f = raspFs().open("/rasp.txt", "r");
+    if (!f) return false;
+    txt.reserve(f.size() + 1);
+    uint8_t buf[512];
+    for (;;) {
+      int n = f.read(buf, sizeof(buf));
+      if (n <= 0) break;
+      txt.append((const char*)buf, n);
+    }
+    f.close();
+  }
+  rasp::load(txt, s, fromDay);
+  return !s.days.empty();
+}
+
+// Тип занятия из начала названия: «лек.Физика» -> «лекция», «Физика»
+String raspType(const std::string& subj, std::string& rest) {
+  struct T { const char* p; const char* ru; const char* en; };
+  static const T TYPES[] = {{"лек.", "лекция", "lecture"}, {"пр.", "практика", "practice"}, {"лаб.", "лабораторная", "lab"},
+                            {"сем.", "семинар", "seminar"}, {"зач.", "зачёт", "test"}, {"экз.", "экзамен", "exam"}, {"конс.", "консультация", "consult"}};
+  for (const T& t : TYPES)
+    if (subj.rfind(t.p, 0) == 0) {
+      rest = subj.substr(strlen(t.p));
+      while (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+      return cfgLang == LANG_RU ? t.ru : t.en;
+    }
+  rest = subj;
+  return "";
+}
+
+// Минуты от полуночи по «08:05-09:40»: начало и конец
+bool raspSpan(const std::string& t, int& a, int& b) {
+  int h1, m1, h2, m2;
+  if (sscanf(t.c_str(), "%d:%d-%d:%d", &h1, &m1, &h2, &m2) != 4) return false;
+  a = h1 * 60 + m1;
+  b = h2 * 60 + m2;
+  return true;
+}
+
+struct RaspLine {
+  String s;
+  uint16_t c;
+};
+
+void raspAddWrapped(std::vector<RaspLine>& out, const String& s, uint16_t c, int indent) {
+  std::vector<uint16_t> cps;
+  utf8ToCps(s.c_str(), cps);
+  std::vector<Line> lines;
+  wrapCps(cps, 30 - indent, lines);
+  for (const Line& l : lines) {
+    String t;
+    for (int i = 0; i < indent; i++) t += ' ';
+    t += cpsToUtf8(cps.data() + l.start, l.len).c_str();
+    out.push_back({t, c});
+  }
+}
+
+void raspBuild(const rasp::Schedule& s, int di, long today, int nowMin, std::vector<RaspLine>& out) {
+  out.clear();
+  const rasp::Day& d = s.days[(size_t)di];
+  bool isToday = rasp::dayNum(d.y, d.m, d.d) == today;
+  if (d.pairs.empty()) {
+    out.push_back({L3("Пар нет", "No classes", "没有课"), C_GREEN});
+    return;
+  }
+  bool nextMarked = false;
+  for (const rasp::Pair& p : d.pairs) {
+    std::string tm = p.num >= 1 && p.num <= 7 ? s.times[p.num] : "";
+    int a = 0, b = 0;
+    bool span = raspSpan(tm, a, b);
+    uint16_t hc = C_LIGHT;
+    String mark;
+    if (isToday && span && nowMin >= a && nowMin < b) {
+      hc = C_GREEN;
+      mark = L3("  сейчас", "  now", "  现在");
+    } else if (isToday && span && nowMin < a && !nextMarked) {
+      hc = C_YELLOW;
+      mark = L3("  далее", "  next", "  下一节");
+      nextMarked = true;
+    }
+    std::string rest;
+    String type = raspType(p.subj, rest);
+    String head = String(p.num) + ". " + String(tm.c_str()) + (type.length() ? String("  ") + type : String("")) + mark;
+    out.push_back({head, hc});
+    raspAddWrapped(out, String(rest.c_str()), C_WHITE, 2);
+    if (!p.who.empty()) raspAddWrapped(out, String(p.who.c_str()), 0x8C71, 2);
+    out.push_back({"", C_BLACK});
+  }
+}
+
+void raspDraw(const rasp::Schedule& s, int di, const std::vector<RaspLine>& lines, int top, bool isToday) {
+  const rasp::Day& d = s.days[(size_t)di];
+  tft.fillRect(0, 0, 240, 28, isToday ? C_SEL : C_BAR);
+  char date[8];
+  snprintf(date, sizeof(date), "%02d.%02d", d.d, d.m);
+  static const char* const WD_RU[] = {"Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"};
+  static const char* const WD_EN[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  String h = String(d.wd >= 0 ? (cfgLang == LANG_RU ? WD_RU[d.wd] : WD_EN[d.wd]) : "?") + " " + date;
+  drawUtf8(h.c_str(), 6, 2, C_WHITE, isToday ? C_SEL : C_BAR);
+  SmallFont small;
+  String w = String(L3("нед.", "wk ", "周")) + String(d.week);
+  drawUtf8(w.c_str(), 234 - textWidth(w.c_str()), 6, C_LIGHT, isToday ? C_SEL : C_BAR);
+  if (isToday) drawUtf8(L3("сегодня", "today", "今天"), 110, 6, C_YELLOW, C_SEL);
+  const int Y0 = 32, ROWS_V = 12;
+  for (int r = 0; r < ROWS_V; r++) {
+    int y = Y0 + r * 16;
+    size_t i = (size_t)(top + r);
+    tft.fillRect(0, y, 240, 16, C_BLACK);
+    if (i < lines.size()) drawUtf8(lines[i].s.c_str(), 0, y, lines[i].c, C_BLACK);
+  }
+  tft.fillRect(0, Y0 + ROWS_V * 16, 240, 240 - (Y0 + ROWS_V * 16), C_BLACK);
+  drawUtf8(L3("< > день  ^v листать  OK меню", "< > day  ^v scroll  OK menu", "< > 日  ^v 滚动  OK 菜单"), 0, 224, 0x52AA, C_BLACK);
+}
+
+void runRasp() {
+  rasp::Schedule s;
+  struct tm t;
+  bool haveTime = timeNow(t);
+  long today = haveTime ? rasp::dayNum(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday) : 0;
+  int nowMin = haveTime ? t.tm_hour * 60 + t.tm_min : -1;
+  prefs.begin("dsk", true);
+  uint32_t ts = prefs.getULong("raspts", 0);
+  prefs.end();
+  bool have = raspLoad(s, today ? today - 7 : 0);
+  bool stale = !have || (haveTime && ts > 1 && (uint32_t)time(nullptr) - ts > 6 * 3600) || ts == 1;
+  if (stale && wifiOk()) {
+    showMsg(L3("Скачиваю расписание...", "Downloading the schedule...", "正在下载课表……"), C_YELLOW);
+    String err = raspDownload();
+    if (err.length() && !have) {
+      viewAnswer(String(L3("Не получилось скачать расписание: ", "Could not download the schedule: ", "无法下载课表：")) + err, C_RED);
+      return;
+    }
+    if (!err.length()) have = raspLoad(s, today ? today - 7 : 0);
+  }
+  if (!have) {
+    viewAnswer(L3("Расписания ещё нет. Подключите Wi-Fi и откройте приложение снова.", "No schedule yet. Connect Wi-Fi and open the app again.",
+                  "还没有课表。请连接Wi-Fi后再打开。"),
+               C_YELLOW);
+    return;
+  }
+  // открыть на сегодня, а если сегодня пар нет в расписании (воскресенье) - на ближайший следующий день
+  int di = 0;
+  if (today)
+    for (size_t i = 0; i < s.days.size(); i++)
+      if (rasp::dayNum(s.days[i].y, s.days[i].m, s.days[i].d) >= today) {
+        di = (int)i;
+        break;
+      }
+  std::vector<RaspLine> lines;
+  int top = 0;
+  bool redraw = true;
+  uint32_t lastTick = millis();
+  for (;;) {
+    if (redraw) {
+      if (haveTime && timeNow(t)) nowMin = t.tm_hour * 60 + t.tm_min;
+      raspBuild(s, di, today, nowMin, lines);
+      const rasp::Day& d = s.days[(size_t)di];
+      raspDraw(s, di, lines, top, today && rasp::dayNum(d.y, d.m, d.d) == today);
+      redraw = false;
+    }
+    uint8_t j = joyEvent();
+    if (j == J_RIGHT && di + 1 < (int)s.days.size()) { di++; top = 0; redraw = true; }
+    if (j == J_LEFT && di > 0) { di--; top = 0; redraw = true; }
+    if (j == J_DOWN && top + 12 < (int)lines.size()) { top += 3; redraw = true; }
+    if (j == J_UP && top > 0) { top = top > 3 ? top - 3 : 0; redraw = true; }
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) return;
+    if (e == EV_CLICK) {
+      std::vector<String> o = splitBar(L3("Сегодня|Выбрать неделю|Обновить с сайта|Адрес страницы|Выйти", "Today|Pick a week|Update from the site|Page address|Leave",
+                                          "今天|选择周|从网站更新|页面地址|退出"));
+      int k = choiceScreen(String(L3("Расписание ", "Schedule ", "课表 ")) + String(s.group.c_str()), o);
+      if (k == 0 && today) {
+        for (size_t i = 0; i < s.days.size(); i++)
+          if (rasp::dayNum(s.days[i].y, s.days[i].m, s.days[i].d) >= today) {
+            di = (int)i;
+            break;
+          }
+      } else if (k == 1) {
+        std::vector<String> items, right;
+        std::vector<int> first;
+        int lastW = -1;
+        for (size_t i = 0; i < s.days.size(); i++)
+          if (s.days[i].week != lastW) {
+            lastW = s.days[i].week;
+            first.push_back((int)i);
+            char r[16];
+            snprintf(r, sizeof(r), "%02d.%02d", s.days[i].d, s.days[i].m);
+            items.push_back(String(L3("Неделя ", "Week ", "第")) + String(lastW));
+            right.push_back(r);
+          }
+        int sel = 0;
+        for (size_t w = 0; w < first.size(); w++)
+          if (first[w] <= di) sel = (int)w;
+        int w = listScreen(L3("Неделя", "Week", "周"), items, right, sel);
+        if (w >= 0) di = first[(size_t)w];
+      } else if (k == 2) {
+        showMsg(L3("Скачиваю расписание...", "Downloading the schedule...", "正在下载课表……"), C_YELLOW);
+        String err = raspDownload();
+        if (err.length()) viewAnswer(String(L3("Не получилось: ", "Failed: ", "失败：")) + err, C_RED);
+        else {
+          raspLoad(s, today ? today - 7 : 0);
+          if (di >= (int)s.days.size()) di = 0;
+        }
+      } else if (k == 3) {
+        viewAnswer(String(L3("Сейчас: ", "Now: ", "当前：")) + raspUrl() +
+                       L3("\n\nДля другой группы откройте на сайте её расписание и введите адрес страницы (например http://rasp2.achgaa.ru/4.html).",
+                          "\n\nFor another group open its schedule on the site and enter that page address.", "\n\n输入其他班级的页面地址。"),
+                   C_WHITE);
+        pendingInput = raspUrl();
+        String u = inputText();
+        u.trim();
+        if (u.length() > 10 && (u.startsWith("http://") || u.startsWith("https://"))) {
+          prefs.begin("dsk", false);
+          prefs.putString("raspurl", u);
+          prefs.putULong("raspts", 0);
+          prefs.end();
+          showMsg(L3("Скачиваю расписание...", "Downloading the schedule...", "正在下载课表……"), C_YELLOW);
+          String err = raspDownload();
+          if (err.length()) viewAnswer(String(L3("Не получилось: ", "Failed: ", "失败：")) + err, C_RED);
+          else {
+            raspLoad(s, today ? today - 7 : 0);
+            di = 0;
+          }
+        }
+      } else if (k == 4) {
+        return;
+      }
+      top = 0;
+      redraw = true;
+    }
+    if (millis() - lastTick > 30000) {               // «сейчас/далее» меняются со временем
+      lastTick = millis();
+      redraw = true;
+    }
+    if (admService()) redraw = true;
+    delay(5);
+  }
+}
+#else
+void runRasp() { notInEdition(); }
+#endif
+
 // ========================= ТЕЛЕФОН (пульт и клавиатура по Wi-Fi) =========================
 // Сам пульт работает всегда, когда есть Wi-Fi; это приложение только показывает адрес.
 void drawPhonePad(bool wifi, bool conn) {
@@ -10904,14 +11244,14 @@ void runAdmin();
 // Как у телефона: строка состояния сверху, иконки приложений 3x3, несколько страниц.
 // Ручка - выбор (влево/вправо у края - соседняя страница), нажатие - открыть приложение.
 enum AppId : uint8_t {
-  A_CHAT, A_ROOM, A_GAMES, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
+  A_CHAT, A_ROOM, A_GAMES, A_RASP, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
   A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_PCSCR, A_PHONE, A_SETTINGS, A_ADMIN, A_COUNT
 };
-const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
+const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Расписание", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
                                      "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Экран ПК", "Телефон", "Настройки", "Админ"};
-const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
+const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Schedule", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
                                      "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "PC screen", "Phone", "Settings", "Admin"};
-const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
+const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0x1A7B, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
                                      0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x2A2F, 0x0C87, 0x636F, 0xB0A6};
 const int HOME_TOP = 22, CELL_W = 80, CELL_H = 70, TILE = 46;
 
@@ -10982,6 +11322,14 @@ void drawAppIcon(int a, int x, int y) {
       break;
     case A_RATES:
       drawCp(0x20BD, cx - 6, cy - 12, W, col);       // знак рубля
+      break;
+    case A_RASP:                                     // календарь
+      tft.fillRoundRect(x + 7, y + 10, 32, 28, 3, W);
+      tft.fillRect(x + 7, y + 10, 32, 7, 0xF2C5);
+      tft.fillRect(x + 13, y + 6, 3, 7, W);
+      tft.fillRect(x + 30, y + 6, 3, 7, W);
+      for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++) tft.fillRect(x + 10 + c * 7, y + 20 + r * 6, 5, 4, col);
       break;
     case A_CLOCK:                                    // циферблат
       tft.fillCircle(cx, cy, 15, W);
@@ -11056,6 +11404,7 @@ void homeApps(std::vector<uint8_t>& apps) {
     if ((a == A_IMAGES || a == A_GALLERY) && !ENABLE_IMAGES) continue;
     if (a == A_BT && !ENABLE_BLE) continue;
     if (a == A_PHONE && !ENABLE_WIFIPAD) continue;
+    if (a == A_RASP && !ENABLE_RASP) continue;
     if (GAMES_EDITION && a != A_GAMES && a != A_ROOM && a != A_PHONE && a != A_SETTINGS && a != A_ADMIN) continue;
     if ((a == A_REMOTE && !ENABLE_IR) || (a == A_IMAGES && !ENABLE_WEBIMG)) continue;
     apps.push_back((uint8_t)a);
@@ -11150,6 +11499,7 @@ void launchApp(int a) {
     case A_GALLERY: if (!GAMES_EDITION) runGallery(); break;
     case A_WEATHER: if (!GAMES_EDITION) runWeather(); break;
     case A_RATES: if (!GAMES_EDITION) runRates(); break;
+    case A_RASP: runRasp(); break;
     case A_CLOCK: if (!GAMES_EDITION) runClock(); break;
     case A_TIMER: if (!GAMES_EDITION) runTimer(); break;
     case A_STOPW: if (!GAMES_EDITION) runStopwatch(); break;
