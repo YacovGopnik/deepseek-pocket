@@ -1623,6 +1623,35 @@ bool accTilt(int& tx, int& ty) {
   return ok;
 }
 
+// Идёт игра (а не меню): только тогда наклон гаджета работает как ручка.
+// Экраны выбора и сообщения внутри игр наклон не слушают - иначе меню «уезжает».
+bool g_inGame = false;
+struct InGame {
+  bool prev;
+  InGame() : prev(g_inGame) { g_inGame = true; }
+  ~InGame() { g_inGame = prev; }
+};
+struct UiPause {
+  bool prev;
+  UiPause() : prev(g_inGame) { g_inGame = false; }
+  ~UiPause() { g_inGame = prev; }
+};
+
+// Наклон как направление ручки (для игр, которые слушают «вверх/вниз/влево/вправо»). ~15 градусов - срабатывает.
+uint8_t tiltDir() {
+#if BOARD_S3
+  if (!g_inGame || !cfgTilt || !accOk) return J_NONE;
+  int tx, ty;
+  if (!accTilt(tx, ty)) return J_NONE;
+  int ax = abs(tx), ay = abs(ty);
+  if (ax < 66 && ay < 66) return J_NONE;
+  if (ax > ay) return tx > 0 ? J_RIGHT : J_LEFT;
+  return ty > 0 ? J_DOWN : J_UP;
+#else
+  return J_NONE;
+#endif
+}
+
 // Ручка, которую держат на телефоне (пульт по Wi-Fi): J_NONE, если не держат.
 uint8_t padDir() {
   wpad::poll();
@@ -1656,7 +1685,7 @@ void joyAnalog(int& dx, int& dy) {
     case J_RIGHT: dx = 2000; dy = 0; break;
   }
   // наклон гаджета (если включён и ручку не трогают): ~30 градусов - до упора
-  if (BOARD_S3 && cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
+  if (BOARD_S3 && g_inGame && cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
     int tx, ty;
     if (accTilt(tx, ty)) {
       auto conv = [](int t) {
@@ -1686,7 +1715,10 @@ uint8_t joyRawDir() {
   if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
   joyRotate(dx, dy);
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-  if (ax < joyThr() && ay < joyThr()) return padDir();
+  if (ax < joyThr() && ay < joyThr()) {
+    uint8_t p = padDir();
+    return p != J_NONE ? p : tiltDir();
+  }
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
   return dy > 0 ? J_DOWN : J_UP;
 }
@@ -2979,6 +3011,7 @@ void flashCleared() {
 // Возвращает true, если играть заново; false - выйти в меню.
 // Окошко итога: заголовок и строка; нажатие - true (ещё раз), удержание - false (выход).
 bool resultBox(const char* title, const char* line, uint16_t titleCol) {
+  UiPause uiPause;
   if (titleCol == C_GREEN) sndWin();
   else if (titleCol == C_RED) sndLose();
   else sndOk();
@@ -3558,6 +3591,7 @@ void saveMinKey(const char* key, uint32_t v) {           // для рекорд�
 
 // Прокручиваемый список: крупные пункты, справа мелкая подпись. Возвращает номер или -1 (удержание).
 int listScreen(const char* title, const std::vector<String>& items, const std::vector<String>& right, int sel) {
+  UiPause uiPause;
   const int ROW = 30, Y0 = 32, VIS = 6;
   int n = (int)items.size(), top = 0;
   if (sel < 0 || sel >= n) sel = 0;
@@ -3625,6 +3659,7 @@ std::vector<String> splitBar(const char* s) {
 // если не помещается, экран прокручивается так, чтобы выбранный вариант был виден целиком.
 // Возвращает номер варианта или -1 (удержание).
 int choiceScreen(const String& header, const std::vector<String>& opts) {
+  UiPause uiPause;
   struct Row {
     int opt;                                         // -1 - текст вопроса, -2 - пустая строка, иначе номер варианта
     std::vector<uint16_t> cps;
@@ -4359,6 +4394,7 @@ void drawInput(const std::vector<uint16_t>& text) {
 String pendingInput;           // вопрос, который не удалось отправить (вернётся в поле ввода)
 
 String inputText() {
+  UiPause uiPause;
   bool chatMode = g_kbChat;                          // в чате удержание открывает меню чата, в остальных местах - «назад»
   g_kbChat = false;
   SaverArm arm;
@@ -4662,7 +4698,10 @@ BtnEvent viewText(const String& utf8, uint16_t fg) {
   }
 }
 
-void viewAnswer(const String& utf8, uint16_t fg) { viewText(utf8, fg); }
+void viewAnswer(const String& utf8, uint16_t fg) {
+  UiPause uiPause;
+  viewText(utf8, fg);
+}
 
 // ========================= ЛЕНТА ЧАТА =========================
 struct ViewLine {
@@ -10324,10 +10363,23 @@ void runTttNetVia(bool direct) {
       showMsg(String(L3("Ищу соперника в комнате #", "Looking for an opponent in room #", "正在房间里寻找对手 #")) + cfgRoom +
               L3(". Пусть друг тоже откроет «Крестики по сети». Держать - выход.", ". Ask a friend to open Tic-tac-toe online too. Hold - exit.",
                  "。请朋友也打开“联网井字棋”。长按：退出。"), C_YELLOW);
-    uint32_t lastSeek = 0;
+    uint32_t lastSeek = 0, lastConn = millis();
+    int shownLink = -1;
     while (!peer.length()) {
       if (btnEvent() == EV_LONG) return;
       netPump();
+      if (!direct && !mqUp && millis() - lastConn > 5000) {   // связь с сервером пропала - переподключиться
+        lastConn = millis();
+        mqConnect(3000);
+      }
+      if ((int)netLinkUp() != shownLink) {
+        shownLink = netLinkUp();
+        SmallFont small;
+        tft.fillRect(0, 222, 240, 18, C_BLACK);
+        drawUtf8(shownLink ? (direct ? L3("радио: включено", "radio: on", "无线：开") : L3("сервер: подключено", "server: connected", "服务器：已连接"))
+                           : (direct ? L3("радио: нет", "radio: off", "无线：关") : L3("сервер: нет связи, переподключаюсь", "server: no link, reconnecting", "服务器：重连中")),
+                 4, 222, shownLink ? C_GREEN : C_RED, C_BLACK);
+      }
       if (netLinkUp() && millis() - lastSeek > 2000) {
         lastSeek = millis();
         netSend("ttt\tseek");
@@ -10453,9 +10505,10 @@ const uint16_t C_SQ_LIGHT = 0xEE54, C_SQ_DARK = 0x7CAB, C_SQ_LAST = 0xCE60;
 void chessPause() { delay(1); }
 
 // Клетка: фон, отметки, фигура. mark: 0 - нет, 1 - сюда можно пойти, 2 - курсор, 4 - выбрана, 8 - последний ход.
+bool chsFlip = false;                                // смотреть со стороны чёрных (сетевая партия)
 void drawChessSquare(int s, int mark) {
   int r = s >> 3, f = s & 7;
-  int x = CH_X0 + f * CH_CELL, y = (7 - r) * CH_CELL;
+  int x = CH_X0 + (chsFlip ? 7 - f : f) * CH_CELL, y = (chsFlip ? r : 7 - r) * CH_CELL;
   uint16_t bg = (mark & 8) ? C_SQ_LAST : ((r + f) & 1) ? C_SQ_LIGHT : C_SQ_DARK;
   tft.fillRect(x, y, CH_CELL, CH_CELL, bg);
   int8_t p = chs.sq[s];
@@ -10712,6 +10765,255 @@ void runChess() {
     char b[32];
     snprintf(b, sizeof(b), "%s %u", L3("Ходов:", "Moves:", "回合："), (unsigned)chs.full);
     if (!resultBox(title, b, col)) return;
+  }
+}
+
+// ---------- Шахматы вдвоём: через сервер комнаты или напрямую по радио ----------
+// Сообщения: «chs seek», «chs start <кому> <1 - ты белые>», «chs move <кому> <ход>», «chs bye <кому>», «chs resign <кому>».
+void runChessNet(bool direct) {
+  if (!ENABLE_CHESS) {
+    notInEdition();
+    return;
+  }
+  if (direct) {
+    if (!enow::begin()) {
+      viewAnswer(L3("Не удалось включить прямую связь.", "Could not start the direct link.", "无法启动直连。"), C_RED);
+      return;
+    }
+  } else {
+    if (inRoom) return;
+    if (!waitWifi(false)) return;
+    if (!cfgNick.length() && !askNick()) return;
+    if (!mqUp) {
+      showMsg(L3("Подключаюсь...", "Connecting...", "正在连接……"), C_YELLOW);
+      mqConnect(6000);
+    }
+    inRoom = true;
+  }
+  g_netDirect = direct;
+  struct Leave {
+    bool direct;
+    ~Leave() {
+      chsFlip = false;
+      if (direct) {
+        enow::end();
+        g_netDirect = false;
+      } else {
+        inRoom = false;
+        if (!(cfgRoomBg && cfgNick.length())) mqDrop();
+      }
+    }
+  } leave{direct};
+  int wins = 0, losses = 0, round = 0;
+  for (;;) {
+    // --- поиск соперника (как в «Крестиках по сети») ---
+    String peer, peerNick;
+    bool myWhite = true;
+    netInbox.clear();
+    showMsg(direct ? L3("Ищу гаджет рядом. Пусть друг откроет «Шахматы рядом». Держать - выход.",
+                        "Looking for a device nearby. Ask a friend to open Chess nearby. Hold - exit.", "正在寻找附近的设备。长按：退出。")
+                   : String(L3("Ищу соперника в комнате #", "Looking for an opponent in room #", "正在房间里寻找对手 #")) + cfgRoom +
+                         L3(". Пусть друг откроет «Шахматы по сети». Держать - выход.", ". Ask a friend to open Chess online. Hold - exit.", "。长按：退出。"),
+            C_YELLOW);
+    uint32_t lastSeek = 0, lastConn = millis();
+    int shownLink = -1;
+    while (!peer.length()) {
+      if (btnEvent() == EV_LONG) return;
+      netPump();
+      if (!direct && !mqUp && millis() - lastConn > 5000) {
+        lastConn = millis();
+        mqConnect(3000);
+      }
+      if ((int)netLinkUp() != shownLink) {
+        shownLink = netLinkUp();
+        SmallFont small;
+        tft.fillRect(0, 222, 240, 18, C_BLACK);
+        drawUtf8(shownLink ? (direct ? L3("радио: включено", "radio: on", "无线：开") : L3("сервер: подключено", "server: connected", "服务器：已连接"))
+                           : (direct ? L3("радио: нет", "radio: off", "无线：关") : L3("сервер: нет связи, переподключаюсь", "server: no link, reconnecting", "服务器：重连中")),
+                 4, 222, shownLink ? C_GREEN : C_RED, C_BLACK);
+      }
+      if (netLinkUp() && millis() - lastSeek > 2000) {
+        lastSeek = millis();
+        netSend("chs\tseek");
+      }
+      String id, nick, game, cmd, to;
+      int arg;
+      while (netNext(id, nick, game, cmd, to, arg)) {
+        if (game != "chs") continue;
+        if (cmd == "seek" && strcmp(roomId.c_str(), id.c_str()) < 0) {
+          peer = id;
+          peerNick = nick;
+          myWhite = round % 2 == 0;                  // цвет чередуется от партии к партии
+          netSend(String("chs\tstart\t") + peer + "\t" + (myWhite ? "0" : "1"));
+          break;
+        }
+        if (cmd == "start" && to == roomId) {
+          peer = id;
+          peerNick = nick;
+          myWhite = arg == 1;
+          break;
+        }
+      }
+      delay(10);
+    }
+    sndOk();
+    if (!peerNick.length()) peerNick = peer;
+    // --- партия ---
+    chs.reset();
+    chsFlip = !myWhite;
+    int cur = myWhite ? 12 : 52, sel = -1, lastFrom = -1, lastTo = -1;
+    uint64_t targets = 0;
+    chess::Move legal[chess::MAX_MOVES];
+    int nLegal = chs.legal(legal);
+    auto mine = [&](int s) { return myWhite ? chs.sq[s] > 0 : chs.sq[s] < 0; };
+    auto myTurn = [&]() { return chs.white == myWhite; };
+    auto markOf = [&](int s) {
+      return ((targets >> s) & 1 ? 1 : 0) | (s == cur ? 2 : 0) | (s == sel ? 4 : 0) | ((s == lastFrom || s == lastTo) ? 8 : 0);
+    };
+    auto drawAll = [&]() {
+      tft.fillRect(0, 0, CH_X0, 216, C_BLACK);
+      tft.fillRect(CH_X0 + 216, 0, 240 - CH_X0 - 216, 216, C_BLACK);
+      {
+        SmallFont small;
+        for (int r = 0; r < 8; r++) drawCp((uint16_t)('1' + r), 4, (chsFlip ? r : 7 - r) * CH_CELL + 6, C_LIGHT, C_BLACK);
+      }
+      for (int sq = 0; sq < 64; sq++) drawChessSquare(sq, markOf(sq));
+    };
+    auto status = [&]() {
+      String t = myTurn() ? String(L3("Ваш ход", "Your move", "轮到你")) + (myWhite ? L3(" (белые)", " (White)", "（白）") : L3(" (чёрные)", " (Black)", "（黑）"))
+                          : String(L3("Ход: ", "Move: ", "对手：")) + peerNick;
+      if (myTurn() && chs.inCheck(myWhite)) t = L3("Вам шах!", "You are in check!", "将军！");
+      chessStatus(String(wins) + ":" + String(losses) + "  " + t, myTurn() ? (chs.inCheck(myWhite) ? C_RED : C_GREEN) : C_YELLOW);
+    };
+    tft.fillScreen(C_BLACK);
+    drawAll();
+    status();
+    chess::Result res = chs.result();
+    bool gone = false, resigned = false, oppResigned = false;
+    uint32_t lastHeard = millis();
+    while (res == chess::PLAYING && !gone && !resigned && !oppResigned) {
+      netPump();
+      String id, nick, game, cmd, to;
+      int arg;
+      while (netNext(id, nick, game, cmd, to, arg)) {
+        if (game != "chs" || id != peer) continue;
+        lastHeard = millis();
+        if (cmd == "bye") gone = true;
+        if (cmd == "resign" && to == roomId) oppResigned = true;
+        if (cmd == "move" && to == roomId && !myTurn() && arg >= 0) {
+          chess::Move om = 0;                        // ход соперника - только если он есть среди возможных
+          for (int i = 0; i < nLegal; i++)
+            if (legal[i] == (chess::Move)arg) om = legal[i];
+          if (om) {
+            chess::Undo u;
+            chs.make(om, u);
+            lastFrom = chess::mFrom(om);
+            lastTo = chess::mTo(om);
+            nLegal = chs.legal(legal);
+            sel = -1;
+            targets = 0;
+            drawAll();
+            beep(1, 700, 40);
+            res = chs.result();
+            status();
+          }
+        }
+      }
+      if (millis() - lastHeard > 600000UL || (!netLinkUp() && millis() - lastHeard > (direct ? 8000UL : 60000UL))) gone = true;
+      if (myTurn() && millis() - lastHeard > 30000UL) lastHeard = millis();   // думаю я - соперник может молчать
+      uint8_t j = joyEvent();
+      if (j != J_NONE) {
+        int old = cur, r = cur >> 3, f = cur & 7;
+        int dir = chsFlip ? -1 : 1;                  // у чёрных доска перевёрнута
+        if (j == J_LEFT) f = (f + 8 - dir) % 8;
+        if (j == J_RIGHT) f = (f + 8 + dir) % 8;
+        if (j == J_UP) r = (r + 8 + dir) % 8;
+        if (j == J_DOWN) r = (r + 8 - dir) % 8;
+        cur = r * 8 + f;
+        drawChessSquare(old, markOf(old));
+        drawChessSquare(cur, markOf(cur));
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        std::vector<String> o = splitBar(L3("Продолжить|Сдаться|Выйти", "Continue|Resign|Leave", "继续|认输|退出"));
+        int k = choiceScreen(L3("Шахматы по сети", "Chess online", "联网国际象棋"), o);
+        if (k == 1) {
+          netSend(String("chs\tresign\t") + peer);
+          resigned = true;
+          break;
+        }
+        if (k == 2) {
+          netSend(String("chs\tbye\t") + peer);
+          return;
+        }
+        tft.fillScreen(C_BLACK);
+        drawAll();
+        status();
+      }
+      if (e == EV_CLICK && myTurn()) {
+        if (sel >= 0 && ((targets >> cur) & 1)) {      // мой ход
+          chess::Move mv = 0;
+          for (int i = 0; i < nLegal; i++)
+            if (chess::mFrom(legal[i]) == sel && chess::mTo(legal[i]) == cur &&
+                (!chess::mPromo(legal[i]) || chess::mPromo(legal[i]) == chess::QUEEN))
+              mv = legal[i];
+          chess::Undo u;
+          chs.make(mv, u);
+          netSend(String("chs\tmove\t") + peer + "\t" + String((unsigned)mv));
+          lastFrom = sel;
+          lastTo = cur;
+          sel = -1;
+          targets = 0;
+          nLegal = chs.legal(legal);
+          lastHeard = millis();
+          drawAll();
+          res = chs.result();
+          status();
+        } else if (mine(cur) && cur != sel) {
+          uint64_t t = 0;
+          for (int i = 0; i < nLegal; i++)
+            if (chess::mFrom(legal[i]) == cur) t |= 1ULL << chess::mTo(legal[i]);
+          if (t) {
+            sel = cur;
+            targets = t;
+            drawAll();
+          } else {
+            chessStatus(L3("Этой фигурой сейчас не пойти", "This piece cannot move now", "这个棋子现在不能走"), C_YELLOW);
+          }
+        } else if (sel >= 0) {
+          sel = -1;
+          targets = 0;
+          drawAll();
+        }
+      }
+      delay(3);
+    }
+    round++;
+    if (gone) {
+      showMsg(L3("Соперник вышел из игры.", "The opponent has left.", "对手已离开。"), C_YELLOW);
+      delay(1800);
+      continue;
+    }
+    delay(700);
+    bool won = oppResigned || (res == chess::MATE_WHITE_WINS && myWhite) || (res == chess::MATE_BLACK_WINS && !myWhite);
+    bool lost = resigned || (res == chess::MATE_WHITE_WINS && !myWhite) || (res == chess::MATE_BLACK_WINS && myWhite);
+    if (won) {
+      wins++;
+      saveBestKey("bchnet", loadBestKey("bchnet") + 1);
+    } else if (lost) {
+      losses++;
+    }
+    const char* title = oppResigned ? L3("Соперник сдался!", "The opponent resigned!", "对手认输！")
+                        : resigned  ? L3("Вы сдались", "You resigned", "你认输了")
+                        : won       ? L3("Мат! Вы победили", "Checkmate! You win", "将死！你赢了")
+                        : lost      ? L3("Вам мат", "Checkmate. You lose", "你被将死了")
+                                    : L3("Ничья", "Draw", "和棋");
+    char b[24];
+    snprintf(b, sizeof(b), "%d : %d", wins, losses);
+    if (!resultBox(title, b, won ? C_GREEN : lost ? C_RED : C_YELLOW)) {
+      netSend(String("chs\tbye\t") + peer);
+      return;
+    }
   }
 }
 
@@ -11467,16 +11769,18 @@ void runGamesMenu() {
                                  L3("Сапёр", "Minesweeper", "扫雷"), L3("Повтори", "Repeat", "记忆重复"),
                                  L3("Крестики-нолики", "Tic-tac-toe", "井字棋"), L3("Крестики по сети", "Tic-tac-toe online", "联网井字棋"),
                                  L3("Крестики рядом", "Tic-tac-toe nearby", "附近井字棋"), L3("Шахматы", "Chess", "国际象棋"),
+                                 L3("Шахматы по сети", "Chess online", "联网国际象棋"), L3("Шахматы рядом", "Chess nearby", "附近国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
                                  L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bquiz", "", "bguess", "bfps", "", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "", ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
       right.push_back(v ? String((unsigned)v) : String(""));
     }
     sel = listScreen(T().menuGames, names, right, sel);
+    InGame inGame;                                   // наклон гаджета работает только внутри игр
     switch (sel) {
       case 0: runGame(); break;
       case 1: run2048(); break;
@@ -11496,12 +11800,14 @@ void runGamesMenu() {
       case 15: runTttNet(); break;
       case 16: runTttNear(); break;
       case 17: runChess(); break;
-      case 18: runQuiz(); break;
-      case 19: runStory(); break;
-      case 20: runGuess(); break;
-      case 21: runFps3d(); break;
-      case 22: runSandbox(); break;
-      case 23: runHiScores(); break;
+      case 18: runChessNet(false); break;
+      case 19: runChessNet(true); break;
+      case 20: runQuiz(); break;
+      case 21: runStory(); break;
+      case 22: runGuess(); break;
+      case 23: runFps3d(); break;
+      case 24: runSandbox(); break;
+      case 25: runHiScores(); break;
       default: return;                               // «Назад» или удержание
     }
   }
