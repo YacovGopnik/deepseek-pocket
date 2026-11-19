@@ -25,6 +25,14 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+
+// Плата: ESP32-C3 Super Mini (как раньше) или ESP32-S3 (S3-Zero / S3 Super Mini / DevKitC-1) - выбирается
+// при сборке (плата в Arduino IDE), распиновка подставляется сама.
+#if CONFIG_IDF_TARGET_ESP32S3
+#define BOARD_S3 1
+#else
+#define BOARD_S3 0
+#endif
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -219,13 +227,21 @@ bool BATTERY_ENABLED = false;      // выясняется при включен
 // Пищалка (необязательно): «+» на GPIO20 (на плате подписан 20 или RX), «-» на GND.
 // Пассивная (пьезо, умеет разные ноты) - false; активная (со своим генератором, только «бип») - true.
 // Если пищалки нет - ничего менять не нужно: звук просто не будет слышен.
+#if BOARD_S3
+const int PIN_BUZ = 44;                              // S3: RX
+#else
 const int PIN_BUZ = 20;
+#endif
 const bool BUZZER_ACTIVE = false;
 
 // ИК-светодиод для «Пульта» (необязательно): GPIO8 -> база транзистора (S9014 и подобные, NPN),
 // коллектор -> 5V, эмиттер -> «+» светодиода (длинная ножка), «-» светодиода -> резистор 33-68 Ом -> GND.
 // Если светодиода нет - ничего менять не нужно. На GPIO8 сидит и синий огонёк платы: при отправке он мигает.
+#if BOARD_S3
+const int PIN_IR = 43;                               // S3: TX
+#else
 const int PIN_IR = 8;
+#endif
 const int IR_TRIM_US = 3;          // поправка на время работы самих команд, мкс (подстройка несущей частоты)
 #define IR_DB_REPO "logickworkshop/Flipper-IRDB"   // база пультов на GitHub
 #define IR_DB_BRANCH "main"
@@ -250,12 +266,23 @@ const int IR_TRIM_US = 3;          // поправка на время рабо�
 // (он нужен, чтобы плата нормально запускалась: при включении на GPIO2 должно быть «высокое» напряжение).
 // Эмиттер -> GND, коллектор -> «-» светодиода, «+» светодиода -> резистор 47 Ом -> 5V.
 // При включении платы светодиод на мгновение вспыхивает - это нормально.
+#if BOARD_S3
+const int PIN_LED = 18;                              // S3: площадка 18 снизу
+#else
 const int PIN_LED = 2;
+#endif
 bool torchOn = false;
 
+#if BOARD_S3
+// ESP32-S3 (S3-Zero): экран SCL 12, SDA 11, DC 10, RES 9, BLK 8; батарея - делитель на GPIO3
+const int PIN_SCK = 12, PIN_MOSI = 11, PIN_DC = 10, PIN_BLK = 8;
+const int PIN_RST_A = 9, PIN_RST_B = 3;
+const int PIN_BAT = 3;
+#else
 const int PIN_SCK = 4, PIN_MOSI = 6, PIN_DC = 5, PIN_BLK = 10;
 const int PIN_RST_A = 21, PIN_RST_B = 3;        // сброс экрана: GPIO21 (схема с батареей) или GPIO3 (старая схема)
 const int PIN_BAT = 3;                          // середина делителя напряжения батареи
+#endif
 
 // Батарея
 const float BAT_DIVIDER = 2.0;       // 100 кОм + 100 кОм = делит пополам
@@ -264,7 +291,11 @@ const float BAT_CALIBRATION = 1.0;   // поправка: (напряжение 
 // Память чата: сколько последних сообщений (ваших и ответов) отправлять DeepSeek
 const int MAX_HISTORY_MSGS = 10;          // 5 вопросов и 5 ответов
 const unsigned MAX_HISTORY_CHARS = 5000;  // и не больше этого объёма текста
+#if BOARD_S3
+const int PIN_JOY_X = 1, PIN_JOY_Y = 2, PIN_SW = 7;
+#else
 const int PIN_JOY_X = 0, PIN_JOY_Y = 1, PIN_SW = 7;
+#endif
 
 // Имена моделей пробуются по очереди, рабочее запоминается.
 struct Attempt { const char* model; bool noThink; };
@@ -1143,13 +1174,13 @@ void showMsg(const String& s, uint16_t fg) {
 extern bool screenAsleep;
 
 void sndTone(int freq) {
-  if (cfgSd) return;                                 // вывод пищалки занят SD-картой
+  if (cfgSd && !BOARD_S3) return;                                 // вывод пищалки занят SD-картой
   if (BUZZER_ACTIVE) digitalWrite(PIN_BUZ, freq > 0 ? HIGH : LOW);
   else ledcWriteTone(PIN_BUZ, freq > 0 ? (uint32_t)freq : 0);
 }
 
 void soundInit() {
-  if (cfgSd) return;
+  if (cfgSd && !BOARD_S3) return;
   if (BUZZER_ACTIVE) {
     pinMode(PIN_BUZ, OUTPUT);
     digitalWrite(PIN_BUZ, LOW);
@@ -1502,13 +1533,32 @@ String portalNote;                                   // что только чт
 // Карта подключается вместо ИК-пульта, фонарика и пищалки: SCK - GPIO8, MOSI - GPIO2, MISO - GPIO20, CS - GPIO9
 // (плюс 10 кОм от GPIO2 и от GPIO9 к 3V3). Включается в Настройках. Шина SPI у платы одна, а у экрана нет CS,
 // поэтому на время работы с картой выводы шины переключаются на карту, потом обратно на экран.
+#if BOARD_S3
+const int SD_SCK = 5, SD_MOSI = 6, SD_MISO = 13, SD_CS = 4;   // S3: у карты своя шина SPI
+#else
 const int SD_SCK = 8, SD_MOSI = 2, SD_MISO = 20, SD_CS = 9;
+#endif
 bool sdOk = false;                                   // карта смонтирована
 int sdDepth = 0;
 // Шаг работы с картой - переживает перезапуск кнопкой RST: если гаджет завис, после RST видно, где.
 RTC_NOINIT_ATTR uint32_t sdDiagStage;
 #define SD_STAGE(n) (sdDiagStage = 0x5D000000u | (uint32_t)(n))
 
+#if BOARD_S3
+// У S3 две свободные шины SPI: карта на своей, ничего переключать не нужно.
+SPIClass sdSpi(HSPI);
+#define SD_SPI sdSpi
+void sdBusOn() {
+  static bool started = false;
+  sdDepth++;
+  if (!started) {
+    sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
+    started = true;
+  }
+}
+void sdBusOff() { sdDepth--; }
+#else
+#define SD_SPI SPI
 // Шина не останавливается: на работающей шине через матрицу GPIO переключаются только выводы.
 void sdBusOn() {
   if (sdDepth++ > 0) return;
@@ -1552,6 +1602,8 @@ void sdBusOff() {
   SD_STAGE(7);
 }
 
+#endif
+
 struct SdBus {                                       // на время жизни - шина у карты
   SdBus() { sdBusOn(); }
   ~SdBus() { sdBusOff(); }
@@ -1579,7 +1631,7 @@ bool sdMount() {
       delay(200);
     }
     SD_STAGE(8);
-    sdOk = SD.begin(SD_CS, SPI, 4000000, "/sd", 4);   // 4 МГц: на проводах 8 МГц работало через раз
+    sdOk = SD.begin(SD_CS, SD_SPI, 4000000, "/sd", 4);   // 4 МГц: на проводах 8 МГц работало через раз
     SD_STAGE(9);
   }
   if (sdOk) {
@@ -1599,7 +1651,7 @@ void sdRetryService() {
   last = millis();
   SdBus bus;
   SD.end();
-  sdOk = SD.begin(SD_CS, SPI, 4000000, "/sd", 4);
+  sdOk = SD.begin(SD_CS, SD_SPI, 4000000, "/sd", 4);
   if (sdOk) {
     SD.mkdir("/pics");
     SD.mkdir("/fw");
@@ -2086,7 +2138,11 @@ void notInEdition() {
 }
 
 // Сборки прошивки: 0 - полная, 1 - с Bluetooth, 2 - игровая.
+#if BOARD_S3
+const char* edFile(int e) { return e == 1 ? "firmware-s3-ble.bin" : e == 2 ? "firmware-s3-games.bin" : "firmware-s3.bin"; }
+#else
 const char* edFile(int e) { return e == 1 ? "firmware-ble.bin" : e == 2 ? "firmware-games.bin" : "firmware.bin"; }
+#endif
 const char* edName(int e) {
   return e == 1 ? L3("с Bluetooth", "Bluetooth", "蓝牙版") : e == 2 ? L3("игровая", "games", "游戏版") : L3("полная", "full", "完整版");
 }
@@ -7001,7 +7057,7 @@ void runRemote() {
     notInEdition();
     return;
   }
-  if (cfgSd) {
+  if (cfgSd && !BOARD_S3) {
     viewAnswer(L3("Вывод ИК-светодиода занят SD-картой.", "The IR LED pin is used by the SD card.", "红外引脚已被SD卡占用。"), C_YELLOW);
     return;
   }
@@ -7236,7 +7292,11 @@ void handleFwDone() {
 
 // ---------- Сборки прошивки на SD-карте ----------
 // Обе сборки (полная и с Bluetooth) скачиваются с GitHub на карту; переключаться между ними можно без интернета.
+#if BOARD_S3
+String sdFwPath(int e) { return e == 1 ? "/fw/s3-ble.bin" : e == 2 ? "/fw/s3-games.bin" : "/fw/s3-full.bin"; }
+#else
 String sdFwPath(int e) { return e == 1 ? "/fw/ble.bin" : e == 2 ? "/fw/games.bin" : "/fw/full.bin"; }
+#endif
 
 int sdFwVersion() {
   SdBus b;
@@ -8153,7 +8213,7 @@ bool runSettings() {
           notInEdition();
           break;
         }
-        if (cfgSd) {
+        if (cfgSd && !BOARD_S3) {
           viewAnswer(L3("Вывод фонарика занят SD-картой.", "The torch pin is used by the SD card.", "手电筒引脚已被SD卡占用。"), C_YELLOW);
           break;
         }
