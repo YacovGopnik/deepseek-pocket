@@ -11074,6 +11074,7 @@ void runRasp() {
   prefs.end();
   bool have = raspLoad(s, today ? today - 7 : 0);
   bool stale = !have || (haveTime && ts > 1 && (uint32_t)time(nullptr) - ts > 6 * 3600) || ts == 1;
+  if (!have && !waitWifi(false)) return;             // расписания нет совсем - ждём сеть (можно отменить)
   if (stale && wifiOk()) {
     showMsg(L3("Скачиваю расписание...", "Downloading the schedule...", "正在下载课表……"), C_YELLOW);
     String err = raspDownload();
@@ -11081,11 +11082,17 @@ void runRasp() {
       viewAnswer(String(L3("Не получилось скачать расписание: ", "Could not download the schedule: ", "无法下载课表：")) + err, C_RED);
       return;
     }
-    if (!err.length()) have = raspLoad(s, today ? today - 7 : 0);
+    if (!err.length()) {
+      have = raspLoad(s, 0);                         // всё, что есть на сайте
+      if (have && today) {
+        rasp::Schedule cur;
+        if (raspLoad(cur, today - 7)) s = cur;       // а если есть текущие недели - только их
+      }
+    }
   }
   if (!have) {
-    viewAnswer(L3("Расписания ещё нет. Подключите Wi-Fi и откройте приложение снова.", "No schedule yet. Connect Wi-Fi and open the app again.",
-                  "还没有课表。请连接Wi-Fi后再打开。"),
+    viewAnswer(L3("Расписание скачалось, но не читается. Нажмите «Обновить с сайта» ещё раз или проверьте адрес страницы.",
+                  "The schedule was downloaded but cannot be read. Try updating again or check the page address.", "课表无法读取。"),
                C_YELLOW);
     return;
   }
