@@ -117,6 +117,9 @@ inline void sendPhone(const std::string&) {}
 inline void media(uint16_t) {}
 }  // namespace ble
 #endif
+#ifndef ENABLE_PCSCREEN
+#define ENABLE_PCSCREEN FULL_EDITION                 // «Экран ПК» (картинки с компьютера по USB)
+#endif
 #ifndef ENABLE_RASP
 #define ENABLE_RASP (FULL_EDITION && !GAMES_EDITION)  // расписание занятий с сайта вуза
 #endif
@@ -10742,6 +10745,7 @@ void runGamesMenu() {
   }
 }
 
+#if ENABLE_PCSCREEN
 // ========================= ЭКРАН ПК (картинки с компьютера по USB) =========================
 // На компьютере страница pc.html в Chrome пишет в USB-порт гаджета (Web Serial).
 // ПК -> "DSJ1" + длина JPEG (4 байта, младший первым) + флаги (1 = ещё и сохранить в галерею);
@@ -10883,6 +10887,9 @@ void runPcScreen() {
   }
   Serial.println("DSPC BYE");
 }
+#else
+void runPcScreen() { notInEdition(); }
+#endif
 
 // ========================= РАСПИСАНИЕ (с сайта вуза) =========================
 // Страница группы скачивается и разбирается по кусочкам (rasp.h), результат хранится в /rasp.txt -
@@ -11429,6 +11436,7 @@ void homeApps(std::vector<uint8_t>& apps) {
     if (a == A_BT && !ENABLE_BLE) continue;
     if (a == A_PHONE && !ENABLE_WIFIPAD) continue;
     if (a == A_RASP && !ENABLE_RASP) continue;
+    if (a == A_PCSCR && !ENABLE_PCSCREEN) continue;
     if (GAMES_EDITION && a != A_GAMES && a != A_ROOM && a != A_PHONE && a != A_SETTINGS && a != A_ADMIN) continue;
     if ((a == A_REMOTE && !ENABLE_IR) || (a == A_IMAGES && !ENABLE_WEBIMG)) continue;
     apps.push_back((uint8_t)a);
