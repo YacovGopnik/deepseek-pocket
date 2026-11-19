@@ -127,6 +127,9 @@ inline void sendPhone(const std::string&) {}
 inline void media(uint16_t) {}
 }  // namespace ble
 #endif
+#ifndef ENABLE_FWBACKUP
+#define ENABLE_FWBACKUP (!(ENABLE_BLE && !BOARD_S3))  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
+#endif
 #ifndef ENABLE_PCSCREEN
 #define ENABLE_PCSCREEN FULL_EDITION                 // «Экран ПК» (картинки с компьютера по USB)
 #endif
@@ -7496,16 +7499,21 @@ const char* edTag(int e) {
 }
 
 uint32_t fwImageSize(const esp_partition_t* p) {
+#if !ENABLE_FWBACKUP
+  (void)p;
+  return 0;
+#else
   if (!p) return 0;
   esp_partition_pos_t pos = {p->address, p->size};
   esp_image_metadata_t md;
   if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &pos, &md) == ESP_OK) return md.image_len;
   return 0;
+#endif
 }
 
 // Копия работающей прошивки на карту. "" - сделано (или карты нет), иначе ошибка.
 String fwBackupToSd() {
-  if (!sdOk) return "";
+  if (!sdOk || !ENABLE_FWBACKUP) return "";
   const esp_partition_t* run = esp_ota_get_running_partition();
   uint32_t n = fwImageSize(run);
   if (!n) return L3("не удалось прочитать текущую прошивку", "cannot read the current firmware", "无法读取当前固件");
