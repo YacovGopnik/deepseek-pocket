@@ -1425,6 +1425,112 @@ void accSet(uint8_t r, uint8_t v) {
 #endif
 }
 
+// ---------- Гироскоп на той же шине I2C (MPU6050/6500/9250 или L3G4200D/L3GD20) ----------
+// У MPU есть и свой акселерометр: если ADXL345 нет, наклон берётся с него.
+uint8_t gyroAddr = 0, gyroType = 0;                  // 1 - MPU60x0/65x0/92x0, 2 - L3G
+const char* gyroName = "";
+float gyroBias[3] = {0, 0, 0};                       // показания в покое
+int8_t gAxX = -1, gSgX = 1, gAxY = -1, gSgY = 1;     // какая ось гироскопа - «наклон вправо» и «к себе»
+uint8_t accSrc = 0;                                  // откуда наклон: 1 - ADXL345, 2 - MPU
+
+uint8_t i2cRead8(uint8_t addr, uint8_t r) {
+#if BOARD_S3
+  Wire.beginTransmission(addr);
+  Wire.write(r);
+  if (Wire.endTransmission(false) != 0) return 0xFF;
+  if (Wire.requestFrom((int)addr, 1) != 1) return 0xFF;
+  return Wire.read();
+#else
+  (void)addr;
+  (void)r;
+  return 0xFF;
+#endif
+}
+void i2cWrite8(uint8_t addr, uint8_t r, uint8_t v) {
+#if BOARD_S3
+  Wire.beginTransmission(addr);
+  Wire.write(r);
+  Wire.write(v);
+  Wire.endTransmission();
+#else
+  (void)addr;
+  (void)r;
+  (void)v;
+#endif
+}
+bool i2cReadN(uint8_t addr, uint8_t r, uint8_t* b, int n) {
+#if BOARD_S3
+  Wire.beginTransmission(addr);
+  Wire.write(r);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)addr, n) != n) return false;
+  for (int i = 0; i < n; i++) b[i] = Wire.read();
+  return true;
+#else
+  (void)addr;
+  (void)r;
+  (void)b;
+  (void)n;
+  return false;
+#endif
+}
+
+// Скорость поворота по трём осям, градусы в секунду (без смещения покоя).
+bool gyroRead(float g[3]) {
+  uint8_t b[6];
+  if (gyroType == 1) {
+    if (!i2cReadN(gyroAddr, 0x43, b, 6)) return false;
+    for (int i = 0; i < 3; i++) g[i] = (int16_t)((b[i * 2] << 8) | b[i * 2 + 1]) / 65.5f - gyroBias[i];
+    return true;
+  }
+  if (gyroType == 2) {
+    if (!i2cReadN(gyroAddr, 0x28 | 0x80, b, 6)) return false;
+    for (int i = 0; i < 3; i++) g[i] = (int16_t)(b[i * 2] | (b[i * 2 + 1] << 8)) * 0.0175f - gyroBias[i];
+    return true;
+  }
+  return false;
+}
+
+void gyroInit() {
+  for (uint8_t a : {(uint8_t)0x68, (uint8_t)0x69}) {
+    uint8_t who = i2cRead8(a, 0x75);
+    if (who == 0x68 || who == 0x70 || who == 0x71 || who == 0x73 || who == 0x72 || who == 0x98) {
+      gyroAddr = a;
+      gyroType = 1;
+      gyroName = who == 0x68 ? "MPU6050" : who == 0x70 ? "MPU6500" : "MPU9250";
+      i2cWrite8(a, 0x6B, 0x00);                      // проснуться
+      delay(50);
+      i2cWrite8(a, 0x1A, 0x03);                      // фильтр ~44 Гц
+      i2cWrite8(a, 0x1B, 0x08);                      // гироскоп +-500 град/с
+      i2cWrite8(a, 0x1C, 0x00);                      // акселерометр +-2g
+      break;
+    }
+    uint8_t l3 = i2cRead8(a, 0x0F);
+    if (l3 == 0xD3 || l3 == 0xD4 || l3 == 0xD7) {
+      gyroAddr = a;
+      gyroType = 2;
+      gyroName = l3 == 0xD3 ? "L3G4200D" : "L3GD20";
+      i2cWrite8(a, 0x20, 0x0F);                      // включить, 100 Гц
+      i2cWrite8(a, 0x23, 0x10);                      // +-500 град/с
+      break;
+    }
+  }
+  if (!gyroType) return;
+  delay(100);
+  float sum[3] = {0, 0, 0}, g[3];
+  int n = 0;
+  for (int i = 0; i < 50; i++) {                     // смещение покоя (при включении гаджет обычно лежит)
+    if (gyroRead(g)) {
+      for (int k = 0; k < 3; k++) sum[k] += g[k];
+      n++;
+    }
+    delay(4);
+  }
+  if (n)
+    for (int k = 0; k < 3; k++) gyroBias[k] = sum[k] / n;
+  Serial.printf("gyro: %s at 0x%02X\n", gyroName, gyroAddr);
+}
+
 void accInit() {
 #if BOARD_S3
   Wire.begin(ACC_SDA, ACC_SCL, 400000);
@@ -1435,10 +1541,16 @@ void accInit() {
       accSet(0x2C, 0x0A);                            // 100 измерений в секунду
       accSet(0x2D, 0x08);                            // измерять
       accOk = true;
+      accSrc = 1;
       break;
     }
   }
   Serial.printf("ADXL345: %s\n", accOk ? "ok" : "not found");
+  gyroInit();
+  if (!accOk && gyroType == 1) {                     // нет ADXL345 - наклон с акселерометра MPU
+    accOk = true;
+    accSrc = 2;
+  }
   prefs.begin("dsk", true);
   accZero[0] = prefs.getShort("az0", 0);
   accZero[1] = prefs.getShort("az1", 0);
@@ -1447,6 +1559,10 @@ void accInit() {
   accSgX = prefs.getChar("asx", 1);
   accAxY = prefs.getChar("aay", 1);
   accSgY = prefs.getChar("asy", 1);
+  gAxX = prefs.getChar("gax", -1);
+  gSgX = prefs.getChar("gsx", 1);
+  gAxY = prefs.getChar("gay", -1);
+  gSgY = prefs.getChar("gsy", 1);
   prefs.end();
 #endif
 }
@@ -1455,6 +1571,12 @@ void accInit() {
 bool accRaw(int v[3]) {
 #if BOARD_S3
   if (!accOk) return false;
+  if (accSrc == 2) {                                 // MPU: +-2g = 16384 на 1g -> 256 на 1g
+    uint8_t b[6];
+    if (!i2cReadN(gyroAddr, 0x3B, b, 6)) return false;
+    for (int i = 0; i < 3; i++) v[i] = (int16_t)((b[i * 2] << 8) | b[i * 2 + 1]) / 64;
+    return true;
+  }
   Wire.beginTransmission(accAddr);
   Wire.write(0x32);
   if (Wire.endTransmission(false) != 0) return false;
@@ -1470,21 +1592,34 @@ bool accRaw(int v[3]) {
 }
 
 // Наклон в осях экрана: tx > 0 - вправо, ty > 0 - к себе (вниз по экрану). 256 = 90 градусов примерно.
+// С гироскопом наклон плавный: быстрые повороты - от гироскопа, а медленно поправляет акселерометр
+// (тряска акселерометра почти не видна, а гироскоп не «уплывает»).
 bool accTilt(int& tx, int& ty) {
   static uint32_t last = 0;
-  static int cx = 0, cy = 0;
-  static bool ok = false;
-  if (millis() - last >= 10) {                       // не чаще 100 раз в секунду
-    last = millis();
+  static float fx = 0, fy = 0;
+  static bool ok = false, init = false;
+  uint32_t now = millis();
+  if (now - last >= 10) {                            // не чаще 100 раз в секунду
+    float dt = init ? (now - last) / 1000.0f : 0;
+    last = now;
     int v[3];
     ok = accRaw(v);
     if (ok) {
-      cx = (v[accAxX] - accZero[accAxX]) * accSgX;
-      cy = (v[accAxY] - accZero[accAxY]) * accSgY;
+      float ax = (v[accAxX] - accZero[accAxX]) * accSgX, ay = (v[accAxY] - accZero[accAxY]) * accSgY;
+      float g[3];
+      if (init && gAxX >= 0 && gAxY >= 0 && dt < 0.2f && gyroRead(g)) {
+        const float K = 256.0f * 3.14159f / 180.0f;  // град/с -> наши единицы (256 ~ 1g)
+        fx = 0.97f * (fx + g[gAxX] * gSgX * dt * K) + 0.03f * ax;
+        fy = 0.97f * (fy + g[gAxY] * gSgY * dt * K) + 0.03f * ay;
+      } else {
+        fx = ax;
+        fy = ay;
+      }
+      init = true;
     }
   }
-  tx = cx;
-  ty = cy;
+  tx = (int)fx;
+  ty = (int)fy;
   return ok;
 }
 
@@ -8533,17 +8668,29 @@ void accSaveCal() {
   prefs.putChar("asx", accSgX);
   prefs.putChar("aay", accAxY);
   prefs.putChar("asy", accSgY);
+  prefs.putChar("gax", gAxX);
+  prefs.putChar("gsx", gSgX);
+  prefs.putChar("gay", gAxY);
+  prefs.putChar("gsy", gSgY);
   prefs.end();
 }
 
 // Ждать нажатия, показывая подсказку; вернуть средние показания за полсекунды.
+float gyroTurn[3];                                  // на сколько градусов повернули гаджет, пока ждали нажатия
 bool accCapture(const char* hint, int out[3]) {
   showMsg(hint, C_WHITE);
+  for (int k = 0; k < 3; k++) gyroTurn[k] = 0;
+  uint32_t t = millis();
   for (;;) {
     BtnEvent e = btnEvent();
     joyEvent();
     if (e == EV_LONG) return false;
     if (e == EV_CLICK) break;
+    float g[3];
+    uint32_t now = millis();
+    if (gyroRead(g))
+      for (int k = 0; k < 3; k++) gyroTurn[k] += g[k] * (now - t) / 1000.0f;
+    t = now;
     delay(10);
   }
   long sum[3] = {0, 0, 0};
@@ -8564,12 +8711,29 @@ bool accCapture(const char* hint, int out[3]) {
 void accCalibrate() {
   int flat[3], right[3], down[3];
   if (!accCapture(L3("1/3. Положите гаджет ровно экраном вверх и нажмите кнопку.", "1/3. Lay the device flat, screen up, and press the button.", "1/3. 平放后按键。"), flat)) return;
+  if (gyroType) {                                    // гаджет лежит - заодно смещение покоя гироскопа
+    float sum[3] = {0, 0, 0}, g[3];
+    int n = 0;
+    float save[3] = {gyroBias[0], gyroBias[1], gyroBias[2]};
+    for (int k = 0; k < 3; k++) gyroBias[k] = 0;
+    for (int i = 0; i < 60; i++) {
+      if (gyroRead(g)) {
+        for (int k = 0; k < 3; k++) sum[k] += g[k];
+        n++;
+      }
+      delay(5);
+    }
+    for (int k = 0; k < 3; k++) gyroBias[k] = n ? sum[k] / n : save[k];
+  }
   if (!accCapture(L3("2/3. Наклоните гаджет ВПРАВО (градусов на 30-45), держите и нажмите кнопку.", "2/3. Tilt the device to the RIGHT (30-45 degrees), hold and press.",
                      "2/3. 向右倾斜后按键。"), right))
     return;
-  if (!accCapture(L3("3/3. Наклоните гаджет К СЕБЕ (нижним краем вниз), держите и нажмите кнопку.", "3/3. Tilt the device TOWARDS you (bottom edge down), hold and press.",
-                     "3/3. 向自己倾斜后按键。"), down))
+  float turnRight[3] = {gyroTurn[0], gyroTurn[1], gyroTurn[2]};
+  if (!accCapture(L3("3/3. Верните гаджет ровно, потом наклоните К СЕБЕ (нижним краем вниз), держите и нажмите кнопку.",
+                     "3/3. Level the device again, then tilt it TOWARDS you (bottom edge down), hold and press.", "3/3. 放平后向自己倾斜，然后按键。"), down))
     return;
+  float turnDown[3];
+  for (int k = 0; k < 3; k++) turnDown[k] = gyroTurn[k] + turnRight[k];   // за шаг 3: -вправо + к себе
   auto pick = [&](const int a[3], int skip, int8_t& ax, int8_t& sg) {
     int best = -1, bv = 0;
     for (int k = 0; k < 3; k++) {
@@ -8592,13 +8756,28 @@ void accCalibrate() {
   accSgX = sx;
   accAxY = ay;
   accSgY = sy;
+  if (gyroType) {                                    // оси гироскопа: где больше всего повернули
+    int bx = 0, by = -1;
+    for (int k = 1; k < 3; k++)
+      if (fabsf(turnRight[k]) > fabsf(turnRight[bx])) bx = k;
+    for (int k = 0; k < 3; k++)
+      if (k != bx && (by < 0 || fabsf(turnDown[k]) > fabsf(turnDown[by]))) by = k;
+    if (fabsf(turnRight[bx]) > 10 && fabsf(turnDown[by]) > 10) {
+      gAxX = (int8_t)bx;
+      gSgX = (int8_t)(turnRight[bx] > 0 ? 1 : -1);
+      gAxY = (int8_t)by;
+      gSgY = (int8_t)(turnDown[by] > 0 ? 1 : -1);
+    } else {
+      gAxX = gAxY = -1;                              // повернули слишком мало - без гироскопа
+    }
+  }
   accSaveCal();
   viewAnswer(L3("Готово! Наклон откалиброван.", "Done! Tilt calibrated.", "完成！"), C_GREEN);
 }
 
 void runTilt() {
   if (!accOk) {
-    viewAnswer(BOARD_S3 ? L3("Датчик ADXL345 не найден. Подключение: SDA - 38, SCL - 39, VCC - 3V3, GND - GND, CS - 3V3 (режим I2C), SDO - GND. Потом перезапустите гаджет.",
+    viewAnswer(BOARD_S3 ? L3("Датчик наклона не найден (ADXL345 или MPU6050). Подключение: SDA - 38, SCL - 39, VCC - 3V3, GND - GND; у ADXL345 ещё CS - 3V3, SDO - GND. Потом перезапустите гаджет.",
                              "ADXL345 not found. Wiring: SDA 38, SCL 39, VCC 3V3, GND GND, CS to 3V3 (I2C mode), SDO to GND. Then restart.", "未找到ADXL345。")
                         : L3("Датчик наклона подключается только к гаджету на ESP32-S3.", "The tilt sensor works only on the ESP32-S3 gadget.", "倾斜传感器仅支持ESP32-S3。"),
                C_YELLOW);
@@ -8631,6 +8810,9 @@ void runTilt() {
                  (int)(asinf(constrain(ty / 256.0f, -1.f, 1.f)) * 57.3f));
         drawUtf8(b, 4, 2, C_WHITE, C_BLACK);
         drawUtf8(cfgTilt ? L3("игры: наклон ВКЛ ", "games: tilt ON  ", "游戏：开") : L3("игры: наклон выкл", "games: tilt off ", "游戏：关"), 4, 222, cfgTilt ? C_GREEN : C_LIGHT, C_BLACK);
+        String sn = String(accSrc == 1 ? "ADXL345" : "") + (gyroType ? String(accSrc == 1 ? "+" : "") + gyroName : String("")) +
+                    (gyroType && gAxX < 0 ? L3(" (калибр.)", " (calib.)", "") : "");
+        drawUtf8(sn.c_str(), 236 - textWidth(sn.c_str()), 2, 0x8C71, C_BLACK);
       }
     }
     joyEvent();
