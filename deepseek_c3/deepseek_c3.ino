@@ -7647,6 +7647,135 @@ bool runRemoteDownload() {
   }
 }
 
+#if BOARD_S3
+// ---------- Запись кнопок с родного пульта (S3) ----------
+// ИК-приёмник на 38 кГц (VS1838B, TSOP1838...): OUT -> резистор 1 кОм -> GPIO18 (площадка фонарика), VCC -> 3V3, GND -> GND.
+// Приёмник в покое держит 1, во время вспышки - 0. Ловим моменты переключений и сохраняем как сырой сигнал (type: raw).
+const int PIN_IRRX = PIN_LED;
+const int IRRX_MAX = 400;
+static volatile uint32_t irRxT[IRRX_MAX];
+static volatile int irRxN = 0;
+void IRAM_ATTR irRxIsr() {
+  int n = irRxN;
+  if (n < IRRX_MAX) {
+    irRxT[n] = micros();
+    irRxN = n + 1;
+  }
+}
+
+// 1 - сигнал пойман (длительности: вспышка, пауза, вспышка...), 0 - отмена кнопкой гаджета, -1 - слишком короткий.
+int irCapture(std::vector<uint32_t>& dur) {
+  dur.clear();
+  pinMode(PIN_IRRX, INPUT_PULLUP);
+  delay(20);
+  irRxN = 0;
+  attachInterrupt(digitalPinToInterrupt(PIN_IRRX), irRxIsr, CHANGE);
+  int res = 0;
+  for (;;) {
+    BtnEvent e = btnEvent();
+    if (e == EV_CLICK || e == EV_LONG) break;
+    int n = irRxN;
+    if (n > 0 && micros() - irRxT[n - 1] > 150000) {   // 150 мс тишины - пульт закончил
+      res = 1;
+      break;
+    }
+    delay(3);
+  }
+  detachInterrupt(digitalPinToInterrupt(PIN_IRRX));
+  pinMode(PIN_IRRX, INPUT);
+  if (res != 1) return res;
+  int n = irRxN;
+  if (n > 0 && digitalRead(PIN_IRRX) == LOW) n--;    // не должно быть, но последняя вспышка без конца не нужна
+  for (int i = 1; i < n; i++) {
+    uint32_t d = irRxT[i] - irRxT[i - 1];
+    if ((i & 1) == 0 && d > 30000 && dur.size() >= 8) break;   // пауза >30 мс после кадра - дальше повторы, их не берём
+    dur.push_back(d);
+  }
+  if (!dur.empty() && (dur.size() & 1) == 0) dur.pop_back();  // кадр кончается вспышкой
+  return dur.size() >= 8 ? 1 : -1;
+}
+
+String irLearnTitle() { return L3("Мой пульт", "My remote", "我的遥控器"); }
+
+// Дописать кнопку в «Мой пульт» (создаётся при первой записи).
+bool irSaveLearned(String name, const std::vector<uint32_t>& d) {
+  int slot = -1;
+  for (int i = 0; i < IR_SLOTS; i++)
+    if (LittleFS.exists(irPath(i).c_str()) && irTitle(i) == irLearnTitle()) slot = i;
+  bool fresh = slot < 0;
+  if (fresh) slot = irFreeSlot();
+  if (slot < 0 || !irRoom()) return false;
+  File f = LittleFS.open(irPath(slot).c_str(), fresh ? "w" : "a");
+  if (!f) return false;
+  if (fresh) f.print(String("# title: ") + irLearnTitle() + "\nFiletype: IR signals file\nVersion: 1\n");
+  name.trim();
+  name.replace(' ', '_');
+  if (!name.length()) name = "Button";
+  f.print(String("#\nname: ") + name + "\ntype: raw\nfrequency: 38000\nduty_cycle: 0.330000\ndata:");
+  for (uint32_t t : d) f.print(String(" ") + String((unsigned long)t));
+  f.print("\n");
+  f.close();
+  return true;
+}
+
+void runRemoteLearn() {
+  if (ENABLE_TORCH && torchOn) {                     // фонарик и приёмник на одном выводе
+    torchOn = false;
+    digitalWrite(PIN_LED, LOW);
+  }
+  int saved = 0;
+  for (;;) {
+    showMsg(String(L3("Запись с пульта\n\nНаправьте пульт на ИК-приёмник (вывод 18) и нажмите кнопку на пульте.\n\n"
+                      "Выход - кнопка гаджета.",
+                      "Record from a remote\n\nPoint the remote at the IR receiver (pin 18) and press a button on it.\n\nExit - the device button.",
+                      "从遥控器录制\n\n把遥控器对准红外接收器（18脚）并按键。\n\n按本机按键退出。")) +
+                (saved ? String(L3("\n\nЗаписано кнопок: ", "\n\nButtons saved: ", "\n\n已保存: ")) + String(saved) : String("")),
+            C_WHITE);
+    std::vector<uint32_t> d;
+    int r = irCapture(d);
+    if (r == 0) return;
+    if (r < 0) {
+      showMsg(L3("Сигнал слишком короткий - нажмите кнопку пульта ещё раз, поближе к приёмнику.",
+                 "The signal is too short - press the remote button again, closer to the receiver.", "信号太短，请再试一次。"), C_YELLOW);
+      delay(1800);
+      continue;
+    }
+    beep(1, 2400, 15);
+    for (;;) {
+      std::vector<String> names = splitBar(L3("Power|Громкость +|Громкость -|Без звука|Вверх|Вниз|Влево|Вправо|OK|Назад|Домой|Меню|Канал +|Канал -|Источник|Своё название...|Проверить: отправить обратно|Не сохранять",
+                                              "Power|Volume +|Volume -|Mute|Up|Down|Left|Right|OK|Back|Home|Menu|Channel +|Channel -|Input|Custom name...|Test: send it back|Don't save",
+                                              "电源|音量+|音量-|静音|上|下|左|右|OK|返回|主页|菜单|频道+|频道-|信号源|自定义名称...|测试：发送|不保存"));
+      String title = String(L3("Пойман сигнал (", "Signal caught (", "已接收信号（")) + String((int)d.size()) + L3(" импульсов). Что это за кнопка?", " pulses). Which button is it?", "）。这是哪个键？");
+      int k = listScreen(title.c_str(), names, std::vector<String>(), 0);
+      int nn = (int)names.size();
+      if (k == nn - 2) {                             // проверка: отправить записанное на телевизор
+        ir::Signal s;
+        s.hasType = true;
+        s.raw = true;
+        s.freq = 38000;
+        s.data = d;
+        irSend(s);
+        continue;
+      }
+      if (k < 0 || k == nn - 1) break;
+      String name = names[(size_t)k];
+      if (k == nn - 3) {
+        name = inputText();
+        if (!name.length()) continue;
+      }
+      if (irSaveLearned(name, d)) {
+        saved++;
+        showMsg(String(L3("Сохранено: «", "Saved: \"", "已保存：“")) + name + L3("» в «", "\" to \"", "”到“") + irLearnTitle() + L3("».", "\".", "”。"), C_GREEN);
+      } else {
+        showMsg(L3("Не удалось сохранить: нет места для пультов.", "Could not save: no room for remotes.", "保存失败：空间不足。"), C_RED);
+      }
+      delay(1200);
+      break;
+    }
+  }
+}
+#endif
+
 void runRemote() {
   if (!ENABLE_IR) {
     notInEdition();
@@ -7668,8 +7797,17 @@ void runRemote() {
     int n = (int)slots.size();
     items.push_back(L3("+ Скачать из интернета", "+ Download from the internet", "+ 从网上下载"));
     items.push_back(L3("+ Загрузить с телефона", "+ Upload from phone", "+ 从手机上传"));
+#if BOARD_S3
+    items.push_back(L3("+ Записать с пульта", "+ Record from a remote", "+ 从遥控器录制"));
+#endif
     items.push_back(T().menuBack);
     sel = listScreen(L3("Пульт", "Remote", "遥控器"), items, std::vector<String>(), sel);
+#if BOARD_S3
+    if (sel == n + 2) {
+      runRemoteLearn();
+      continue;
+    }
+#endif
     if (sel >= 0 && sel < n) {
       runRemoteButtons(slots[(size_t)sel]);
     } else if (sel == n) {
