@@ -128,7 +128,8 @@ inline void media(uint16_t) {}
 }  // namespace ble
 #endif
 #ifndef ENABLE_FWBACKUP
-#define ENABLE_FWBACKUP (!(ENABLE_BLE && !BOARD_S3))  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
+#define ENABLE_FWBACKUP (!(ENABLE_BLE && !BOARD_S3))
+#define ENABLE_JOYCAL (!(ENABLE_BLE && !BOARD_S3))    // калибровка джойстика (в C3 с Bluetooth нет места)  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
 #endif
 #ifndef ENABLE_PCSCREEN
 #define ENABLE_PCSCREEN FULL_EDITION                 // «Экран ПК» (картинки с компьютера по USB)
@@ -9135,6 +9136,7 @@ void runTilt() {
 }
 #endif
 
+#if ENABLE_JOYCAL
 // ---------- Калибровка джойстика ----------
 // 1) ручку не трогать - центр и дрожание; 2) покрутить по кругу до упора - края хода; 3) проверка точкой.
 void joyCalScreen() {
@@ -9261,6 +9263,7 @@ void joyTestScreen() {
     delay(20);
   }
 }
+#endif
 
 bool runSettings() {
   bool changed = false;
@@ -9323,6 +9326,10 @@ bool runSettings() {
         if (ntpStarted) startNtp();
         break;
       case 6: {
+#if !ENABLE_JOYCAL
+        cfgJoy = (cfgJoy + 1) % 5;
+        saveScreenSettings();
+#else
         for (;;) {
           std::vector<String> o;
           o.push_back(String(L3("Чувствительность: ", "Sensitivity: ", "灵敏度: ")) + String(cfgJoy + 1) + "/5");
@@ -9341,6 +9348,7 @@ bool runSettings() {
             break;
           }
         }
+#endif
         break;
       }
       case 7:
