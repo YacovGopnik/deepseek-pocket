@@ -871,6 +871,7 @@ int cfgJoy = 2;           // чувствительность ручки: 0 (н�
 int cfgSd = 0;            // подключена SD-карта (вместо ИК-пульта, фонарика и пищалки)
 int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
+int cfgTouch = 0;         // 1 - сенсорные кнопки (площадки из меди) работают как ручка (только S3)
 int cfgTilt = 0;          // 1 - наклон гаджета управляет в играх (датчик ADXL345, только S3)
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
 // Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
@@ -931,6 +932,7 @@ void loadSettings() {
   if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
   cfgTilt = prefs.getUChar("tilt", 0) ? 1 : 0;
+  cfgTouch = prefs.getUChar("touch", 0) ? 1 : 0;
   cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
   cfgSd = prefs.getUChar("sd", 0) ? 1 : 0;
@@ -954,6 +956,7 @@ void saveScreenSettings() {
   prefs.putUChar("joy", (uint8_t)cfgJoy);
   prefs.putUChar("joyiy", (uint8_t)cfgJoyInvY);
   prefs.putUChar("tilt", (uint8_t)cfgTilt);
+  prefs.putUChar("touch", (uint8_t)cfgTouch);
   prefs.putUChar("rot", (uint8_t)cfgRot);
   prefs.putUChar("ble", (uint8_t)cfgBle);
   prefs.putUChar("sd", (uint8_t)cfgSd);
@@ -1637,6 +1640,82 @@ struct UiPause {
   ~UiPause() { g_inGame = prev; }
 };
 
+// ========================= СЕНСОРНЫЕ КНОПКИ И ВИБРОМОТОР (S3) =========================
+// Площадки - просто медь (скотч, фольга, позже - медь на плате) на выводах, которые S3 умеет читать
+// касанием (GPIO1-14). Касание = направление ручки; есть отклик вибромотором.
+// Проверка на S3-Zero: вверх - 4, вниз - 5, влево - 6, вправо - 13 (эти выводы свободны без SD-карты).
+#if BOARD_S3
+const int TOUCH_PINS[4] = {4, 5, 6, 13};             // вверх, вниз, влево, вправо
+const int PIN_VIBRO = 40;                            // вибромотор через транзистор
+#endif
+uint32_t touchBase[4];
+bool touchReady = false;
+uint32_t vibroOffAt = 0;
+
+// Короткий толчок вибромотора (не ждёт: выключится сам при следующем опросе ручки).
+void vibe(int ms) {
+#if BOARD_S3
+  digitalWrite(PIN_VIBRO, HIGH);
+  vibroOffAt = millis() + (uint32_t)ms;
+  if (!vibroOffAt) vibroOffAt = 1;
+#else
+  (void)ms;
+#endif
+}
+void vibroService() {
+#if BOARD_S3
+  if (vibroOffAt && (int32_t)(millis() - vibroOffAt) >= 0) {
+    digitalWrite(PIN_VIBRO, LOW);
+    vibroOffAt = 0;
+  }
+#endif
+}
+
+void touchInit() {
+#if BOARD_S3
+  pinMode(PIN_VIBRO, OUTPUT);
+  digitalWrite(PIN_VIBRO, LOW);
+  if (!cfgTouch || cfgSd) return;                    // 4, 5, 6, 13 у SD-карты
+  for (int i = 0; i < 4; i++) {                      // «покой» каждой площадки (в этот момент её не трогают)
+    uint64_t sum = 0;
+    for (int k = 0; k < 8; k++) sum += touchRead(TOUCH_PINS[i]);
+    touchBase[i] = (uint32_t)(sum / 8);
+  }
+  touchReady = true;
+  Serial.printf("touch base: %u %u %u %u\n", (unsigned)touchBase[0], (unsigned)touchBase[1], (unsigned)touchBase[2], (unsigned)touchBase[3]);
+#endif
+}
+
+// Какая площадка нажата (J_NONE - никакая). На S3 значение при касании растёт.
+uint8_t touchDir() {
+#if BOARD_S3
+  if (!touchReady || !cfgTouch) return J_NONE;
+  static uint32_t last = 0;
+  static uint8_t cached = J_NONE, prev = J_NONE;
+  if (millis() - last < 15) return cached;
+  last = millis();
+  static const uint8_t DIRS[4] = {J_UP, J_DOWN, J_LEFT, J_RIGHT};
+  uint8_t d = J_NONE;
+  uint32_t best = 0;
+  for (int i = 0; i < 4; i++) {
+    uint32_t v = touchRead(TOUCH_PINS[i]), b = touchBase[i];
+    uint32_t over = v > b ? v - b : 0;
+    if (over > b / 12 && over > best) {             // касание: больше покоя на ~8%
+      best = over;
+      d = DIRS[i];
+    } else if (over < b / 40) {
+      touchBase[i] = (b * 63 + v) / 64;              // покой медленно подстраивается (влажность, температура)
+    }
+  }
+  if (d != J_NONE && d != prev) vibe(18);            // отклик на новое касание
+  prev = d;
+  cached = d;
+  return d;
+#else
+  return J_NONE;
+#endif
+}
+
 // Наклон как направление ручки (для игр, которые слушают «вверх/вниз/влево/вправо»). ~15 градусов - срабатывает.
 uint8_t tiltDir() {
 #if BOARD_S3
@@ -1716,7 +1795,9 @@ uint8_t joyRawDir() {
   joyRotate(dx, dy);
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
   if (ax < joyThr() && ay < joyThr()) {
+    vibroService();
     uint8_t p = padDir();
+    if (p == J_NONE) p = touchDir();
     return p != J_NONE ? p : tiltDir();
   }
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
@@ -8887,9 +8968,9 @@ bool runSettings() {
   bool changed = false;
   int sel = 0;
   for (;;) {
-    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Наклон|Назад",
-                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Tilt|Back",
-                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|倾斜|返回"));
+    std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Наклон|Сенсорные кнопки|Назад",
+                                            "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Tilt|Touch buttons|Back",
+                                            "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|倾斜|触摸按键|返回"));
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -8912,6 +8993,7 @@ bool runSettings() {
     right[15] = !cfgSd ? (sdDiag != -9 ? String(L3("сбой ", "fail ", "失败 ")) + String(sdDiag) : String(L3("нет", "off", "关"))) : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     right[16] = !accOk ? L3("нет датчика", "no sensor", "无传感器") : cfgTilt ? L3("в играх", "in games", "游戏中") : L3("выкл", "off", "关");
+    right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -9002,6 +9084,30 @@ bool runSettings() {
         break;
       case 16:
         runTilt();
+        break;
+      case 17:
+        if (!BOARD_S3) {
+          viewAnswer(L3("Сенсорные кнопки работают только на гаджете с ESP32-S3.", "Touch buttons work only on the ESP32-S3 gadget.", "仅ESP32-S3支持。"), C_YELLOW);
+          break;
+        }
+        if (cfgSd && !cfgTouch) {
+          viewAnswer(L3("Площадки на выводах 4, 5, 6, 13 - сейчас они у SD-карты. Выключите SD-карту, чтобы проверить сенсорные кнопки.",
+                        "The pads use pins 4, 5, 6, 13, now taken by the SD card. Turn the SD card off to try touch buttons.", "引脚被SD卡占用。"),
+                     C_YELLOW);
+          break;
+        }
+        cfgTouch = !cfgTouch;
+        saveScreenSettings();
+        if (cfgTouch) {
+          viewAnswer(L3("Сенсорные кнопки: вверх - 4, вниз - 5, влево - 6, вправо - 13 (квадратики медного скотча ~12x12 мм). "
+                        "Не трогайте площадки - сейчас запомню их «покой». Вибромотор - вывод 40 через транзистор.",
+                        "Touch buttons: up 4, down 5, left 6, right 13 (copper tape squares ~12x12 mm). Do not touch them now - calibrating. Vibration motor: pin 40 via a transistor.",
+                        "触摸按键：上4 下5 左6 右13。"),
+                     C_WHITE);
+          touchInit();
+        } else {
+          touchReady = false;
+        }
         break;
       case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
         cfgRot = (cfgRot + 1) & 3;
@@ -12789,6 +12895,7 @@ void setup() {
   if (initRun(1)) soundInit();       // после подсветки: у пищалки свой канал
   bootStage("Datchiki");
   if (initRun(2)) accInit();         // датчик наклона (S3)
+  touchInit();                       // сенсорные кнопки и вибромотор (S3)
 
   analogReadResolution(12);
   if (BATTERY_ENABLED) analogSetPinAttenuation(PIN_BAT, ADC_11db);
