@@ -2114,6 +2114,7 @@ uint8_t sdBbCmd0(int cs, int sck, int mosi, int miso) {
   return r;
 }
 
+void viewAnswer(const String& utf8, uint16_t fg);    // определено ниже
 void sdWiringTest() {
   showMsg(L3("Проверяю карту и провода... (~10 с)", "Checking the card and wires... (~10 s)", "正在检查SD卡和接线……"), C_YELLOW);
   SD.end();
