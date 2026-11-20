@@ -85,8 +85,8 @@ jobs:
         run: |
           VER=$((100 + GITHUB_RUN_NUMBER))
           ls -la bins
-          # без трёх прошивок для C3 не публикуем ничего
-          for n in firmware firmware-ble firmware-games; do
+          # не собралась хоть одна сборка - не публикуем ничего (иначе гаджеты одной из плат останутся без обновления)
+          for n in firmware firmware-ble firmware-games firmware-s3 firmware-s3-ble firmware-s3-games; do
             [ -f "bins/$n.bin" ] || { echo "::error::$n.bin missing"; exit 1; }
           done
           mkdir -p firmware

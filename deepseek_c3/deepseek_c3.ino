@@ -8133,6 +8133,16 @@ void handleFwUpload() {
       otaUpErr = L3("это не файл прошивки (.bin)", "this is not a firmware file (.bin)", "这不是固件文件（.bin）");
       return;
     }
+    // байты 12-13 заголовка - для какого чипа сборка (5 - ESP32-C3, 9 - ESP32-S3)
+    if (otaUpSize == 0 && up.currentSize >= 16 && (up.buf[12] | (up.buf[13] << 8)) != (BOARD_S3 ? 9 : 5)) {
+      Update.abort();
+      otaUpStarted = false;
+      otaUpErr = BOARD_S3 ? L3("это прошивка для платы C3. Для этого гаджета нужен файл firmware-s3.bin",
+                               "this firmware is for the C3 board. This device needs firmware-s3.bin", "这是C3固件，本设备需要 firmware-s3.bin")
+                          : L3("это прошивка для платы S3. Для этого гаджета нужен файл firmware.bin (без s3)",
+                               "this firmware is for the S3 board. This device needs firmware.bin (no s3)", "这是S3固件，本设备需要 firmware.bin");
+      return;
+    }
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
       otaUpErr = Update.errorString();
       Update.abort();
