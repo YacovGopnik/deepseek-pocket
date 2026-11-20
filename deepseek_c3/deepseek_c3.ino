@@ -9063,8 +9063,13 @@ bool runSettings() {
         break;
       case 15: {
         std::vector<String> yn = splitBar(L3("Да, перезапустить|Нет", "Yes, restart|No", "是，重启|否"));
-        String q = cfgSd ? L3("Выключить SD-карту? Вернутся пищалка, фонарик и ИК-пульт (если они подключены). Нужен перезапуск.",
-                              "Turn the SD card off? The buzzer, torch and IR remote come back (if wired). Needs a restart.", "关闭SD卡？需要重启。")
+        String q = cfgSd ? (BOARD_S3 ? L3("Выключить SD-карту? Нужен перезапуск.", "Turn the SD card off? Needs a restart.", "关闭SD卡？需要重启。")
+                                     : L3("Выключить SD-карту? Вернутся пищалка, фонарик и ИК-пульт (если они подключены). Нужен перезапуск.",
+                              "Turn the SD card off? The buzzer, torch and IR remote come back (if wired). Needs a restart.", "关闭SD卡？需要重启。"))
+                         : BOARD_S3 ? L3("Включить SD-карту? Её выводы: CS - GPIO4, SCK - GPIO5, MOSI - GPIO6, MISO - GPIO13. "
+                              "Сенсорные кнопки на этих выводах отключатся. Нужен перезапуск.",
+                              "Turn the SD card on? Pins: CS GPIO4, SCK GPIO5, MOSI GPIO6, MISO GPIO13. "
+                              "Touch buttons on these pins are turned off. Needs a restart.", "开启SD卡？需要重启。")
                          : L3("Включить SD-карту? Её выводы: SCK - GPIO8, MOSI - GPIO2, MISO - GPIO20, CS - GPIO9 (+10 кОм от GPIO2 и GPIO9 к 3V3). "
                               "Пищалка, фонарик и ИК-пульт отключатся. Нужен перезапуск.",
                               "Turn the SD card on? Pins: SCK GPIO8, MOSI GPIO2, MISO GPIO20, CS GPIO9 (+10k from GPIO2 and GPIO9 to 3V3). "
