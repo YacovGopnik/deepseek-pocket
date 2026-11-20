@@ -1903,7 +1903,10 @@ namespace mir {
 volatile uint8_t inDir = 0, inBtn = 0;                // ручка и кнопка соседнего гаджета, который смотрит экран
 volatile uint32_t inMs = 0;
 inline bool inputFresh() { return inMs && millis() - inMs < 400; }
+volatile bool on = false;                             // этот гаджет транслирует свой экран
 }  // namespace mir
+bool cfgMirBoot = false;                             // включать трансляцию при запуске
+void runMirrorSettings();
 #endif
 
 uint8_t padDir() {
@@ -11022,7 +11025,6 @@ bool take(std::string& m) {
 // Пакеты (первый байт 0xA5): 'B' маяк A (канал), 'J' B подключился/жив, 'I' ручка+кнопка B, 'R' строка экрана:
 // y, x, число отрезков, отрезки (длина, цвет 2 байта) - одноцветные куски сжаты.
 namespace mir {
-volatile bool on = false;                             // этот гаджет транслирует
 volatile bool viewing = false;                        // этот гаджет смотрит чужой экран
 uint8_t viewerMac[6];
 volatile bool viewerNew = false, needFull = false;
@@ -11290,8 +11292,6 @@ void runMirrorView() {
     delay(drawn ? 1 : 8);
   }
 }
-
-bool cfgMirBoot = false;                             // включать трансляцию при запуске
 
 void runMirrorSettings() {
   for (;;) {
