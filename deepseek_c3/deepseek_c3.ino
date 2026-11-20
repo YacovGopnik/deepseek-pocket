@@ -1049,7 +1049,130 @@ struct SmallFont {
   ~SmallFont() { g_big = prev; }
 };
 
+#if BOARD_S3
+// ---------- Трансляция экрана: копия всего, что рисуется, в памяти PSRAM ----------
+// Гаджет с разбитым экраном шлёт эту копию соседнему гаджету по ESP-NOW (см. «Трансляция экрана» ниже).
+namespace mir {
+uint16_t* fb = nullptr;                               // 240x240, те же координаты, что у рисования
+bool fbTried = false;
+volatile uint8_t dirty[240];                          // строка изменилась: от dx0 до dx1
+volatile uint8_t dx0[240], dx1[240];
+int wx = 0, wy = 0, ww = 0, wh = 0;                   // окно для writePixels
+uint32_t wpos = 0;
+
+inline bool ready() {
+  if (!fb && !fbTried) {
+    fbTried = true;
+    fb = (uint16_t*)ps_malloc(240 * 240 * 2);
+    if (fb) memset(fb, 0, 240 * 240 * 2);
+  }
+  return fb != nullptr;
+}
+inline void markRow(int y, int a, int b) {
+  if (!dirty[y]) {
+    dx0[y] = (uint8_t)a;
+    dx1[y] = (uint8_t)b;
+    dirty[y] = 1;
+  } else {
+    if (a < dx0[y]) dx0[y] = (uint8_t)a;
+    if (b > dx1[y]) dx1[y] = (uint8_t)b;
+  }
+}
+void markAll() {
+  for (int y = 0; y < 240; y++) markRow(y, 0, 239);
+}
+void shade(int x, int y, int w, int h, uint16_t c) {
+  if (!ready()) return;
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x + w > 240) w = 240 - x;
+  if (y + h > 240) h = 240 - y;
+  if (w <= 0 || h <= 0) return;
+  for (int yy = y; yy < y + h; yy++) {
+    uint16_t* r = fb + yy * 240 + x;
+    for (int i = 0; i < w; i++) r[i] = c;
+    markRow(yy, x, x + w - 1);
+  }
+}
+void window(int x, int y, int w, int h) {
+  wx = x; wy = y; ww = w; wh = h;
+  wpos = 0;
+}
+void pixels(const uint16_t* c, uint32_t n, bool bigEndian) {
+  if (!ready() || ww <= 0) return;
+  int lastRow = -1, ra = 0, rb = 0;
+  for (uint32_t i = 0; i < n; i++, wpos++) {
+    int px = wx + (int)(wpos % (uint32_t)ww), py = wy + (int)(wpos / (uint32_t)ww);
+    if (py >= wy + wh) break;
+    if (px < 0 || px >= 240 || py < 0 || py >= 240) continue;
+    uint16_t v = c[i];
+    if (bigEndian) v = (uint16_t)((v >> 8) | (v << 8));
+    fb[py * 240 + px] = v;
+    if (py != lastRow) {
+      if (lastRow >= 0) markRow(lastRow, ra, rb);
+      lastRow = py;
+      ra = rb = px;
+    } else {
+      if (px < ra) ra = px;
+      if (px > rb) rb = px;
+    }
+  }
+  if (lastRow >= 0) markRow(lastRow, ra, rb);
+}
+}  // namespace mir
+
+class MirrorTft : public Adafruit_ST7789 {
+ public:
+  MirrorTft(SPIClass* spi, int8_t cs, int8_t dc, int8_t rst) : Adafruit_ST7789(spi, cs, dc, rst) {}
+  void drawPixel(int16_t x, int16_t y, uint16_t c) override {
+    Adafruit_ST7789::drawPixel(x, y, c);
+    mir::shade(x, y, 1, 1, c);
+  }
+  void writePixel(int16_t x, int16_t y, uint16_t c) override {
+    Adafruit_ST7789::writePixel(x, y, c);
+    mir::shade(x, y, 1, 1, c);
+  }
+  void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) override {
+    Adafruit_ST7789::fillRect(x, y, w, h, c);
+    mir::shade(x, y, w, h, c);
+  }
+  void writeFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) override {
+    Adafruit_ST7789::writeFillRect(x, y, w, h, c);
+    mir::shade(x, y, w, h, c);
+  }
+  void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) override {
+    Adafruit_ST7789::drawFastHLine(x, y, w, c);
+    mir::shade(x, y, w, 1, c);
+  }
+  void drawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t c) override {
+    Adafruit_ST7789::drawFastVLine(x, y, h, c);
+    mir::shade(x, y, 1, h, c);
+  }
+  void writeFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) override {
+    Adafruit_ST7789::writeFastHLine(x, y, w, c);
+    mir::shade(x, y, w, 1, c);
+  }
+  void writeFastVLine(int16_t x, int16_t y, int16_t h, uint16_t c) override {
+    Adafruit_ST7789::writeFastVLine(x, y, h, c);
+    mir::shade(x, y, 1, h, c);
+  }
+  void setAddrWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) override {
+    Adafruit_ST7789::setAddrWindow(x, y, w, h);
+    mir::window(x, y, w, h);
+  }
+  void writePixels(uint16_t* c, uint32_t len, bool block = true, bool bigEndian = false) {
+    Adafruit_ST7789::writePixels(c, len, block, bigEndian);
+    mir::pixels(c, len, bigEndian);
+  }
+  void setRotation(uint8_t r) override {
+    Adafruit_ST7789::setRotation(r);
+    mir::markAll();
+  }
+};
+MirrorTft tft(&SPI, -1, PIN_DC, -1);                 // без CS; сброс делаем сами (displayReset)
+#else
 Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, -1, PIN_DC, -1);  // без CS; сброс делаем сами (displayReset)
+#endif
 static uint16_t cbuf[24 * 24];
 
 // Номер иероглифа в font_cjk.h (двоичный поиск) или -1.
@@ -1372,6 +1495,7 @@ void holdWatchTask(void*) {
 int joyCx = 2048, joyCy = 2048;
 // Края хода ручки (Настройки -> Джойстик -> Калибровка). -1 - не калибровали: считаем от центра как есть.
 int joyX0 = -1, joyX1 = -1, joyY0 = -1, joyY1 = -1;
+bool joyHeldAtBoot = false;                          // при включении ручку держали до упора
 
 // Значение оси: медиана трёх замеров - одиночные выбросы АЦП (дрожащий контакт) не дёргают курсор.
 int joyRead(int pin) {
@@ -1412,9 +1536,15 @@ void joyCalibrate() {
   joyY0 = prefs.getInt("jy0", -1);
   joyY1 = prefs.getInt("jy1", -1);
   prefs.end();
+  // ручку держат до упора при включении - знак «включить трансляцию экрана» (экран разбит, меню не видно)
+  int bx = joyCx, by = joyCy;
+  joyHeldAtBoot = scx >= 0 ? (abs(bx - scx) > 1000 || abs(by - scy) > 1000)
+                           : (bx < 500 || bx > 3600 || by < 500 || by > 3600);
   if (scx >= 0 && scy >= 0 && (abs(joyCx - scx) > 300 || abs(joyCy - scy) > 300)) {
     joyCx = scx;
     joyCy = scy;
+  } else if (joyHeldAtBoot) {
+    joyCx = joyCy = 2048;
   }
 }
 
@@ -1768,6 +1898,14 @@ uint8_t tiltDir() {
 }
 
 // Ручка, которую держат на телефоне (пульт по Wi-Fi): J_NONE, если не держат.
+#if BOARD_S3
+namespace mir {
+volatile uint8_t inDir = 0, inBtn = 0;                // ручка и кнопка соседнего гаджета, который смотрит экран
+volatile uint32_t inMs = 0;
+inline bool inputFresh() { return inMs && millis() - inMs < 400; }
+}  // namespace mir
+#endif
+
 uint8_t padDir() {
   wpad::poll();
   switch (wpad::heldDir()) {
@@ -1776,12 +1914,18 @@ uint8_t padDir() {
     case 'L': return J_LEFT;
     case 'R': return J_RIGHT;
   }
+#if BOARD_S3
+  if (mir::inputFresh() && mir::inDir) return mir::inDir;
+#endif
   return J_NONE;
 }
 
-// Кнопка нажата: на гаджете или на телефоне.
+// Кнопка нажата: на гаджете, на телефоне или на гаджете, который смотрит наш экран.
 bool swDown() {
   wpad::poll();
+#if BOARD_S3
+  if (mir::inputFresh() && mir::inBtn) return true;
+#endif
   return digitalRead(PIN_SW) == LOW || wpad::heldBtn();
 }
 
@@ -9410,6 +9554,9 @@ bool runSettings() {
     std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Наклон|Сенсорные кнопки|Назад",
                                             "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Tilt|Touch buttons|Back",
                                             "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|倾斜|触摸按键|返回"));
+#if BOARD_S3
+    items.insert(items.end() - 1, String(L3("Трансляция экрана", "Screen sharing", "屏幕共享")));
+#endif
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -9433,6 +9580,9 @@ bool runSettings() {
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     right[16] = !accOk ? L3("нет датчика", "no sensor", "无传感器") : cfgTilt ? L3("в играх", "in games", "游戏中") : L3("выкл", "off", "关");
     right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
+#if BOARD_S3
+    right[18] = mir::on ? L3("идёт", "on", "开") : cfgMirBoot ? L3("при запуске", "on boot", "开机") : L3("выкл", "off", "关");
+#endif
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
       case 0:
@@ -9587,6 +9737,11 @@ bool runSettings() {
           touchReady = false;
         }
         break;
+#if BOARD_S3
+      case 18:
+        runMirrorSettings();
+        break;
+#endif
       case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
         cfgRot = (cfgRot + 1) & 3;
         tft.setRotation((TFT_ROTATION + cfgRot) % 4);
@@ -10751,6 +10906,10 @@ void runFps3d() {
 // ---- Прямая связь гаджет-гаджет (ESP-NOW): без роутера и интернета, до ~100 м ----
 // На время игры Wi-Fi отключается от сети (оба гаджета должны быть на одном канале - берём 1-й),
 // после игры подключается снова.
+#if BOARD_S3
+void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len);
+bool mirNowUp = false;                               // ESP-NOW включён ради трансляции экрана
+#endif
 namespace enow {
 std::mutex mu;
 std::vector<std::string> inbox;
@@ -10764,6 +10923,12 @@ const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len <= 0 || len > 250) return;
+#if BOARD_S3
+  if (data[0] == 0xA5) {                             // трансляция экрана - двоичные пакеты
+    mirRecv(info, data, len);
+    return;
+  }
+#endif
   std::string m((const char*)data, (size_t)len);
   std::lock_guard<std::mutex> lk(mu);
   size_t t = m.find('\t');
@@ -10801,7 +10966,10 @@ bool begin() {
   WiFi.disconnect(false);
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-  if (esp_now_init() != ESP_OK) return false;
+#if BOARD_S3
+  if (!mirNowUp)
+#endif
+    if (esp_now_init() != ESP_OK) return false;
   esp_now_register_recv_cb(onRecv);
   addPeer(BCAST);
   on = true;
@@ -10811,6 +10979,9 @@ bool begin() {
 void end() {
   if (!on) return;
   esp_now_deinit();
+#if BOARD_S3
+  mirNowUp = false;                                  // трансляция включит ESP-NOW заново сама
+#endif
   on = false;
   std::lock_guard<std::mutex> lk(mu);
   inbox.clear();
@@ -10844,6 +11015,322 @@ bool take(std::string& m) {
   return true;
 }
 }  // namespace enow
+
+#if BOARD_S3
+// ========================= ТРАНСЛЯЦИЯ ЭКРАНА =========================
+// Гаджет A (например, с разбитым экраном) шлёт свой экран гаджету B по ESP-NOW, B шлёт обратно ручку и кнопку.
+// Пакеты (первый байт 0xA5): 'B' маяк A (канал), 'J' B подключился/жив, 'I' ручка+кнопка B, 'R' строка экрана:
+// y, x, число отрезков, отрезки (длина, цвет 2 байта) - одноцветные куски сжаты.
+namespace mir {
+volatile bool on = false;                             // этот гаджет транслирует
+volatile bool viewing = false;                        // этот гаджет смотрит чужой экран
+uint8_t viewerMac[6];
+volatile bool viewerNew = false, needFull = false;
+volatile uint32_t viewerMs = 0;
+uint8_t srcMac[6];                                    // B: чей экран смотрим
+volatile bool srcFound = false;
+volatile uint8_t srcCh = 0;
+QueueHandle_t rowQ = nullptr;                         // B: принятые строки ждут рисования
+volatile uint32_t rxMs = 0;
+TaskHandle_t task = nullptr;
+}  // namespace mir
+
+void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len < 2 || !info) return;
+  char t = (char)data[1];
+  if (mir::on) {                                     // мы - транслирующий гаджет
+    if (t == 'J') {
+      if (memcmp(mir::viewerMac, info->src_addr, 6) != 0 || !mir::viewerMs) {
+        memcpy(mir::viewerMac, info->src_addr, 6);
+        mir::viewerNew = true;
+      }
+      if (!mir::viewerMs || millis() - mir::viewerMs > 3000) mir::needFull = true;
+      mir::viewerMs = millis();
+    } else if (t == 'I' && len >= 4) {
+      mir::inDir = data[2] <= 4 ? data[2] : 0;
+      mir::inBtn = data[3];
+      mir::inMs = millis();
+      mir::viewerMs = millis();
+    }
+  }
+  if (mir::viewing) {                                // мы смотрим
+    if (t == 'B' && len >= 3 && !mir::srcFound) {
+      memcpy(mir::srcMac, info->src_addr, 6);
+      mir::srcCh = data[2];
+      mir::srcFound = true;
+    } else if (t == 'R' && mir::rowQ && mir::srcFound && memcmp(info->src_addr, mir::srcMac, 6) == 0) {
+      uint8_t buf[250];
+      memset(buf, 0, sizeof(buf));
+      memcpy(buf, data, (size_t)len);
+      xQueueSend(mir::rowQ, buf, 0);                 // очередь полна - строка придёт при плановом обновлении
+      mir::rxMs = millis();
+    }
+  }
+}
+
+// Включить ESP-NOW, не трогая Wi-Fi: трансляция работает на канале домашней сети, интернет остаётся.
+bool mirNowEnsure() {
+  if (enow::on || mirNowUp) return true;
+  if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) return false;
+  esp_now_register_recv_cb(enow::onRecv);
+  enow::addPeer(enow::BCAST);
+  mirNowUp = true;
+  return true;
+}
+
+void mirSend(const uint8_t* mac, const uint8_t* p, int n) {
+  for (int k = 0; k < 30; k++) {
+    esp_err_t e = esp_now_send(mac, p, (size_t)n);
+    if (e != ESP_ERR_ESPNOW_NO_MEM) return;
+    vTaskDelay(1);                                   // очередь отправки полна - подождать
+  }
+}
+
+// Одна строка экрана (кусок от x0 до x1), сжатая одноцветными отрезками.
+void mirSendRow(int y, int x0, int x1) {
+  uint8_t p[250];
+  int x = x0;
+  while (x <= x1) {
+    p[0] = 0xA5;
+    p[1] = 'R';
+    p[2] = (uint8_t)y;
+    p[3] = (uint8_t)x;
+    int n = 0, o = 5;
+    const uint16_t* row = mir::fb + y * 240;
+    while (x <= x1 && n < 81) {
+      uint16_t c = row[x];
+      int l = 1;
+      while (x + l <= x1 && l < 255 && row[x + l] == c) l++;
+      p[o++] = (uint8_t)l;
+      p[o++] = (uint8_t)(c & 0xFF);
+      p[o++] = (uint8_t)(c >> 8);
+      x += l;
+      n++;
+    }
+    p[4] = (uint8_t)n;
+    mirSend(mir::viewerMac, p, o);
+  }
+}
+
+void mirTask(void*) {
+  uint32_t lastBeacon = 0, lastRefresh = 0;
+  int refreshRow = 0, scanY = 0;
+  for (;;) {
+    if (!mir::on || !mir::ready()) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+    if (!mirNowEnsure()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    uint32_t now = millis();
+    bool viewer = mir::viewerMs && now - mir::viewerMs < 3000;
+    if (mir::viewerNew) {
+      mir::viewerNew = false;
+      enow::addPeer(mir::viewerMac);
+    }
+    if (now - lastBeacon > (viewer ? 1000u : 150u)) {  // маяк: «я здесь, мой канал такой-то»
+      lastBeacon = now;
+      uint8_t ch = 1;
+      wifi_second_chan_t sc;
+      esp_wifi_get_channel(&ch, &sc);
+      uint8_t b[3] = {0xA5, 'B', ch};
+      esp_now_send(enow::BCAST, b, 3);
+    }
+    if (!viewer) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    if (mir::needFull) {
+      mir::needFull = false;
+      mir::markAll();
+    }
+    if (now - lastRefresh > 60) {                    // по кругу освежаем по 4 строки: потерянные пакеты не копятся
+      lastRefresh = now;
+      for (int k = 0; k < 4; k++) {
+        mir::markRow(refreshRow, 0, 239);
+        refreshRow = (refreshRow + 1) % 240;
+      }
+    }
+    int sent = 0;
+    for (int k = 0; k < 240 && sent < 24; k++) {
+      int y = (scanY + k) % 240;
+      if (!mir::dirty[y]) continue;
+      int a = mir::dx0[y], b = mir::dx1[y];
+      mir::dirty[y] = 0;
+      if (a > b) continue;
+      mirSendRow(y, a, b);
+      sent++;
+      scanY = (y + 1) % 240;
+    }
+    vTaskDelay(pdMS_TO_TICKS(sent ? 2 : 15));
+  }
+}
+
+void mirStart() {
+  if (!mir::ready()) return;                         // нет PSRAM - нечего транслировать
+  mir::on = true;
+  mir::needFull = true;
+  if (!mir::task) xTaskCreatePinnedToCore(mirTask, "mirror", 4096, nullptr, 1, &mir::task, 0);
+}
+
+void mirStop() {
+  mir::on = false;
+  mir::viewerMs = 0;
+  mir::inMs = 0;
+}
+
+// Смотреть экран другого гаджета и управлять им своей ручкой. Выход - держать кнопку 3 секунды.
+void runMirrorView() {
+  if (mir::on) mirStop();                            // одновременно и транслировать, и смотреть нельзя
+  showMsg(L3("Ищу гаджет, который транслирует экран...\n\nНа нём: Настройки -> Трансляция экрана, или при включении держать ручку до упора в любую сторону.\n\nДержать кнопку 3 с - выход.",
+             "Looking for a device sharing its screen...\n\nOn it: Settings -> Screen sharing, or hold the stick to the edge while powering on.\n\nHold the button 3 s to exit.",
+             "正在寻找共享屏幕的设备……\n\n长按按键3秒退出。"),
+          C_YELLOW);
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_STA);
+  if (!mirNowEnsure()) {
+    viewAnswer(L3("Не удалось включить прямую связь.", "Could not start the direct link.", "无法启动直连。"), C_RED);
+    return;
+  }
+  mir::rowQ = xQueueCreate(48, 250);
+  mir::srcFound = false;
+  mir::viewing = true;
+  struct Leave {
+    ~Leave() {
+      mir::viewing = false;
+      if (mir::rowQ) {
+        vQueueDelete(mir::rowQ);
+        mir::rowQ = nullptr;
+      }
+      if (mirNowUp && !enow::on) {
+        esp_now_deinit();
+        mirNowUp = false;
+      }
+      WiFi.setAutoReconnect(true);
+      wifiStarted = false;                           // фоновый Wi-Fi подключится заново
+    }
+  } leave;
+  uint32_t held = 0;                                 // с какого момента держат кнопку
+  auto exitHeld = [&]() {
+    bool d = digitalRead(PIN_SW) == LOW;
+    if (!d) {
+      held = 0;
+      return false;
+    }
+    if (!held) held = millis();
+    return millis() - held > 3000;
+  };
+  // 1. поиск: перебираем каналы, на каждом слушаем маяк
+  for (int ch = 1; !mir::srcFound; ch = ch % 13 + 1) {
+    esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 260 && !mir::srcFound) {
+      if (exitHeld()) return;
+      delay(5);
+    }
+  }
+  esp_wifi_set_channel(mir::srcCh ? mir::srcCh : 1, WIFI_SECOND_CHAN_NONE);
+  enow::addPeer(mir::srcMac);
+  tft.fillScreen(C_BLACK);
+  // 2. смотрим: рисуем строки, шлём ручку и кнопку
+  uint8_t pk[250];
+  uint16_t line[240];
+  uint32_t lastJoin = 0, lastIn = 0;
+  uint8_t lastDir = 255, lastBtn = 255;
+  mir::rxMs = millis();
+  bool lostShown = false;
+  for (;;) {
+    int drawn = 0;
+    while (drawn < 40 && xQueueReceive(mir::rowQ, pk, 0) == pdTRUE) {
+      int y = pk[2], x = pk[3], n = pk[4], o = 5, k = 0;
+      for (int i = 0; i < n && o + 2 < 250; i++, o += 3) {
+        int l = pk[o];
+        uint16_t c = (uint16_t)(pk[o + 1] | (pk[o + 2] << 8));
+        for (int j = 0; j < l && x + k < 240; j++) line[k++] = c;
+      }
+      if (k > 0 && y < 240) {
+        tft.startWrite();
+        tft.setAddrWindow(x, y, k, 1);
+        tft.writePixels(line, (uint32_t)k);
+        tft.endWrite();
+      }
+      drawn++;
+      lostShown = false;
+    }
+    uint32_t now = millis();
+    if (now - lastJoin > 800) {                      // «я смотрю» - без этого гаджет A перестаёт слать
+      lastJoin = now;
+      uint8_t j[2] = {0xA5, 'J'};
+      esp_now_send(mir::srcMac, j, 2);
+    }
+    // своя ручка и кнопка -> гаджету A (кнопку держим не дольше 1,5 с: дольше - это выход у нас)
+    uint8_t d = joyRawDir();
+    bool down = digitalRead(PIN_SW) == LOW;
+    if (down && !held) held = now;
+    if (!down) held = 0;
+    if (held && now - held > 3000) return;
+    uint8_t b = (down && now - held < 1500) ? 1 : 0;
+    if (d != lastDir || b != lastBtn || now - lastIn > 100) {
+      lastDir = d;
+      lastBtn = b;
+      lastIn = now;
+      uint8_t m[4] = {0xA5, 'I', d, b};
+      esp_now_send(mir::srcMac, m, 4);
+    }
+    if (!lostShown && now - mir::rxMs > 4000) {      // давно ничего не приходило
+      lostShown = true;
+      SmallFont small;
+      tft.fillRect(0, 222, 240, 18, C_BLACK);
+      drawUtf8(L3("Нет связи с гаджетом...", "No link to the device...", "连接中断……"), 4, 223, C_YELLOW, C_BLACK);
+    }
+    delay(drawn ? 1 : 8);
+  }
+}
+
+bool cfgMirBoot = false;                             // включать трансляцию при запуске
+
+void runMirrorSettings() {
+  for (;;) {
+    std::vector<String> o;
+    o.push_back(String(L3("Транслировать этот экран: ", "Share this screen: ", "共享本屏幕: ")) + (mir::on ? L3("вкл", "on", "开") : L3("выкл", "off", "关")));
+    o.push_back(String(L3("Включать при запуске: ", "Start on power-up: ", "开机启动: ")) + (cfgMirBoot ? L3("да", "yes", "是") : L3("нет", "no", "否")));
+    o.push_back(L3("Смотреть экран другого гаджета", "View another device's screen", "查看其他设备屏幕"));
+    o.push_back(L3("Как это работает", "How it works", "说明"));
+    o.push_back(L3("Назад", "Back", "返回"));
+    int k = choiceScreen(L3("Трансляция экрана", "Screen sharing", "屏幕共享"), o);
+    if (k == 0) {
+      if (mir::on) mirStop();
+      else mirStart();
+      if (!mir::ready()) viewAnswer(L3("Нет памяти PSRAM - трансляция невозможна.", "No PSRAM - sharing is not possible.", "没有PSRAM。"), C_RED);
+    } else if (k == 1) {
+      cfgMirBoot = !cfgMirBoot;
+      prefs.begin("dsk", false);
+      prefs.putUChar("mirboot", cfgMirBoot ? 1 : 0);
+      prefs.end();
+    } else if (k == 2) {
+      runMirrorView();
+    } else if (k == 3) {
+      viewAnswer(L3("Гаджет с разбитым экраном показывает свой экран на другом гаджете рядом (до ~50 м, без интернета), "
+                    "а ручка и кнопка второго гаджета управляют первым.\n\n"
+                    "Как включить на разбитом гаджете вслепую: выключить, зажать ручку до упора в любую сторону, включить, "
+                    "подержать 3 секунды - прозвучат три сигнала. Или заранее: «Включать при запуске».\n\n"
+                    "На втором гаджете: Настройки -> Трансляция экрана -> Смотреть. Выход - держать кнопку 3 секунды.\n\n"
+                    "Интернет на транслирующем гаджете продолжает работать.",
+                    "A device with a broken screen shows it on another device nearby (~50 m, no internet); the second device's stick and button control the first.\n\n"
+                    "Blind start on the broken device: power off, hold the stick to any edge, power on, keep holding 3 s - three beeps. Or set Start on power-up beforehand.\n\n"
+                    "On the other device: Settings -> Screen sharing -> View. Exit - hold the button 3 s.",
+                    "屏幕共享说明。"),
+                 C_WHITE);
+    } else {
+      return;
+    }
+  }
+}
+#endif
 
 bool g_netDirect = false;                            // игра идёт напрямую (ESP-NOW), а не через сервер
 void netSend(const String& body) {
@@ -13384,6 +13871,21 @@ void setup() {
   xTaskCreate(holdWatchTask, "hold", 2048, nullptr, 2, nullptr);
   joyCalibrate();
   Serial.printf("3: joystick center %d / %d\n", joyCx, joyCy);
+#if BOARD_S3
+  prefs.begin("dsk", true);
+  cfgMirBoot = prefs.getUChar("mirboot", 0) != 0;
+  prefs.end();
+  if (joyHeldAtBoot || cfgMirBoot) {                 // ручку держали при включении - экран, видимо, не виден
+    mirStart();
+    if (mir::on) {
+      for (int i = 0; i < 3; i++) {
+        beep(1, 1800, 80);
+        delay(120);
+      }
+      vibe(150);
+    }
+  }
+#endif
 
   sugg.addDict(DICT_RU);
   sugg.addDict(DICT_EN);
