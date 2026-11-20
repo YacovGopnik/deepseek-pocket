@@ -129,6 +129,7 @@ inline void media(uint16_t) {}
 #endif
 #ifndef ENABLE_FWBACKUP
 #define ENABLE_FWBACKUP (!(ENABLE_BLE && !BOARD_S3))
+#define ENABLE_MIRVIEW (BOARD_S3 || !ENABLE_BLE)     // смотреть экран другого гаджета (транслировать - только S3)
 #define ENABLE_JOYCAL (!(ENABLE_BLE && !BOARD_S3))    // калибровка джойстика (в C3 с Bluetooth нет места)  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
 #endif
 #ifndef ENABLE_PCSCREEN
@@ -1906,6 +1907,8 @@ inline bool inputFresh() { return inMs && millis() - inMs < 400; }
 volatile bool on = false;                             // этот гаджет транслирует свой экран
 }  // namespace mir
 bool cfgMirBoot = false;                             // включать трансляцию при запуске
+#endif
+#if ENABLE_MIRVIEW
 void runMirrorSettings();
 #endif
 
@@ -9567,7 +9570,7 @@ bool runSettings() {
     std::vector<String> items = splitBar(L3("Язык|Яркость|Звук|Гасить экран|Заставка|Часовой пояс|Джойстик|Фонарик|Wi-Fi и ключ|Забыть слова|Обновление|Ось Y джойстика|Администратор|Поворот экрана|Bluetooth|SD-карта|Наклон|Сенсорные кнопки|Назад",
                                             "Language|Brightness|Sound|Screen off|Screensaver|Time zone|Joystick|Flashlight|Wi-Fi and key|Forget words|Update|Joystick Y axis|Administrator|Screen rotation|Bluetooth|SD card|Tilt|Touch buttons|Back",
                                             "语言|亮度|声音|自动熄屏|屏保|时区|摇杆|手电筒|Wi-Fi和密钥|清除词语|更新|摇杆Y轴|管理员|屏幕旋转|蓝牙|SD卡|倾斜|触摸按键|返回"));
-#if BOARD_S3
+#if ENABLE_MIRVIEW
     items.insert(items.end() - 1, String(L3("Трансляция экрана", "Screen sharing", "屏幕共享")));
 #endif
     std::vector<String> right;
@@ -9595,6 +9598,8 @@ bool runSettings() {
     right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
 #if BOARD_S3
     right[18] = mir::on ? L3("идёт", "on", "开") : cfgMirBoot ? L3("при запуске", "on boot", "开机") : L3("выкл", "off", "关");
+#elif ENABLE_MIRVIEW
+    right[18] = L3("смотреть", "view", "查看");
 #endif
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
@@ -9750,7 +9755,7 @@ bool runSettings() {
           touchReady = false;
         }
         break;
-#if BOARD_S3
+#if ENABLE_MIRVIEW
       case 18:
         runMirrorSettings();
         break;
@@ -10919,7 +10924,7 @@ void runFps3d() {
 // ---- Прямая связь гаджет-гаджет (ESP-NOW): без роутера и интернета, до ~100 м ----
 // На время игры Wi-Fi отключается от сети (оба гаджета должны быть на одном канале - берём 1-й),
 // после игры подключается снова.
-#if BOARD_S3
+#if ENABLE_MIRVIEW
 void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len);
 bool mirNowUp = false;                               // ESP-NOW включён ради трансляции экрана
 #endif
@@ -10936,7 +10941,7 @@ const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len <= 0 || len > 250) return;
-#if BOARD_S3
+#if ENABLE_MIRVIEW
   if (data[0] == 0xA5) {                             // трансляция экрана - двоичные пакеты
     mirRecv(info, data, len);
     return;
@@ -10979,7 +10984,7 @@ bool begin() {
   WiFi.disconnect(false);
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-#if BOARD_S3
+#if ENABLE_MIRVIEW
   if (!mirNowUp)
 #endif
     if (esp_now_init() != ESP_OK) return false;
@@ -10992,7 +10997,7 @@ bool begin() {
 void end() {
   if (!on) return;
   esp_now_deinit();
-#if BOARD_S3
+#if ENABLE_MIRVIEW
   mirNowUp = false;                                  // трансляция включит ESP-NOW заново сама
 #endif
   on = false;
@@ -11029,27 +11034,30 @@ bool take(std::string& m) {
 }
 }  // namespace enow
 
-#if BOARD_S3
+#if ENABLE_MIRVIEW
 // ========================= ТРАНСЛЯЦИЯ ЭКРАНА =========================
 // Гаджет A (например, с разбитым экраном) шлёт свой экран гаджету B по ESP-NOW, B шлёт обратно ручку и кнопку.
 // Пакеты (первый байт 0xA5): 'B' маяк A (канал), 'J' B подключился/жив, 'I' ручка+кнопка B, 'R' строка экрана:
 // y, x, число отрезков, отрезки (длина, цвет 2 байта) - одноцветные куски сжаты.
 namespace mir {
 volatile bool viewing = false;                        // этот гаджет смотрит чужой экран
+#if BOARD_S3
 uint8_t viewerMac[6];
 volatile bool viewerNew = false, needFull = false;
 volatile uint32_t viewerMs = 0;
+TaskHandle_t task = nullptr;
+#endif
 uint8_t srcMac[6];                                    // B: чей экран смотрим
 volatile bool srcFound = false;
 volatile uint8_t srcCh = 0;
 QueueHandle_t rowQ = nullptr;                         // B: принятые строки ждут рисования
 volatile uint32_t rxMs = 0;
-TaskHandle_t task = nullptr;
 }  // namespace mir
 
 void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len < 2 || !info) return;
   char t = (char)data[1];
+#if BOARD_S3
   if (mir::on) {                                     // мы - транслирующий гаджет
     if (t == 'J') {
       if (memcmp(mir::viewerMac, info->src_addr, 6) != 0 || !mir::viewerMs) {
@@ -11065,6 +11073,7 @@ void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       mir::viewerMs = millis();
     }
   }
+#endif
   if (mir::viewing) {                                // мы смотрим
     if (t == 'B' && len >= 3 && !mir::srcFound) {
       memcpy(mir::srcMac, info->src_addr, 6);
@@ -11091,6 +11100,7 @@ bool mirNowEnsure() {
   return true;
 }
 
+#if BOARD_S3
 void mirSend(const uint8_t* mac, const uint8_t* p, int n) {
   for (int k = 0; k < 30; k++) {
     esp_err_t e = esp_now_send(mac, p, (size_t)n);
@@ -11194,9 +11204,13 @@ void mirStop() {
   mir::inMs = 0;
 }
 
+#endif
+
 // Смотреть экран другого гаджета и управлять им своей ручкой. Выход - держать кнопку 3 секунды.
 void runMirrorView() {
+#if BOARD_S3
   if (mir::on) mirStop();                            // одновременно и транслировать, и смотреть нельзя
+#endif
   showMsg(L3("Ищу гаджет, который транслирует экран...\n\nНа нём: Настройки -> Трансляция экрана, или при включении держать ручку до упора в любую сторону.\n\nДержать кнопку 3 с - выход.",
              "Looking for a device sharing its screen...\n\nOn it: Settings -> Screen sharing, or hold the stick to the edge while powering on.\n\nHold the button 3 s to exit.",
              "正在寻找共享屏幕的设备……\n\n长按按键3秒退出。"),
@@ -11306,21 +11320,33 @@ void runMirrorView() {
 void runMirrorSettings() {
   for (;;) {
     std::vector<String> o;
+#if BOARD_S3
     o.push_back(String(L3("Транслировать этот экран: ", "Share this screen: ", "共享本屏幕: ")) + (mir::on ? L3("вкл", "on", "开") : L3("выкл", "off", "关")));
     o.push_back(String(L3("Включать при запуске: ", "Start on power-up: ", "开机启动: ")) + (cfgMirBoot ? L3("да", "yes", "是") : L3("нет", "no", "否")));
+#else
+    o.push_back(L3("Транслировать: только на S3", "Share: S3 only", "共享：仅S3"));
+    o.push_back(L3("Включать при запуске: только на S3", "Start on power-up: S3 only", "仅S3"));
+#endif
     o.push_back(L3("Смотреть экран другого гаджета", "View another device's screen", "查看其他设备屏幕"));
     o.push_back(L3("Как это работает", "How it works", "说明"));
     o.push_back(L3("Назад", "Back", "返回"));
     int k = choiceScreen(L3("Трансляция экрана", "Screen sharing", "屏幕共享"), o);
     if (k == 0) {
+#if BOARD_S3
       if (mir::on) mirStop();
       else mirStart();
       if (!mir::ready()) viewAnswer(L3("Нет памяти PSRAM - трансляция невозможна.", "No PSRAM - sharing is not possible.", "没有PSRAM。"), C_RED);
+#else
+      viewAnswer(L3("Транслировать свой экран умеет только гаджет на ESP32-S3 (нужна память PSRAM). Этот гаджет может смотреть экран S3.",
+                    "Only an ESP32-S3 device can share its screen (needs PSRAM). This device can view an S3 screen.", "仅S3可共享屏幕。"), C_YELLOW);
+#endif
     } else if (k == 1) {
+#if BOARD_S3
       cfgMirBoot = !cfgMirBoot;
       prefs.begin("dsk", false);
       prefs.putUChar("mirboot", cfgMirBoot ? 1 : 0);
       prefs.end();
+#endif
     } else if (k == 2) {
       runMirrorView();
     } else if (k == 3) {
