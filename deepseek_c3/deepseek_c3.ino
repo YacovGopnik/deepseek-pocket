@@ -2047,7 +2047,8 @@ bool sdMount() {
       delay(200);
     }
     SD_STAGE(8);
-    sdOk = SD.begin(SD_CS, SD_SPI, 4000000, "/sd", 4);   // 4 МГц: на проводах 8 МГц работало через раз
+    // 4 МГц: на проводах 8 МГц работало через раз; не вышло - пробуем медленнее (длинные провода, слабый модуль)
+    sdOk = SD.begin(SD_CS, SD_SPI, k == 0 ? 4000000 : k == 1 ? 1000000 : 400000, "/sd", 4);
     SD_STAGE(9);
   }
   if (sdOk) {
@@ -2067,13 +2068,147 @@ void sdRetryService() {
   last = millis();
   SdBus bus;
   SD.end();
-  sdOk = SD.begin(SD_CS, SD_SPI, 4000000, "/sd", 4);
+  sdOk = SD.begin(SD_CS, SD_SPI, 1000000, "/sd", 4);
   if (sdOk) {
     SD.mkdir("/pics");
     SD.mkdir("/fw");
   }
   Serial.printf("SD card retry: %s\n", sdOk ? "ok" : "not found");
 }
+
+#if BOARD_S3
+// ---------- Проверка проводки карты (Настройки -> SD-карта, когда карта не найдена) ----------
+// Без библиотеки SD: выводы дёргаются вручную, карте посылается команда сброса CMD0 - живая карта
+// отвечает 0x01. Если не ответила - перебираем, не перепутаны ли провода местами.
+uint8_t sdBbByte(int sck, int mosi, int miso, uint8_t out) {
+  uint8_t in = 0;
+  for (int i = 7; i >= 0; i--) {
+    digitalWrite(mosi, (out >> i) & 1);
+    delayMicroseconds(4);
+    digitalWrite(sck, HIGH);
+    delayMicroseconds(4);
+    in = (uint8_t)((in << 1) | (digitalRead(miso) ? 1 : 0));
+    digitalWrite(sck, LOW);
+  }
+  return in;
+}
+
+// Ответ карты на CMD0 (0xFF - молчит, 0x00 - линия MISO прижата к земле, 0x01 - карта жива).
+uint8_t sdBbCmd0(int cs, int sck, int mosi, int miso) {
+  pinMode(miso, INPUT_PULLUP);
+  pinMode(cs, OUTPUT);
+  pinMode(sck, OUTPUT);
+  pinMode(mosi, OUTPUT);
+  digitalWrite(cs, HIGH);
+  digitalWrite(mosi, HIGH);
+  digitalWrite(sck, LOW);
+  delay(2);
+  for (int i = 0; i < 12; i++) sdBbByte(sck, mosi, miso, 0xFF);   // >74 тактов при CS=1: карта переходит в SPI
+  digitalWrite(cs, LOW);
+  const uint8_t cmd[6] = {0x40, 0, 0, 0, 0, 0x95};
+  for (uint8_t b : cmd) sdBbByte(sck, mosi, miso, b);
+  uint8_t r = 0xFF;
+  for (int i = 0; i < 12 && r == 0xFF; i++) r = sdBbByte(sck, mosi, miso, 0xFF);
+  digitalWrite(cs, HIGH);
+  sdBbByte(sck, mosi, miso, 0xFF);
+  return r;
+}
+
+void sdWiringTest() {
+  showMsg(L3("Проверяю карту и провода... (~10 с)", "Checking the card and wires... (~10 s)", "正在检查SD卡和接线……"), C_YELLOW);
+  SD.end();
+  sdSpi.end();
+  const int P[4] = {SD_CS, SD_SCK, SD_MOSI, SD_MISO};
+  const char* NM[4] = {"CS", "SCK", "MOSI", "MISO"};
+  String rep = L3("Проверка SD-карты\n\n", "SD card check\n\n", "SD卡检查\n\n");
+  // 1. Состояние линий: с подтяжкой к 0 и к 1 свободный провод читается 0 и 1.
+  rep += L3("Линии (подтяжка вниз / вверх):\n", "Lines (pull-down / pull-up):\n", "线路：\n");
+  bool stuck0 = false;
+  for (int i = 0; i < 4; i++) {
+    pinMode(P[i], INPUT_PULLDOWN);
+    delay(3);
+    int lo = digitalRead(P[i]);
+    pinMode(P[i], INPUT_PULLUP);
+    delay(3);
+    int hi = digitalRead(P[i]);
+    pinMode(P[i], INPUT);
+    rep += String(NM[i]) + " (GPIO" + String(P[i]) + "): " + String(lo) + " / " + String(hi);
+    if (lo == 0 && hi == 0) {
+      rep += L3("  прижат к GND!", "  stuck to GND!", "  接地!");
+      stuck0 = true;
+    }
+    rep += "\n";
+  }
+  // 2. Команда сброса по проводам как в прошивке.
+  uint8_t r = sdBbCmd0(SD_CS, SD_SCK, SD_MOSI, SD_MISO);
+  char hx[8];
+  snprintf(hx, sizeof(hx), "0x%02X", r);
+  rep += String(L3("\nОтвет карты на сброс: ", "\nCard reply to reset: ", "\n复位应答: ")) + hx + "\n";
+  bool good = (r & 0xFE) == 0;                       // 0x01 (или 0x00 у уже запущенной карты)
+  String verdict;
+  if (r == 0x01) {
+    verdict = L3("Карта отвечает - провода в порядке.", "The card answers - the wires are fine.", "卡有应答，接线正常。");
+  } else {
+    // 3. Не ответила - может, провода перепутаны местами? Перебираем все 24 варианта.
+    int found = -1;
+    int perm[4] = {0, 1, 2, 3};
+    std::sort(perm, perm + 4);
+    int n = 0;
+    do {
+      if (n++ == 0) continue;                        // исходный порядок уже проверен
+      if (sdBbCmd0(P[perm[0]], P[perm[1]], P[perm[2]], P[perm[3]]) == 0x01) {
+        found = perm[0] * 1000 + perm[1] * 100 + perm[2] * 10 + perm[3];
+        break;
+      }
+    } while (std::next_permutation(perm, perm + 4));
+    if (found >= 0) {
+      int q[4] = {found / 1000, found / 100 % 10, found / 10 % 10, found % 10};
+      verdict = L3("Провода перепутаны! Карта ответила так:\n", "Wires are swapped! The card answered with:\n", "接线接反！\n");
+      for (int i = 0; i < 4; i++)
+        verdict += String("  ") + NM[i] + L3(" модуля сейчас на GPIO", " of the module is on GPIO", " 在 GPIO") + String(P[q[i]]) +
+                   L3(", а должен быть на GPIO", ", must be on GPIO", "，应在 GPIO") + String(P[i]) + "\n";
+    } else if (r == 0xFF) {
+      verdict = L3("Карта молчит. Проверьте: карта вставлена до щелчка; питание модуля (со стабилизатором - 5V, без - 3V3) и GND; "
+                   "что провод MISO (DO) действительно идёт на GPIO13. Попробуйте другую карту.",
+                   "The card is silent. Check: card fully inserted; module power (5V with a regulator, 3V3 without) and GND; "
+                   "that MISO (DO) really goes to GPIO13. Try another card.", "卡无应答。检查供电和接线。");
+    } else if (r == 0x00 || stuck0) {
+      verdict = L3("Линия MISO прижата к земле: модуль без питания, замыкание на GND или MISO не на том выводе.",
+                   "MISO is held low: module unpowered, a short to GND or MISO on a wrong pin.", "MISO被拉低。");
+    } else {
+      verdict = L3("Карта отвечает мусором - плохой контакт или слишком длинные провода. Пропаяйте контакты, укоротите провода, "
+                   "поставьте конденсатор 10-100 мкФ на питание модуля.",
+                   "The card answers garbage - bad contact or wires too long. Resolder, shorten wires, add a 10-100 uF capacitor on the module power.",
+                   "应答错误，检查焊点。");
+    }
+  }
+  rep += "\n" + verdict + "\n";
+  // 4. Если карта живая - пробуем смонтировать на разных скоростях.
+  sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
+  if (good) {
+    const uint32_t F[3] = {4000000, 1000000, 400000};
+    for (uint32_t f : F) {
+      SD.end();
+      bool ok = SD.begin(SD_CS, sdSpi, f, "/sd", 4);
+      rep += String(f / 1000) + L3(" кГц: ", " kHz: ", " kHz: ") +
+             (ok ? String(L3("открылась, ", "mounted, ", "成功，")) + String((unsigned long)(SD.cardSize() / (1024 * 1024))) + L3(" МБ", " MB", " MB")
+                 : String(L3("не открылась", "failed", "失败")));
+      rep += "\n";
+      if (ok) {
+        sdOk = true;
+        SD.mkdir("/pics");
+        SD.mkdir("/fw");
+        break;
+      }
+    }
+    if (!sdOk)
+      rep += L3("Карта отвечает, но не открывается: отформатируйте её в FAT32 (до 32 ГБ) или возьмите другую.\n",
+                "The card answers but does not mount: format it as FAT32 (up to 32 GB) or try another.\n", "请格式化为FAT32。\n");
+  }
+  Serial.println(rep);
+  viewAnswer(rep, sdOk ? C_GREEN : C_WHITE);
+}
+#endif
 
 fs::FS& picFs() {
   if (sdOk) return SD;
@@ -9062,6 +9197,18 @@ bool runSettings() {
         runAdmin();
         break;
       case 15: {
+#if BOARD_S3
+        if (cfgSd && !sdOk) {                        // карта включена, но не нашлась - предлагаем проверку
+          std::vector<String> ch = splitBar(L3("Проверить карту и провода|Выключить SD-карту|Назад",
+                                               "Check the card and wires|Turn the SD card off|Back", "检查|关闭|返回"));
+          int c = choiceScreen(L3("SD-карта не найдена", "SD card not found", "未找到SD卡"), ch);
+          if (c == 0) {
+            sdWiringTest();
+            break;
+          }
+          if (c != 1) break;
+        }
+#endif
         std::vector<String> yn = splitBar(L3("Да, перезапустить|Нет", "Yes, restart|No", "是，重启|否"));
         String q = cfgSd ? (BOARD_S3 ? L3("Выключить SD-карту? Нужен перезапуск.", "Turn the SD card off? Needs a restart.", "关闭SD卡？需要重启。")
                                      : L3("Выключить SD-карту? Вернутся пищалка, фонарик и ИК-пульт (если они подключены). Нужен перезапуск.",
