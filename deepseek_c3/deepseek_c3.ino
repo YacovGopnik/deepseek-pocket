@@ -11498,7 +11498,7 @@ void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
         memcpy(mir::viewerMac, info->src_addr, 6);
         mir::viewerNew = true;
       }
-      if (!mir::viewerMs || millis() - mir::viewerMs > 3000) mir::needFull = true;
+      if (!mir::viewerMs || millis() - mir::viewerMs > 3000 || (len >= 3 && data[2] == 'F')) mir::needFull = true;
       mir::viewerMs = millis();
     } else if (t == 'I' && len >= 4) {
       mir::inDir = data[2] <= 4 ? data[2] : 0;
@@ -11509,6 +11509,7 @@ void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   }
 #endif
   if (mir::viewing) {                                // мы смотрим
+    if (mir::srcFound && memcmp(info->src_addr, mir::srcMac, 6) == 0) mir::rxMs = millis();   // любой пакет - связь есть
     if (t == 'B' && len >= 3 && !mir::srcFound) {
       memcpy(mir::srcMac, info->src_addr, 6);
       mir::srcCh = data[2];
@@ -11725,7 +11726,6 @@ void runMirrorView() {
         tft.endWrite();
       }
       drawn++;
-      lostShown = false;
     }
     uint32_t now = millis();
     if (now - lastJoin > 800) {                      // «я смотрю» - без этого гаджет A перестаёт слать
@@ -11747,11 +11747,15 @@ void runMirrorView() {
       uint8_t m[4] = {0xA5, 'I', d, b};
       esp_now_send(mir::srcMac, m, 4);
     }
-    if (!lostShown && now - mir::rxMs > 4000) {      // давно ничего не приходило
+    if (!lostShown && now - mir::rxMs > 5000) {      // давно ничего не приходило
       lostShown = true;
       SmallFont small;
       tft.fillRect(0, 222, 240, 18, C_BLACK);
       drawUtf8(L3("Нет связи с гаджетом...", "No link to the device...", "连接中断……"), 4, 223, C_YELLOW, C_BLACK);
+    } else if (lostShown && now - mir::rxMs < 500) {  // связь вернулась - убрать надпись и попросить весь экран
+      lostShown = false;
+      uint8_t f[3] = {0xA5, 'J', 'F'};
+      esp_now_send(mir::srcMac, f, 3);
     }
     delay(drawn ? 1 : 8);
   }
