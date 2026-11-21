@@ -7986,7 +7986,7 @@ void runRemoteLearn() {
 // Кнопки нарисованы как на настоящем пульте (по образцу пульта Sber/Салют ТВ). Ручка ходит между кнопками,
 // нажатие - отправить. Кнопки, которой нет в файле, - тусклая: нажмите её, и (на S3) её можно записать с родного пульта.
 enum PadKey { PK_POWER, PK_MUTE, PK_UP, PK_LEFT, PK_OK, PK_RIGHT, PK_DOWN, PK_BACK, PK_HOME, PK_VOLUP,
-              PK_MENU, PK_INPUT, PK_VOLDN, PK_CHDN, PK_CHUP, PK_MORE, PK_COUNT };
+              PK_MENU, PK_INPUT, PK_VOLDN, PK_CHDN, PK_CHUP, PK_MORE, PK_JOY, PK_COUNT };
 struct PadBtn {
   int16_t x, y, r;      // центр и радиус (у «таблеток» r - половина высоты)
   bool pill;
@@ -7998,7 +7998,9 @@ const PadBtn PAD[PK_COUNT] = {
     {58, 158, 16, false}, {120, 158, 16, false}, {182, 158, 16, false},  // назад, домой, громче
     {58, 192, 16, false}, {120, 192, 16, false}, {182, 192, 16, false},  // меню, источник, тише
     {58, 224, 11, true},  {120, 224, 11, true},  {182, 224, 11, true},   // канал -, канал +, ещё
+    {120, 20, 10, true},                                                 // режим «джойстик»
 };
+bool padJoyMode = false;                             // ручка = стрелки, нажатие = OK, удержание = Назад
 const uint16_t PAD_BODY = 0x10A2, PAD_KEY = 0x31A6, PAD_KEY_OFF = 0x18E3, PAD_RING = 0x05FF, PAD_DPAD = 0x2124;
 
 // Имя кнопки -> клавиша пульта (английские имена из базы Flipper и русские из «Записать с пульта»).
@@ -8130,6 +8132,17 @@ void padDrawBtn(int k, bool focus, bool have, bool pressed) {
   uint16_t bg = pressed ? PAD_RING : PAD_KEY;
   uint16_t fg = pressed ? C_BLACK : !have ? 0x52AA : k == PK_POWER ? 0xF9A6 : C_WHITE;
   uint16_t around = (k >= PK_UP && k <= PK_DOWN) ? PAD_DPAD : PAD_BODY;
+  if (k == PK_JOY) {                                 // переключатель режима вверху
+    int w = 84, h = b.r * 2;
+    uint16_t pbg = padJoyMode ? PAD_RING : PAD_KEY;
+    tft.fillRoundRect(b.x - w / 2 - 3, b.y - b.r - 3, w + 6, h + 6, b.r + 3, PAD_BODY);
+    tft.fillRoundRect(b.x - w / 2, b.y - b.r, w, h, b.r, pressed ? C_WHITE : pbg);
+    if (focus) tft.drawRoundRect(b.x - w / 2 - 2, b.y - b.r - 2, w + 4, h + 4, b.r + 2, padJoyMode ? C_WHITE : PAD_RING);
+    const char* t = L3("Джойстик", "Joystick", "摇杆");
+    SmallFont small;
+    drawUtf8(t, b.x - textWidth(t) / 2, b.y - 6, padJoyMode ? C_BLACK : C_LIGHT, pressed ? C_WHITE : pbg);
+    return;
+  }
   if (b.pill) {
     int w = 54, h = b.r * 2;
     tft.fillRoundRect(b.x - w / 2 - 3, b.y - b.r - 3, w + 6, h + 6, b.r + 3, around);
@@ -8157,12 +8170,7 @@ void padDrawAll(const String& title, int focus, const bool* have) {
   tft.fillRoundRect(4, 2, 232, 238, 22, PAD_BODY);
   tft.fillCircle(120, 84, 52, PAD_DPAD);             // круг крестовины
   tft.drawCircle(120, 84, 52, 0x3186);
-  {
-    SmallFont small;
-    String t = title;
-    while (t.length() > 3 && textWidth(t.c_str()) > 140) t.remove(t.length() - 1);
-    drawUtf8(t.c_str(), 120 - textWidth(t.c_str()) / 2, 13, C_LIGHT, PAD_BODY);
-  }
+  (void)title;                                       // название пульта - в «Ещё»
   for (int k = 0; k < PK_COUNT; k++) padDrawBtn(k, k == focus, have[k], false);
 }
 
@@ -8227,6 +8235,11 @@ bool padLearn(int slot, int key) {
 void runRemotePad(int slot) {
   String title = irTitle(slot);
   int focus = PK_OK;
+  {
+    prefs.begin("dsk", true);
+    padJoyMode = prefs.getUChar("irjoy", 0) != 0;
+    prefs.end();
+  }
   for (;;) {
     std::vector<String> names;
     std::vector<uint32_t> offs;
@@ -8236,7 +8249,7 @@ void runRemotePad(int slot) {
     bool have[PK_COUNT];
     for (int k = 0; k < PK_COUNT; k++) {
       idx[k] = -1;
-      have[k] = k == PK_MORE;
+      have[k] = k == PK_MORE || k == PK_JOY;
     }
     for (size_t i = 0; i < names.size(); i++) {
       int k = padKeyOf(names[i]);
@@ -8247,6 +8260,51 @@ void runRemotePad(int slot) {
     }
     padDrawAll(title, focus, have);
     bool reload = false;
+    // отправить клавишу k с подсветкой; нет её в пульте - короткий низкий сигнал
+    auto sendKey = [&](int k) {
+      if (!have[k] || idx[k] < 0) {
+        beep(1, 600, 60);
+        return;
+      }
+      padDrawBtn(k, k == focus, true, true);
+      ir::Signal sg;
+      irLoadSignal(slot, offs[(size_t)idx[k]], sg) && irSend(sg);
+      vibe(25);
+      delay(70);
+      padDrawBtn(k, k == focus, true, false);
+    };
+    while (!reload && padJoyMode) {                  // режим «джойстик»: ручка и кнопка сами - клавиши пульта
+      uint8_t d = joyEvent();
+      if (d == J_UP) sendKey(PK_UP);
+      else if (d == J_DOWN) sendKey(PK_DOWN);
+      else if (d == J_LEFT) sendKey(PK_LEFT);
+      else if (d == J_RIGHT) sendKey(PK_RIGHT);
+      BtnEvent e = btnEvent();
+      if (e == EV_CLICK) sendKey(PK_OK);
+      if (e == EV_LONG) {                            // до 1,5 с - «Назад», дольше - выйти из режима
+        uint32_t t0 = millis();
+        bool leave = false;
+        while (swDown()) {
+          if (!leave && millis() - t0 > 800) {
+            leave = true;
+            beep(1, 1500, 40);
+            padDrawBtn(PK_JOY, true, true, true);    // подсказка: отпустите - режим выключится
+          }
+          delay(10);
+        }
+        if (!leave) {
+          sendKey(PK_BACK);
+        } else {
+          padJoyMode = false;
+          prefs.begin("dsk", false);
+          prefs.putUChar("irjoy", 0);
+          prefs.end();
+          focus = PK_JOY;
+          padDrawAll(title, focus, have);
+        }
+      }
+      delay(10);
+    }
     while (!reload) {
       uint8_t d = joyEvent();
       if (d != J_NONE) {
@@ -8263,6 +8321,20 @@ void runRemotePad(int slot) {
       if (e == EV_CLICK) {
         if (focus == PK_MORE) {
           runRemoteButtons(slot);
+          reload = true;
+          break;
+        }
+        if (focus == PK_JOY) {                       // включить режим «джойстик» (запоминается)
+          padJoyMode = true;
+          prefs.begin("dsk", false);
+          prefs.putUChar("irjoy", 1);
+          prefs.end();
+          beep(1, 2000, 30);
+          showMsg(L3("Режим «Джойстик»\n\nРучка - стрелки\nНажатие - OK\nУдержание - Назад\nДержать дольше 1,5 с - выйти из режима",
+                     "Joystick mode\n\nStick - arrows\nPress - OK\nHold - Back\nHold over 1.5 s - leave the mode",
+                     "摇杆模式\n\n摇杆 - 方向\n按下 - OK\n长按 - 返回\n按住1.5秒以上 - 退出"),
+                  C_WHITE);
+          delay(2200);
           reload = true;
           break;
         }
