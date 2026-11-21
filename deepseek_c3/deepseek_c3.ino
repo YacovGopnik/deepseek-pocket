@@ -279,6 +279,7 @@ const int PIN_LED = 18;                              // S3: площадка 18 
 const int PIN_LED = 2;
 #endif
 bool torchOn = false;
+uint8_t cfgIrRx = 44;                                // S3: вывод ИК-приёмника (44 - RX, или 18)
 
 #if BOARD_S3
 // ESP32-S3 (S3-Zero): экран SCL 12, SDA 11, DC 10, RES 9, BLK 8; батарея - делитель на GPIO3
@@ -1354,15 +1355,27 @@ void sndTone(int freq) {
   audFreq = freq > 0 ? freq : 0;
 #endif
   if (cfgSd && !BOARD_S3) return;                                 // вывод пищалки занят SD-картой
+  if (BOARD_S3 && cfgIrRx == PIN_BUZ) return;                      // на выводе пищалки - ИК-приёмник
   if (BUZZER_ACTIVE) digitalWrite(PIN_BUZ, freq > 0 ? HIGH : LOW);
   else ledcWriteTone(PIN_BUZ, freq > 0 ? (uint32_t)freq : 0);
 }
 
 void soundInit() {
 #if BOARD_S3
-  audioInit();
+  static bool aud = false;
+  if (!aud) {
+    aud = true;
+    audioInit();
+    prefs.begin("dsk", true);
+    cfgIrRx = prefs.getUChar("irrx", 44);
+    prefs.end();
+  }
 #endif
   if (cfgSd && !BOARD_S3) return;
+  if (BOARD_S3 && cfgIrRx == PIN_BUZ) {               // на выводе пищалки - ИК-приёмник, вывод оставляем входом
+    pinMode(PIN_BUZ, INPUT);
+    return;
+  }
   if (BUZZER_ACTIVE) {
     pinMode(PIN_BUZ, OUTPUT);
     digitalWrite(PIN_BUZ, LOW);
@@ -7801,7 +7814,8 @@ bool runRemoteDownload() {
 // ---------- Запись кнопок с родного пульта (S3) ----------
 // ИК-приёмник на 38 кГц (VS1838B, TSOP1838...): OUT -> резистор 1 кОм -> GPIO18 (площадка фонарика), VCC -> 3V3, GND -> GND.
 // Приёмник в покое держит 1, во время вспышки - 0. Ловим моменты переключений и сохраняем как сырой сигнал (type: raw).
-const int PIN_IRRX = PIN_LED;
+// Вывод приёмника выбирается в «Записать с пульта»: 44 (RX, вместо пищалки - звук всё равно идёт через усилитель) или 18.
+int irRxPin() { return cfgIrRx == 18 ? 18 : 44; }
 const int IRRX_MAX = 400;
 static volatile uint32_t irRxT[IRRX_MAX];
 static volatile int irRxN = 0;
@@ -7816,15 +7830,27 @@ void IRAM_ATTR irRxIsr() {
 // 1 - сигнал пойман (длительности: вспышка, пауза, вспышка...), 0 - отмена кнопкой гаджета, -1 - слишком короткий.
 int irCapture(std::vector<uint32_t>& dur) {
   dur.clear();
+  const int PIN_IRRX = irRxPin();
   pinMode(PIN_IRRX, INPUT_PULLUP);
   delay(20);
   irRxN = 0;
   attachInterrupt(digitalPinToInterrupt(PIN_IRRX), irRxIsr, CHANGE);
   int res = 0;
+  uint32_t tShow = 0;
+  int shown = -1;
   for (;;) {
     BtnEvent e = btnEvent();
     if (e == EV_CLICK || e == EV_LONG) break;
     int n = irRxN;
+    if (millis() - tShow > 250 && n != shown) {      // живой счётчик: видно, доходит ли что-то до вывода
+      tShow = millis();
+      shown = n;
+      SmallFont small;
+      tft.fillRect(0, 222, 240, 18, C_BLACK);
+      char b[48];
+      snprintf(b, sizeof(b), "GPIO%d: %s %d", PIN_IRRX, n ? "pulses" : "tishina", n);
+      drawUtf8(b, 4, 223, n ? C_GREEN : C_GRAY, C_BLACK);
+    }
     if (n > 0 && micros() - irRxT[n - 1] > 150000) {   // 150 мс тишины - пульт закончил
       res = 1;
       break;
@@ -7869,16 +7895,39 @@ bool irSaveLearned(String name, const std::vector<uint32_t>& d) {
 }
 
 void runRemoteLearn() {
-  if (ENABLE_TORCH && torchOn) {                     // фонарик и приёмник на одном выводе
+  for (;;) {                                         // сначала - на каком выводе приёмник
+    std::vector<String> o;
+    o.push_back(L3("Начать запись", "Start recording", "开始录制"));
+    o.push_back(String(L3("Вывод приёмника: ", "Receiver pin: ", "接收器引脚: ")) +
+                (irRxPin() == 44 ? String("44 (RX)") : String(L3("18 (фонарик)", "18 (torch)", "18（手电）"))));
+    o.push_back(L3("Назад", "Back", "返回"));
+    int k = choiceScreen(L3("Запись с пульта", "Record from a remote", "从遥控器录制"), o);
+    if (k == 1) {
+      cfgIrRx = irRxPin() == 44 ? 18 : 44;
+      prefs.begin("dsk", false);
+      prefs.putUChar("irrx", cfgIrRx);
+      prefs.end();
+      if (cfgIrRx == PIN_BUZ) {
+        ledcDetach(PIN_BUZ);                         // пищалку с этого вывода снимаем
+        pinMode(PIN_BUZ, INPUT);
+      } else {
+        soundInit();                                 // вывод 44 снова для пищалки
+      }
+      continue;
+    }
+    if (k != 0) return;
+    break;
+  }
+  if (ENABLE_TORCH && torchOn && irRxPin() == PIN_LED) {   // фонарик и приёмник на одном выводе
     torchOn = false;
     digitalWrite(PIN_LED, LOW);
   }
   int saved = 0;
   for (;;) {
-    showMsg(String(L3("Запись с пульта\n\nНаправьте пульт на ИК-приёмник (вывод 18) и нажмите кнопку на пульте.\n\n"
-                      "Выход - кнопка гаджета.",
-                      "Record from a remote\n\nPoint the remote at the IR receiver (pin 18) and press a button on it.\n\nExit - the device button.",
-                      "从遥控器录制\n\n把遥控器对准红外接收器（18脚）并按键。\n\n按本机按键退出。")) +
+    showMsg(String(L3("Запись с пульта\n\nНаправьте пульт на ИК-приёмник (вывод ", "Record from a remote\n\nPoint the remote at the IR receiver (pin ", "从遥控器录制\n\n把遥控器对准红外接收器（")) +
+                String(irRxPin()) +
+                L3(") и нажмите кнопку на пульте.\n\nВыход - кнопка гаджета.",
+                   ") and press a button on it.\n\nExit - the device button.", "脚）并按键。\n\n按本机按键退出。") +
                 (saved ? String(L3("\n\nЗаписано кнопок: ", "\n\nButtons saved: ", "\n\n已保存: ")) + String(saved) : String("")),
             C_WHITE);
     std::vector<uint32_t> d;
@@ -11143,12 +11192,18 @@ void mirTask(void*) {
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     }
+    if (WiFi.getMode() == WIFI_OFF) mirNowUp = false; // Wi-Fi выключали - ESP-NOW тоже погас
     if (!mirNowEnsure()) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
     uint32_t now = millis();
     bool viewer = mir::viewerMs && now - mir::viewerMs < 3000;
+    static bool lowPower = false;                    // пока идёт поток - передатчик тише: меньше просадки питания
+    if (viewer != lowPower) {
+      lowPower = viewer;
+      esp_wifi_set_max_tx_power(viewer ? 44 : 80);   // 11 дБм рядом хватает с запасом
+    }
     if (mir::viewerNew) {
       mir::viewerNew = false;
       enow::addPeer(mir::viewerMac);
@@ -11195,7 +11250,7 @@ void mirStart() {
   if (!mir::ready()) return;                         // нет PSRAM - нечего транслировать
   mir::on = true;
   mir::needFull = true;
-  if (!mir::task) xTaskCreatePinnedToCore(mirTask, "mirror", 4096, nullptr, 1, &mir::task, 0);
+  if (!mir::task) xTaskCreatePinnedToCore(mirTask, "mirror", 8192, nullptr, 1, &mir::task, 0);
 }
 
 void mirStop() {
@@ -13891,6 +13946,16 @@ void setup() {
     snprintf(b, sizeof(b), "Upalo na shage: %s - propuskayu", INIT_NAMES[initSkip]);
     bootStage(b);
     delay(3000);
+  } else {
+    esp_reset_reason_t why = esp_reset_reason();     // неожиданная перезагрузка - показать причину
+    const char* w = why == ESP_RST_PANIC ? "Perezagruzka: sboy programmy (panic)"
+                    : why == ESP_RST_BROWNOUT ? "Perezagruzka: prosadka pitaniya"
+                    : (why == ESP_RST_INT_WDT || why == ESP_RST_TASK_WDT || why == ESP_RST_WDT) ? "Perezagruzka: zavislo (watchdog)"
+                    : nullptr;
+    if (w) {
+      bootStage(w);
+      delay(2500);
+    }
   }
   bootStage("Zvuk");
   if (initRun(1)) soundInit();       // после подсветки: у пищалки свой канал
