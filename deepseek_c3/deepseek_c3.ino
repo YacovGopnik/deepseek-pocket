@@ -7874,12 +7874,18 @@ int irCapture(std::vector<uint32_t>& dur) {
 String irLearnTitle() { return L3("Мой пульт", "My remote", "我的遥控器"); }
 
 // Дописать кнопку в «Мой пульт» (создаётся при первой записи).
+bool irAppendRaw(int slot, bool fresh, String name, const std::vector<uint32_t>& d);
 bool irSaveLearned(String name, const std::vector<uint32_t>& d) {
   int slot = -1;
   for (int i = 0; i < IR_SLOTS; i++)
     if (LittleFS.exists(irPath(i).c_str()) && irTitle(i) == irLearnTitle()) slot = i;
   bool fresh = slot < 0;
   if (fresh) slot = irFreeSlot();
+  return irAppendRaw(slot, fresh, name, d);
+}
+
+// Дописать сырой сигнал в файл пульта slot (fresh - файла ещё нет, создать «Мой пульт»).
+bool irAppendRaw(int slot, bool fresh, String name, const std::vector<uint32_t>& d) {
   if (slot < 0 || !irRoom()) return false;
   File f = LittleFS.open(irPath(slot).c_str(), fresh ? "w" : "a");
   if (!f) return false;
@@ -7975,6 +7981,313 @@ void runRemoteLearn() {
 }
 #endif
 
+
+// ---------- Пульт в виде пульта ----------
+// Кнопки нарисованы как на настоящем пульте (по образцу пульта Sber/Салют ТВ). Ручка ходит между кнопками,
+// нажатие - отправить. Кнопки, которой нет в файле, - тусклая: нажмите её, и (на S3) её можно записать с родного пульта.
+enum PadKey { PK_POWER, PK_MUTE, PK_UP, PK_LEFT, PK_OK, PK_RIGHT, PK_DOWN, PK_BACK, PK_HOME, PK_VOLUP,
+              PK_MENU, PK_INPUT, PK_VOLDN, PK_CHDN, PK_CHUP, PK_MORE, PK_COUNT };
+struct PadBtn {
+  int16_t x, y, r;      // центр и радиус (у «таблеток» r - половина высоты)
+  bool pill;
+};
+const PadBtn PAD[PK_COUNT] = {
+    {26, 20, 15, false},  {214, 20, 15, false},                          // питание, без звука
+    {120, 50, 14, false}, {86, 84, 14, false},  {120, 84, 19, false},    // вверх, влево, OK
+    {154, 84, 14, false}, {120, 118, 14, false},                         // вправо, вниз
+    {58, 158, 16, false}, {120, 158, 16, false}, {182, 158, 16, false},  // назад, домой, громче
+    {58, 192, 16, false}, {120, 192, 16, false}, {182, 192, 16, false},  // меню, источник, тише
+    {58, 224, 11, true},  {120, 224, 11, true},  {182, 224, 11, true},   // канал -, канал +, ещё
+};
+const uint16_t PAD_BODY = 0x10A2, PAD_KEY = 0x31A6, PAD_KEY_OFF = 0x18E3, PAD_RING = 0x05FF, PAD_DPAD = 0x2124;
+
+// Имя кнопки -> клавиша пульта (английские имена из базы Flipper и русские из «Записать с пульта»).
+String padNorm(const String& in) {
+  String o;
+  for (size_t i = 0; i < in.length(); i++) {
+    uint8_t c = (uint8_t)in[i];
+    if (c == ' ' || c == '_') continue;
+    if (c == 0xD0 && i + 1 < in.length()) {          // кириллица: заглавные -> строчные
+      uint8_t d = (uint8_t)in[i + 1];
+      if (d >= 0x90 && d <= 0x9F) { o += (char)0xD0; o += (char)(d + 0x20); i++; continue; }
+      if (d >= 0xA0 && d <= 0xAF) { o += (char)0xD1; o += (char)(d - 0x20); i++; continue; }
+    }
+    o += (char)tolower(c);
+  }
+  return o;
+}
+int padKeyOf(const String& name) {
+  String n = padNorm(name);
+  auto any = [&](std::initializer_list<const char*> l) {
+    for (const char* x : l)
+      if (n == x) return true;
+    return false;
+  };
+  if (any({"power", "poweron", "poweroff", "питание", "вкл", "вкл/выкл", "onoff"})) return PK_POWER;
+  if (any({"mute", "беззвука", "звук"})) return PK_MUTE;
+  if (any({"up", "вверх"})) return PK_UP;
+  if (any({"down", "вниз"})) return PK_DOWN;
+  if (any({"left", "влево"})) return PK_LEFT;
+  if (any({"right", "вправо"})) return PK_RIGHT;
+  if (any({"ok", "enter", "select", "ок"})) return PK_OK;
+  if (any({"back", "return", "exit", "назад"})) return PK_BACK;
+  if (any({"home", "smart", "smarthub", "домой"})) return PK_HOME;
+  if (any({"volup", "vol+", "volume+", "volumeup", "громкость+", "громче"})) return PK_VOLUP;
+  if (any({"voldn", "voldown", "vol-", "volume-", "volumedown", "громкость-", "тише"})) return PK_VOLDN;
+  if (any({"menu", "settings", "меню", "настройки"})) return PK_MENU;
+  if (any({"input", "source", "источник", "tv/av", "av"})) return PK_INPUT;
+  if (any({"chnext", "ch+", "chup", "channelup", "channel+", "канал+"})) return PK_CHUP;
+  if (any({"chprev", "ch-", "chdown", "channeldown", "channel-", "канал-"})) return PK_CHDN;
+  return -1;
+}
+const char* padKeyName(int k) {
+  switch (k) {
+    case PK_POWER: return "Power";
+    case PK_MUTE: return L3("Без звука", "Mute", "静音");
+    case PK_UP: return L3("Вверх", "Up", "上");
+    case PK_DOWN: return L3("Вниз", "Down", "下");
+    case PK_LEFT: return L3("Влево", "Left", "左");
+    case PK_RIGHT: return L3("Вправо", "Right", "右");
+    case PK_OK: return "OK";
+    case PK_BACK: return L3("Назад", "Back", "返回");
+    case PK_HOME: return L3("Домой", "Home", "主页");
+    case PK_VOLUP: return L3("Громкость +", "Volume +", "音量+");
+    case PK_VOLDN: return L3("Громкость -", "Volume -", "音量-");
+    case PK_MENU: return L3("Меню", "Menu", "菜单");
+    case PK_INPUT: return L3("Источник", "Input", "信号源");
+    case PK_CHUP: return L3("Канал +", "Channel +", "频道+");
+    case PK_CHDN: return L3("Канал -", "Channel -", "频道-");
+  }
+  return "";
+}
+
+// Значок клавиши: линии и фигуры, без картинок.
+void padIcon(int k, int x, int y, uint16_t c) {
+  switch (k) {
+    case PK_POWER:
+      tft.drawCircle(x, y, 7, c);
+      tft.drawCircle(x, y, 6, c);
+      tft.fillRect(x - 3, y - 8, 7, 6, PAD_KEY);
+      tft.fillRect(x - 1, y - 9, 3, 9, c);
+      break;
+    case PK_MUTE:
+      tft.fillRect(x - 8, y - 3, 4, 7, c);
+      tft.fillTriangle(x - 5, y, x, y - 7, x, y + 7, c);
+      tft.drawLine(x + 3, y - 4, x + 9, y + 4, c);
+      tft.drawLine(x + 3, y + 4, x + 9, y - 4, c);
+      break;
+    case PK_UP: tft.fillTriangle(x, y - 6, x - 7, y + 4, x + 7, y + 4, c); break;
+    case PK_DOWN: tft.fillTriangle(x, y + 6, x - 7, y - 4, x + 7, y - 4, c); break;
+    case PK_LEFT: tft.fillTriangle(x - 6, y, x + 4, y - 7, x + 4, y + 7, c); break;
+    case PK_RIGHT: tft.fillTriangle(x + 6, y, x - 4, y - 7, x - 4, y + 7, c); break;
+    case PK_OK: {
+      SmallFont small;
+      drawUtf8("OK", x - textWidth("OK") / 2, y - 6, c, PAD_KEY);
+      break;
+    }
+    case PK_BACK:                                    // стрелка «назад» с загибом
+      tft.drawFastHLine(x - 6, y - 3, 10, c);
+      tft.drawFastHLine(x - 6, y - 2, 10, c);
+      tft.fillTriangle(x - 9, y - 3, x - 4, y - 8, x - 4, y + 2, c);
+      tft.drawFastVLine(x + 4, y - 3, 9, c);
+      tft.drawFastVLine(x + 5, y - 3, 9, c);
+      tft.drawFastHLine(x - 2, y + 5, 7, c);
+      tft.drawFastHLine(x - 2, y + 6, 7, c);
+      break;
+    case PK_HOME:
+      tft.fillTriangle(x, y - 9, x - 9, y, x + 9, y, c);
+      tft.fillRect(x - 6, y, 13, 8, c);
+      tft.fillRect(x - 2, y + 3, 5, 5, PAD_KEY);
+      break;
+    case PK_VOLUP:
+    case PK_CHUP:
+      tft.fillRect(x - 7, y - 1, 15, 3, c);
+      tft.fillRect(x - 1, y - 7, 3, 15, c);
+      break;
+    case PK_VOLDN:
+    case PK_CHDN:
+      tft.fillRect(x - 7, y - 1, 15, 3, c);
+      break;
+    case PK_MENU:                                    // шестерёнка
+      tft.fillCircle(x, y, 7, c);
+      for (int a = 0; a < 8; a++) {
+        float r = a * 0.785398f;
+        tft.fillCircle(x + (int)(9 * cosf(r)), y + (int)(9 * sinf(r)), 2, c);
+      }
+      tft.fillCircle(x, y, 3, PAD_KEY);
+      break;
+    case PK_INPUT:                                   // экран со стрелкой внутрь
+      tft.drawRect(x - 8, y - 7, 17, 13, c);
+      tft.fillTriangle(x + 3, y - 1, x - 2, y - 5, x - 2, y + 3, c);
+      tft.drawFastHLine(x - 6, y - 1, 5, c);
+      tft.drawFastHLine(x - 3, y + 8, 7, c);
+      break;
+  }
+}
+
+void padDrawBtn(int k, bool focus, bool have, bool pressed) {
+  const PadBtn& b = PAD[k];
+  uint16_t bg = pressed ? PAD_RING : PAD_KEY;
+  uint16_t fg = pressed ? C_BLACK : !have ? 0x52AA : k == PK_POWER ? 0xF9A6 : C_WHITE;
+  uint16_t around = (k >= PK_UP && k <= PK_DOWN) ? PAD_DPAD : PAD_BODY;
+  if (b.pill) {
+    int w = 54, h = b.r * 2;
+    tft.fillRoundRect(b.x - w / 2 - 3, b.y - b.r - 3, w + 6, h + 6, b.r + 3, around);
+    tft.fillRoundRect(b.x - w / 2, b.y - b.r, w, h, b.r, bg);
+    if (focus) {
+      tft.drawRoundRect(b.x - w / 2 - 2, b.y - b.r - 2, w + 4, h + 4, b.r + 2, PAD_RING);
+      tft.drawRoundRect(b.x - w / 2 - 3, b.y - b.r - 3, w + 6, h + 6, b.r + 3, PAD_RING);
+    }
+    const char* t = k == PK_MORE ? L3("Ещё", "More", "更多") : k == PK_CHUP ? "CH +" : "CH -";
+    SmallFont small;
+    drawUtf8(t, b.x - textWidth(t) / 2, b.y - 6, k == PK_MORE ? (pressed ? C_BLACK : C_WHITE) : fg, bg);
+    return;
+  }
+  tft.fillCircle(b.x, b.y, b.r + 3, around);
+  tft.fillCircle(b.x, b.y, b.r, bg);
+  if (focus) {
+    tft.drawCircle(b.x, b.y, b.r + 2, PAD_RING);
+    tft.drawCircle(b.x, b.y, b.r + 3, PAD_RING);
+  }
+  padIcon(k, b.x, b.y, fg);
+}
+
+void padDrawAll(const String& title, int focus, const bool* have) {
+  tft.fillScreen(C_BLACK);
+  tft.fillRoundRect(4, 2, 232, 238, 22, PAD_BODY);
+  tft.fillCircle(120, 84, 52, PAD_DPAD);             // круг крестовины
+  tft.drawCircle(120, 84, 52, 0x3186);
+  {
+    SmallFont small;
+    String t = title;
+    while (t.length() > 3 && textWidth(t.c_str()) > 140) t.remove(t.length() - 1);
+    drawUtf8(t.c_str(), 120 - textWidth(t.c_str()) / 2, 13, C_LIGHT, PAD_BODY);
+  }
+  for (int k = 0; k < PK_COUNT; k++) padDrawBtn(k, k == focus, have[k], false);
+}
+
+// Куда перейти рамке: ближайшая кнопка в сторону нажатия.
+int padMove(int from, uint8_t dir) {
+  int best = from;
+  long bestScore = 1L << 30;
+  for (int k = 0; k < PK_COUNT; k++) {
+    if (k == from) continue;
+    int dx = PAD[k].x - PAD[from].x, dy = PAD[k].y - PAD[from].y;
+    int along = dir == J_UP ? -dy : dir == J_DOWN ? dy : dir == J_LEFT ? -dx : dx;
+    int across = (dir == J_UP || dir == J_DOWN) ? abs(dx) : abs(dy);
+    if (along <= 4) continue;
+    long sc = (long)along + 2L * across;
+    if (sc < bestScore) {
+      bestScore = sc;
+      best = k;
+    }
+  }
+  return best;
+}
+
+// Записать одну кнопку прямо с экрана пульта (S3 + ИК-приёмник). true - записана.
+bool padLearn(int slot, int key) {
+#if BOARD_S3
+  std::vector<String> yn = splitBar(L3("Записать с родного пульта|Отмена", "Record from the original remote|Cancel", "从原遥控器录制|取消"));
+  if (choiceScreen(String(L3("Кнопки «", "There is no \"", "没有“")) + padKeyName(key) +
+                       L3("» нет в этом пульте.", "\" button in this remote.", "”键。"),
+                   yn) != 0)
+    return false;
+  for (;;) {
+    showMsg(String(L3("Направьте родной пульт на ИК-приёмник (вывод ", "Point the original remote at the IR receiver (pin ", "将原遥控器对准接收器（")) +
+                String(irRxPin()) + L3(") и нажмите на нём «", ") and press \"", "）并按“") + padKeyName(key) +
+                L3("».\n\nОтмена - кнопка гаджета.", "\".\n\nCancel - the device button.", "”。\n\n按本机按键取消。"),
+            C_WHITE);
+    std::vector<uint32_t> d;
+    int r = irCapture(d);
+    if (r == 0) return false;
+    if (r < 0) {
+      showMsg(L3("Сигнал слишком короткий - ещё раз, поближе.", "Signal too short - again, closer.", "信号太短，再试一次。"), C_YELLOW);
+      delay(1500);
+      continue;
+    }
+    if (!irAppendRaw(slot, false, padKeyName(key), d)) {
+      showMsg(L3("Не удалось сохранить: нет места.", "Could not save: no room.", "保存失败。"), C_RED);
+      delay(1500);
+      return false;
+    }
+    beep(1, 2400, 15);
+    return true;
+  }
+#else
+  showMsg(String(L3("Кнопки «", "There is no \"", "没有“")) + padKeyName(key) +
+              L3("» нет в этом пульте. Записать её с родного пульта можно на гаджете с ESP32-S3.",
+                 "\" button in this remote. Recording from the original remote needs an ESP32-S3 device.", "”键。录制需要S3。"),
+          C_YELLOW);
+  delay(2200);
+  return false;
+#endif
+}
+
+void runRemotePad(int slot) {
+  String title = irTitle(slot);
+  int focus = PK_OK;
+  for (;;) {
+    std::vector<String> names;
+    std::vector<uint32_t> offs;
+    irLoadButtons(slot, names, offs);
+    if (!LittleFS.exists(irPath(slot).c_str())) return;   // пульт удалили из «Ещё»
+    int idx[PK_COUNT];
+    bool have[PK_COUNT];
+    for (int k = 0; k < PK_COUNT; k++) {
+      idx[k] = -1;
+      have[k] = k == PK_MORE;
+    }
+    for (size_t i = 0; i < names.size(); i++) {
+      int k = padKeyOf(names[i]);
+      if (k >= 0 && idx[k] < 0) {
+        idx[k] = (int)i;
+        have[k] = true;
+      }
+    }
+    padDrawAll(title, focus, have);
+    bool reload = false;
+    while (!reload) {
+      uint8_t d = joyEvent();
+      if (d != J_NONE) {
+        int nf = padMove(focus, d);
+        if (nf != focus) {
+          padDrawBtn(focus, false, have[focus], false);
+          focus = nf;
+          padDrawBtn(focus, true, have[focus], false);
+          beep(2, 1800, 4);
+        }
+      }
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) return;
+      if (e == EV_CLICK) {
+        if (focus == PK_MORE) {
+          runRemoteButtons(slot);
+          reload = true;
+          break;
+        }
+        if (!have[focus]) {
+          padLearn(slot, focus);
+          reload = true;
+          break;
+        }
+        padDrawBtn(focus, true, true, true);         // кнопка «нажата»
+        ir::Signal s;
+        bool ok = irLoadSignal(slot, offs[(size_t)idx[focus]], s) && irSend(s);
+        vibe(25);
+        delay(90);
+        padDrawBtn(focus, true, true, false);
+        if (!ok) {
+          showMsg(String(L3("Этот вид сигнала пока не поддерживается: ", "This kind of signal is not supported yet: ", "暂不支持这种信号：")) + fromStd(s.protocol), C_RED);
+          delay(1800);
+          reload = true;
+        }
+      }
+      delay(10);
+    }
+  }
+}
+
 void runRemote() {
   if (!ENABLE_IR) {
     notInEdition();
@@ -8008,7 +8321,7 @@ void runRemote() {
     }
 #endif
     if (sel >= 0 && sel < n) {
-      runRemoteButtons(slots[(size_t)sel]);
+      runRemotePad(slots[(size_t)sel]);
     } else if (sel == n) {
       if (runRemoteDownload()) sel = irCount() - 1;
     } else if (sel == n + 1) {
