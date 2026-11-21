@@ -130,6 +130,11 @@ inline void media(uint16_t) {}
 #ifndef ENABLE_FWBACKUP
 #define ENABLE_FWBACKUP (!(ENABLE_BLE && !BOARD_S3))
 #define ENABLE_MIRVIEW (BOARD_S3 || !ENABLE_BLE)     // смотреть экран другого гаджета (транслировать - только S3)
+#define ENABLE_FTX ENABLE_MIRVIEW                    // передача пультов между гаджетами
+#if ENABLE_FTX
+void ftxSendRemote(int slot);
+void ftxReceiveRemote();
+#endif
 #define ENABLE_JOYCAL (!(ENABLE_BLE && !BOARD_S3))    // калибровка джойстика (в C3 с Bluetooth нет места)  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
 #endif
 #ifndef ENABLE_PCSCREEN
@@ -1321,6 +1326,28 @@ I2SClass audioI2s;
 volatile int audFreq = 0;
 volatile int audVol = 6000;                          // громкость (амплитуда, до 32767)
 bool audOk = false;
+volatile bool audPcm = false, audPcmAck = false;     // усилитель отдан под поток звука (радио, речь, рация)
+int cfgMusicVol = 6;                                 // громкость музыки и речи 0..10
+bool cfgSpeakBoot = false;                           // озвучка ответов (читается при запуске)
+
+// Отдать усилитель под поток звука: частота rate, 16 или 32 бита, с микрофоном (рация) или без.
+bool audPcmBegin(uint32_t rate, bool bits32, bool withMic) {
+  if (!audOk) return false;
+  audPcm = true;
+  for (int i = 0; i < 50 && !audPcmAck; i++) delay(2);   // ждём, пока задача сигналов отпустит I2S
+  audioI2s.end();
+  audioI2s.setPins(I2S_BCLK, I2S_WS, I2S_DOUT, withMic ? I2S_DIN : -1);
+  return audioI2s.begin(I2S_MODE_STD, rate, bits32 ? I2S_DATA_BIT_WIDTH_32BIT : I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+}
+void audPcmEnd() {
+  if (!audOk || !audPcm) return;
+  audioI2s.end();
+  audioI2s.setPins(I2S_BCLK, I2S_WS, I2S_DOUT);
+  audioI2s.begin(I2S_MODE_STD, AUD_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+  audPcm = false;
+}
+// Множитель громкости музыки (0..32768): квадрат - на слух ровнее.
+int audGain() { return cfgMusicVol <= 0 ? 0 : cfgMusicVol * cfgMusicVol * 32768 / 100; }
 
 void audioTask(void*) {
   static int16_t SINE[64];
@@ -1329,6 +1356,12 @@ void audioTask(void*) {
   uint32_t phase = 0;
   int amp = 0;                                       // текущая амплитуда - плавно идёт к нужной
   for (;;) {
+    if (audPcm) {                                    // музыка, речь или рация - усилитель занят ими
+      audPcmAck = true;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    audPcmAck = false;
     int f = audFreq;
     int target = f > 0 ? audVol : 0;
     uint32_t step = f > 0 ? (uint32_t)((uint64_t)f * 4294967296ULL / AUD_RATE) : 0;
@@ -1368,6 +1401,8 @@ void soundInit() {
     audioInit();
     prefs.begin("dsk", true);
     cfgIrRx = prefs.getUChar("irrx", 44);
+    cfgMusicVol = prefs.getUChar("mvol", 6);
+    cfgSpeakBoot = prefs.getUChar("speak", 0) != 0;
     prefs.end();
   }
 #endif
@@ -7661,8 +7696,17 @@ void runRemoteButtons(int slot) {
   for (;;) {
     std::vector<String> items = names;
     items.push_back(L3("Удалить пульт", "Delete the remote", "删除遥控器"));
+#if ENABLE_FTX
+    items.push_back(L3("Отправить на другой гаджет", "Send to another device", "发送到其他设备"));
+#endif
     items.push_back(T().menuBack);
     sel = listScreen(title.c_str(), items, std::vector<String>(), sel);
+#if ENABLE_FTX
+    if (sel == n + 1) {
+      ftxSendRemote(slot);
+      continue;
+    }
+#endif
     if (sel >= 0 && sel < n) {
       ir::Signal s;
       bool ok = irLoadSignal(slot, offs[(size_t)sel], s) && irSend(s);
@@ -8384,11 +8428,20 @@ void runRemote() {
 #if BOARD_S3
     items.push_back(L3("+ Записать с пульта", "+ Record from a remote", "+ 从遥控器录制"));
 #endif
+#if ENABLE_FTX
+    items.push_back(L3("+ Принять с другого гаджета", "+ Receive from another device", "+ 从其他设备接收"));
+#endif
     items.push_back(T().menuBack);
     sel = listScreen(L3("Пульт", "Remote", "遥控器"), items, std::vector<String>(), sel);
 #if BOARD_S3
     if (sel == n + 2) {
       runRemoteLearn();
+      continue;
+    }
+#endif
+#if ENABLE_FTX
+    if (sel == n + 2 + (BOARD_S3 ? 1 : 0)) {
+      ftxReceiveRemote();
       continue;
     }
 #endif
@@ -8411,14 +8464,340 @@ void runRemote() {
   }
 }
 
+#if BOARD_S3
+// ========================= ПОТОКОВЫЙ ЗВУК: РАДИО И РЕЧЬ =========================
+// MP3 из интернета (радио, синтез речи) декодируется minimp3 и идёт на усилитель MAX98357A.
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_NO_SIMD
+#define MINIMP3_ONLY_MP3
+#include "minimp3.h"
+
+namespace snd {
+std::vector<String> urls;                            // что играть по очереди (у радио - одна ссылка)
+volatile bool run = false, stopReq = false;
+volatile int state = 0;                              // 0 - тихо, 1 - соединение, 2 - буфер, 3 - играет, -1 - ошибка
+volatile int errCode = 0;
+volatile uint32_t hz = 0, kbps = 0;
+volatile bool endless = false;                       // радио: при обрыве переподключаться
+TaskHandle_t task = nullptr;
+mp3dec_t dec;
+}  // namespace snd
+
+// Один поток: соединиться, набрать буфер, декодировать до конца или до остановки. false - ошибка соединения.
+bool sndPlayUrl(const String& url) {
+  const int IN_SZ = 16384;
+  static uint8_t* in = nullptr;
+  if (!in) in = (uint8_t*)malloc(IN_SZ);
+  if (!in) return false;
+  static int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+  snd::state = 1;
+  bool https = url.startsWith("https");
+  WiFiClient plain;
+  WiFiClientSecure sec;
+  if (https) {
+    sec.setInsecure();
+    sec.setHandshakeTimeout(12);
+  }
+  HTTPClient http;
+  http.setUserAgent(APP_UA);
+  http.setConnectTimeout(10000);
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!(https ? http.begin(sec, url) : http.begin(plain, url))) {
+    snd::errCode = -100;
+    return false;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    snd::errCode = code;
+    http.end();
+    return false;
+  }
+  int left = http.getSize();                         // -1 у радио (поток без конца)
+  WiFiClient* st = http.getStreamPtr();
+  mp3dec_init(&snd::dec);
+  int have = 0, curHz = 0;
+  bool started = false;
+  uint32_t lastData = millis();
+  const int PRE = snd::endless ? 12000 : 3000;       // сколько набрать до начала
+  snd::state = 2;
+  while (!snd::stopReq) {
+    // дочитать из сети, сколько есть
+    int av = st->available();
+    if (av > 0 && have < IN_SZ) {
+      int n = st->read(in + have, min(av, IN_SZ - have));
+      if (n > 0) {
+        have += n;
+        if (left > 0) left -= n;
+        lastData = millis();
+      }
+    }
+    bool ended = (left == 0) || (!st->connected() && st->available() == 0);
+    if (!started) {
+      if (have < PRE && !ended && millis() - lastData < 8000) {
+        delay(5);
+        continue;
+      }
+      started = true;
+      snd::state = 3;
+    }
+    if (have < 1500 && !ended) {                     // мало данных - подождать сеть
+      if (millis() - lastData > 8000) break;         // сеть пропала
+      delay(3);
+      continue;
+    }
+    mp3dec_frame_info_t info;
+    int samples = mp3dec_decode_frame(&snd::dec, in, have, pcm, &info);
+    if (info.frame_bytes == 0) {                     // нет целого кадра
+      if (ended) break;
+      if (have >= IN_SZ) have = 0;                   // мусор - сбросить
+      delay(2);
+      continue;
+    }
+    memmove(in, in + info.frame_bytes, (size_t)(have - info.frame_bytes));
+    have -= info.frame_bytes;
+    if (samples <= 0) continue;
+    snd::kbps = (uint32_t)info.bitrate_kbps;
+    if (info.hz != curHz) {
+      curHz = info.hz;
+      snd::hz = (uint32_t)curHz;
+      if (!audPcmBegin((uint32_t)curHz, false, false)) break;
+    }
+    int g = audGain();
+    if (info.channels == 2) {                        // стерео -> моно
+      for (int i = 0; i < samples; i++) pcm[i] = (int16_t)(((int32_t)pcm[2 * i] + pcm[2 * i + 1]) / 2 * g >> 15);
+    } else {
+      for (int i = 0; i < samples; i++) pcm[i] = (int16_t)((int32_t)pcm[i] * g >> 15);
+    }
+    audioI2s.write((uint8_t*)pcm, (size_t)samples * 2);   // ждёт места в буфере - задаёт темп
+  }
+  http.end();
+  return true;
+}
+
+void sndTask(void*) {
+  for (;;) {
+    if (!snd::run) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    snd::errCode = 0;
+    bool anyOk = false;
+    do {
+      for (size_t i = 0; i < snd::urls.size() && !snd::stopReq; i++) {
+        bool ok = sndPlayUrl(snd::urls[i]);
+        anyOk = anyOk || ok;
+        if (!ok && snd::endless) vTaskDelay(pdMS_TO_TICKS(2000));   // радио: подождать и снова
+      }
+    } while (snd::endless && !snd::stopReq);
+    audPcmEnd();
+    snd::state = (!anyOk && !snd::stopReq) ? -1 : 0;
+    snd::run = false;
+  }
+}
+
+// Начать играть список ссылок (в фоне). endless - радио: переподключаться без конца.
+void sndStart(const std::vector<String>& urls, bool endless) {
+  if (!snd::task) xTaskCreatePinnedToCore(sndTask, "mp3", 28 * 1024, nullptr, 2, &snd::task, 1);
+  if (snd::run) {
+    snd::stopReq = true;
+    for (int i = 0; i < 300 && snd::run; i++) delay(10);
+  }
+  snd::urls = urls;
+  snd::endless = endless;
+  snd::stopReq = false;
+  snd::state = 1;
+  snd::run = true;
+}
+void sndStop() {
+  if (!snd::run) return;
+  snd::stopReq = true;
+  for (int i = 0; i < 300 && snd::run; i++) delay(10);
+}
+
+// ---------- Речь: текст -> голос (онлайн-синтез, MP3) ----------
+// Текст режется на куски до ~180 байт по концу предложения или пробелу.
+#define cfgSpeak cfgSpeakBoot                        // озвучивать ответы DeepSeek
+
+String speakClean(const String& in) {                // убрать разметку: *, #, `, $, \, |
+  String o;
+  o.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '*' || c == '#' || c == '`' || c == '$' || c == '\\' || c == '|' || c == '_') continue;
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    o += c;
+  }
+  return o;
+}
+
+void speakText(const String& text, const char* lang) {
+  String t = speakClean(text);
+  std::vector<String> urls;
+  int pos = 0, n = (int)t.length();
+  while (pos < n && urls.size() < 40) {
+    while (pos < n && t[pos] == ' ') pos++;
+    int end = min(n, pos + 180);
+    if (end < n) {                                   // резать по концу предложения, иначе по пробелу
+      int cut = -1;
+      for (int i = end - 1; i > pos + 40; i--)
+        if (t[i] == '.' || t[i] == '!' || t[i] == '?' || t[i] == ';' || t[i] == ':') { cut = i + 1; break; }
+      if (cut < 0)
+        for (int i = end - 1; i > pos + 20; i--)
+          if (t[i] == ' ') { cut = i; break; }
+      if (cut < 0) {
+        cut = end;
+        while (cut > pos && ((uint8_t)t[cut] & 0xC0) == 0x80) cut--;   // не резать букву UTF-8 пополам
+      }
+      end = cut;
+    }
+    String part = t.substring(pos, end);
+    part.trim();
+    pos = end;
+    if (!part.length()) continue;
+    urls.push_back(String("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=") + lang + "&q=" +
+                   fromStd(tools::urlEncode(toStd(part))));
+  }
+  if (!urls.empty()) sndStart(urls, false);
+}
+
+const char* speakLang() { return cfgLang == 1 ? "en" : cfgLang == 2 ? "zh-CN" : "ru"; }
+
+void runWalkie();
+// ---------- Радио ----------
+struct Station {
+  const char* name;
+  const char* url;
+};
+const Station STATIONS[] = {
+    {"Европа Плюс", "http://ep128.hostingradio.ru:8030/ep128"},
+    {"Русское радио", "https://rusradio.hostingradio.ru/rusradio128.mp3"},
+    {"Наше радио: Классик рок", "http://nashe1.hostingradio.ru:18000/nasheclassic.mp3"},
+    {"Rock FM 90-е", "http://jfm1.hostingradio.ru:14536/rock90.mp3"},
+    {"Rock FM 00-е", "http://jfm1.hostingradio.ru:14536/rock00.mp3"},
+    {"Радио Шансон", "http://chanson.hostingradio.ru:8041/chanson256.mp3"},
+    {"Говорит Москва", "http://video.govoritmoskva.ru:8000/rufm.mp3"},
+    {"Jazz FM: Instrumental", "http://jfm1.hostingradio.ru:14536/ijstream.mp3"},
+    {"Dance Wave!", "http://dancewave.online/dance.mp3"},
+    {"Dance Wave Retro", "http://retro.dancewave.online/retrodance.mp3"},
+    {"Классное радио", "http://schoolradio.hostingradio.ru:8026/schoolradio128.mp3"},
+    {"Зайцев FM: K-Pop", "https://zaycevfm.cdnvideo.ru/ZaycevFM_kpop_128.mp3"},
+};
+const int N_STATIONS = sizeof(STATIONS) / sizeof(STATIONS[0]);
+
+void radioDraw(const String& name, bool full) {
+  if (full) {
+    tft.fillScreen(C_BLACK);
+    tft.fillRect(0, 0, 240, 26, C_BAR);
+    SmallFont small;
+    drawUtf8(L3("Радио", "Radio", "电台"), 8, 6, C_WHITE, C_BAR);
+    tft.fillRoundRect(20, 40, 200, 96, 14, 0x1926);
+    for (int i = 0; i < 5; i++) tft.drawCircle(120, 88, 14 + i * 8, 0x2B3E);   // «волны» эфира
+    tft.fillCircle(120, 88, 9, C_ACCENT);
+  }
+  SmallFont small;
+  tft.fillRect(0, 140, 240, 100, C_BLACK);
+  String t = name;
+  while (t.length() > 3 && textWidth(t.c_str()) > 228) t.remove(t.length() - 1);
+  drawUtf8(t.c_str(), 120 - textWidth(t.c_str()) / 2, 144, C_WHITE, C_BLACK);
+  const char* st = snd::state == 1   ? L3("соединение...", "connecting...", "连接中...")
+                   : snd::state == 2 ? L3("загрузка...", "buffering...", "缓冲中...")
+                   : snd::state == 3 ? L3("в эфире", "on air", "播放中")
+                   : snd::state < 0  ? L3("не удалось подключиться", "could not connect", "无法连接")
+                                     : L3("остановлено", "stopped", "已停止");
+  char b[48];
+  if (snd::state == 3) snprintf(b, sizeof(b), "%s · %u kbps", st, (unsigned)snd::kbps);
+  else snprintf(b, sizeof(b), "%s", st);
+  drawUtf8(b, 120 - textWidth(b) / 2, 166, snd::state == 3 ? C_GREEN : snd::state < 0 ? C_RED : C_YELLOW, C_BLACK);
+  // громкость
+  tft.drawRoundRect(30, 192, 180, 12, 6, C_GRAY);
+  tft.fillRoundRect(32, 194, cfgMusicVol * 176 / 10, 8, 4, C_ACCENT);
+  drawUtf8(L3("влево/вправо - станция, вверх/вниз - звук", "left/right - station, up/down - volume", "左右换台，上下音量"), 4, 212, C_LIGHT, C_BLACK);
+  drawUtf8(L3("нажатие - пауза, удержание - выход", "press - pause, hold - exit", "按下暂停，长按退出"), 4, 226, C_LIGHT, C_BLACK);
+}
+
+void saveMusicVol() {
+  prefs.begin("dsk", false);
+  prefs.putUChar("mvol", (uint8_t)cfgMusicVol);
+  prefs.end();
+}
+
+void runRadio() {
+  if (!waitWifi(false)) return;
+  prefs.begin("dsk", true);
+  int idx = prefs.getUChar("radio", 0);
+  cfgMusicVol = prefs.getUChar("mvol", 6);
+  prefs.end();
+  if (idx >= N_STATIONS) idx = 0;
+  // выбор станции списком
+  {
+    std::vector<String> items;
+    for (int i = 0; i < N_STATIONS; i++) items.push_back(STATIONS[i].name);
+    items.push_back(T().menuBack);
+    int sel = listScreen(L3("Радио", "Radio", "电台"), items, std::vector<String>(), idx);
+    if (sel < 0 || sel >= N_STATIONS) return;
+    idx = sel;
+  }
+  auto tune = [&](int i) {
+    idx = (i + N_STATIONS) % N_STATIONS;
+    prefs.begin("dsk", false);
+    prefs.putUChar("radio", (uint8_t)idx);
+    prefs.end();
+    std::vector<String> u;
+    u.push_back(STATIONS[idx].url);
+    sndStart(u, true);
+  };
+  tune(idx);
+  radioDraw(STATIONS[idx].name, true);
+  int shownState = -9;
+  uint32_t shownKbps = 0;
+  bool paused = false;
+  for (;;) {
+    uint8_t d = joyEvent();
+    if (d == J_LEFT || d == J_RIGHT) {
+      tune(idx + (d == J_RIGHT ? 1 : -1));
+      paused = false;
+      radioDraw(STATIONS[idx].name, false);
+    } else if (d == J_UP || d == J_DOWN) {
+      cfgMusicVol = constrain(cfgMusicVol + (d == J_UP ? 1 : -1), 0, 10);
+      saveMusicVol();
+      radioDraw(STATIONS[idx].name, false);
+    }
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) break;
+    if (e == EV_CLICK) {
+      if (paused) tune(idx);
+      else sndStop();
+      paused = !paused;
+      radioDraw(STATIONS[idx].name, false);
+    }
+    if (snd::state != shownState || snd::kbps != shownKbps) {
+      shownState = snd::state;
+      shownKbps = snd::kbps;
+      radioDraw(STATIONS[idx].name, false);
+    }
+    delay(20);
+  }
+  sndStop();
+}
+#endif
+
 void runTools() {
   int sel = 0;
   for (;;) {
     std::vector<String> items = splitBar(L3("Калькулятор|Википедия|Картинки|Галерея|Погода|Курсы валют|Часы|Таймер|Секундомер|Пульт|Назад",
                                             "Calculator|Wikipedia|Images|Gallery|Weather|Exchange rates|Clock|Timer|Stopwatch|Remote|Back",
                                             "计算器|维基百科|图片|相册|天气|汇率|时钟|计时器|秒表|遥控器|返回"));
+#if BOARD_S3
+    items.insert(items.end() - 1, String(L3("Радио", "Radio", "电台")));
+    items.insert(items.end() - 1, String(L3("Рация", "Walkie-talkie", "对讲机")));
+#endif
     sel = listScreen(L3("Инструменты", "Tools", "工具"), items, std::vector<String>(), sel);
     switch (sel) {
+#if BOARD_S3
+      case 10: runRadio(); break;
+      case 11: runWalkie(); break;
+#endif
       case 0: runCalc(); break;
       case 1: runWiki(); break;
       case 2: runImages(); break;
@@ -10007,6 +10386,9 @@ bool runSettings() {
 #if ENABLE_MIRVIEW
     items.insert(items.end() - 1, String(L3("Трансляция экрана", "Screen sharing", "屏幕共享")));
 #endif
+#if BOARD_S3
+    items.insert(items.end() - 1, String(L3("Озвучка ответов", "Read answers aloud", "朗读回答")));
+#endif
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -10034,6 +10416,9 @@ bool runSettings() {
     right[18] = mir::on ? L3("идёт", "on", "开") : cfgMirBoot ? L3("при запуске", "on boot", "开机") : L3("выкл", "off", "关");
 #elif ENABLE_MIRVIEW
     right[18] = L3("смотреть", "view", "查看");
+#endif
+#if BOARD_S3
+    right[19] = cfgSpeakBoot ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
 #endif
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
     switch (sel) {
@@ -10192,6 +10577,15 @@ bool runSettings() {
 #if ENABLE_MIRVIEW
       case 18:
         runMirrorSettings();
+        break;
+#endif
+#if BOARD_S3
+      case 19:
+        cfgSpeakBoot = !cfgSpeakBoot;
+        prefs.begin("dsk", false);
+        prefs.putUChar("speak", cfgSpeakBoot ? 1 : 0);
+        prefs.end();
+        if (cfgSpeakBoot) speakText(L3("Озвучка включена.", "Reading aloud is on.", "朗读已开启。"), speakLang());
         break;
 #endif
       case 13:                                     // повернуть на 90° (экран квадратный - всё помещается)
@@ -11488,9 +11882,48 @@ QueueHandle_t rowQ = nullptr;                         // B: принятые с�
 volatile uint32_t rxMs = 0;
 }  // namespace mir
 
+#if BOARD_S3
+namespace wt {                                         // рация
+QueueHandle_t q = nullptr;
+volatile bool on = false;
+volatile uint32_t rxMs = 0;
+}  // namespace wt
+#endif
+namespace ftx {                                        // передача файлов пультов
+QueueHandle_t q = nullptr;                             // пакеты O/K/D/k/E и MAC отправителя
+volatile bool on = false;
+}  // namespace ftx
+struct FtxPkt {
+  uint8_t mac[6];
+  uint8_t len;
+  uint8_t d[250];
+};
+
 void mirRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len < 2 || !info) return;
   char t = (char)data[1];
+#if BOARD_S3
+  if (t == 'A') {                                    // голос рации
+    if (wt::on && wt::q && len >= 4) {
+      uint8_t buf[250];
+      memset(buf, 0, sizeof(buf));
+      memcpy(buf, data, (size_t)len);
+      xQueueSend(wt::q, buf, 0);
+      wt::rxMs = millis();
+    }
+    return;
+  }
+#endif
+  if (t == 'O' || t == 'K' || t == 'D' || t == 'k' || t == 'E') {   // передача файла
+    if (ftx::on && ftx::q) {
+      FtxPkt p;
+      memcpy(p.mac, info->src_addr, 6);
+      p.len = (uint8_t)len;
+      memcpy(p.d, data, (size_t)len);
+      xQueueSend(ftx::q, &p, 0);
+    }
+    return;
+  }
 #if BOARD_S3
   if (mir::on) {                                     // мы - транслирующий гаджет
     if (t == 'J') {
@@ -11810,6 +12243,335 @@ void runMirrorSettings() {
     }
   }
 }
+
+// Прямая связь «гаджет - гаджет» без роутера: Wi-Fi отключаем, все на канале 1.
+void p2pBegin() {
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_STA);
+  mirNowEnsure();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+}
+void p2pEnd() {
+  if (mirNowUp && !enow::on
+#if BOARD_S3
+      && !mir::on
+#endif
+  ) {
+    esp_now_deinit();
+    mirNowUp = false;
+  }
+  WiFi.setAutoReconnect(true);
+  wifiStarted = false;                               // фоновый Wi-Fi подключится заново
+}
+
+#if BOARD_S3
+// ---------- Рация: держишь кнопку - говоришь, отпустил - слушаешь. Все гаджеты рядом в одном «канале». ----------
+// Звук 16 кГц, сжатие mu-law (1 байт на отсчёт), 240 отсчётов (15 мс) в пакете.
+uint8_t muEnc(int16_t x) {
+  const int BIAS = 0x84, CLIP = 32635;
+  int sign = (x >> 8) & 0x80;
+  int v = sign ? -x : x;
+  if (v > CLIP) v = CLIP;
+  v += BIAS;
+  int exp = 7;
+  for (int m = 0x4000; (v & m) == 0 && exp > 0; m >>= 1) exp--;
+  int man = (v >> (exp + 3)) & 0x0F;
+  return (uint8_t)~(sign | (exp << 4) | man);
+}
+int16_t muDec(uint8_t u) {
+  u = (uint8_t)~u;
+  int sign = u & 0x80, exp = (u >> 4) & 7, man = u & 0x0F;
+  int v = ((man << 3) + 0x84) << exp;
+  v -= 0x84;
+  return (int16_t)(sign ? -v : v);
+}
+
+void walkieDraw(int mode, int level) {               // mode: 0 - тишина, 1 - говорю, 2 - слышу
+  static int shownMode = -1;
+  if (mode != shownMode) {
+    shownMode = mode;
+    uint16_t c = mode == 1 ? C_RED : mode == 2 ? C_GREEN : C_ACCENT;
+    tft.fillRoundRect(40, 40, 160, 120, 20, 0x1926);
+    tft.fillRoundRect(98, 58, 44, 64, 20, c);        // микрофон
+    tft.drawFastVLine(120, 122, 16, c);
+    tft.drawFastHLine(104, 138, 33, c);
+    SmallFont small;
+    tft.fillRect(0, 166, 240, 20, C_BLACK);
+    const char* t = mode == 1 ? L3("Передача...", "Talking...", "发送中...")
+                    : mode == 2 ? L3("Приём", "Receiving", "接收中")
+                                : L3("Тишина в эфире", "Channel is quiet", "频道安静");
+    drawUtf8(t, 120 - textWidth(t) / 2, 168, C_WHITE, C_BLACK);
+  }
+  int w = constrain(level, 0, 180);
+  tft.fillRect(30, 190, 180, 8, C_BLACK);
+  tft.fillRect(30, 190, w, 8, mode == 1 ? C_RED : C_GREEN);
+}
+
+void runWalkie() {
+  if (!audOk) {
+    viewAnswer(L3("Нет усилителя звука (I2S).", "No I2S amplifier.", "没有I2S功放。"), C_RED);
+    return;
+  }
+  sndStop();
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, 240, 26, C_BAR);
+  {
+    SmallFont small;
+    drawUtf8(L3("Рация", "Walkie-talkie", "对讲机"), 8, 6, C_WHITE, C_BAR);
+    drawUtf8(L3("Держать кнопку - говорить", "Hold the button to talk", "按住说话"), 4, 206, C_LIGHT, C_BLACK);
+    drawUtf8(L3("Ручка влево - выход", "Stick left - exit", "向左退出"), 4, 222, C_LIGHT, C_BLACK);
+  }
+  p2pBegin();
+  wt::q = xQueueCreate(24, 250);
+  wt::on = true;
+  if (!audPcmBegin(16000, true, true)) {
+    wt::on = false;
+    vQueueDelete(wt::q);
+    wt::q = nullptr;
+    p2pEnd();
+    viewAnswer(L3("Не удалось включить микрофон.", "Could not start the microphone.", "无法启动麦克风。"), C_RED);
+    return;
+  }
+  static int32_t io[240];
+  uint8_t pk[250];
+  uint8_t seq = 0;
+  int32_t dc = 0;
+  int mode = 0;
+  walkieDraw(0, 0);
+  uint32_t lastDraw = 0;
+  for (;;) {
+    if (joyRawDir() == J_LEFT) break;
+    bool talk = digitalRead(PIN_SW) == LOW;
+    int level = 0;
+    if (talk) {
+      size_t got = audioI2s.readBytes((char*)io, sizeof(io));
+      int n = (int)(got / 4);
+      pk[0] = 0xA5;
+      pk[1] = 'A';
+      pk[2] = seq++;
+      pk[3] = 0;
+      int peak = 0;
+      for (int i = 0; i < n; i++) {
+        int32_t x = io[i] >> 13;                      // 24 бита микрофона -> ~16 бит с усилением
+        dc += (x - dc) >> 9;                         // убрать постоянную составляющую
+        x -= dc;
+        if (x > 32767) x = 32767;
+        if (x < -32768) x = -32768;
+        if (abs(x) > peak) peak = abs(x);
+        pk[4 + i] = muEnc((int16_t)x);
+      }
+      if (n > 0) esp_now_send(enow::BCAST, pk, (size_t)(4 + n));
+      for (int i = 0; i < 240; i++) io[i] = 0;       // в динамик - тишина, чтобы не свистело
+      audioI2s.write((uint8_t*)io, sizeof(io));
+      level = peak / 180;
+      mode = 1;
+    } else {
+      int g = audGain();
+      if (xQueueReceive(wt::q, pk, 0) == pdTRUE) {
+        int peak = 0;
+        for (int i = 0; i < 240; i++) {
+          int32_t v = (int32_t)muDec(pk[4 + i]) * g >> 15;
+          if (abs(v) > peak) peak = abs(v);
+          io[i] = v << 16;
+        }
+        audioI2s.write((uint8_t*)io, sizeof(io));
+        level = peak / 180;
+        mode = 2;
+      } else {
+        for (int i = 0; i < 240; i++) io[i] = 0;
+        audioI2s.write((uint8_t*)io, sizeof(io));
+        if (millis() - wt::rxMs > 300) mode = 0;
+      }
+    }
+    if (millis() - lastDraw > 60) {
+      lastDraw = millis();
+      walkieDraw(mode, level);
+    }
+  }
+  wt::on = false;
+  audPcmEnd();
+  vQueueDelete(wt::q);
+  wt::q = nullptr;
+  p2pEnd();
+  while (btnEvent() != EV_NONE) delay(5);
+}
+#endif
+
+#if ENABLE_FTX
+// ---------- Передать пульт на гаджет рядом (ESP-NOW, без интернета) ----------
+// O - предложение (имя, размер), K - согласие, D - кусок (номер, данные), k - подтверждение куска, E - конец.
+FtxPkt ftxIn;                                        // последний принятый пакет
+bool ftxCancel = false;                              // держали кнопку - отмена
+bool ftxWait(char type, uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    if (xQueueReceive(ftx::q, &ftxIn, pdMS_TO_TICKS(20)) == pdTRUE && ftxIn.d[1] == (uint8_t)type) return true;
+    if (btnEvent() == EV_LONG) {
+      ftxCancel = true;
+      return false;
+    }
+  }
+  return false;
+}
+
+void ftxBegin() {
+  ftxCancel = false;
+  p2pBegin();
+  ftx::q = xQueueCreate(12, sizeof(FtxPkt));
+  ftx::on = true;
+}
+void ftxEnd() {
+  ftx::on = false;
+  if (ftx::q) {
+    vQueueDelete(ftx::q);
+    ftx::q = nullptr;
+  }
+  p2pEnd();
+}
+
+void ftxSendRemote(int slot) {
+  File f = LittleFS.open(irPath(slot).c_str(), "r");
+  if (!f) return;
+  size_t size = f.size();
+  String name = irTitle(slot);
+  if (name.length() > 60) name = name.substring(0, 60);
+  ftxBegin();
+  showMsg(String(L3("Жду гаджет, который примет «", "Waiting for a device to accept \"", "等待接收“")) + name +
+              L3("».\n\nНа нём: Пульт -> «+ Принять с другого гаджета».\n\nДержать кнопку - отмена.",
+                 "\".\n\nOn it: Remote -> \"+ Receive from another device\".\n\nHold the button to cancel.", "”。\n\n长按取消。"),
+          C_YELLOW);
+  uint8_t pk[250];
+  FtxPkt& in = ftxIn;
+  uint8_t peer[6];
+  bool got = false;
+  for (int tries = 0; tries < 120 && !got && !ftxCancel; tries++) {   // ~60 с: предлагаем, ждём согласия
+    pk[0] = 0xA5;
+    pk[1] = 'O';
+    pk[2] = (uint8_t)name.length();
+    memcpy(pk + 3, name.c_str(), name.length());
+    uint32_t sz = (uint32_t)size;
+    memcpy(pk + 3 + name.length(), &sz, 4);
+    esp_now_send(enow::BCAST, pk, 3 + name.length() + 4);
+    if (ftxWait('K', 500)) {
+      memcpy(peer, in.mac, 6);
+      got = true;
+    }
+  }
+  bool ok = false;
+  if (got) {
+    enow::addPeer(peer);
+    uint16_t seq = 0;
+    size_t sent = 0;
+    ok = true;
+    while (sent < size && ok) {
+      int n = f.read(pk + 5, 240);
+      if (n <= 0) break;
+      pk[0] = 0xA5;
+      pk[1] = 'D';
+      pk[2] = (uint8_t)(seq & 0xFF);
+      pk[3] = (uint8_t)(seq >> 8);
+      pk[4] = (uint8_t)n;
+      bool acked = false;
+      for (int r = 0; r < 10 && !acked; r++) {
+        esp_now_send(peer, pk, (size_t)(5 + n));
+        uint32_t t0 = millis();
+        while (millis() - t0 < 300 && !acked) {
+          if (xQueueReceive(ftx::q, &in, pdMS_TO_TICKS(20)) == pdTRUE && in.d[1] == 'k' &&
+              (in.d[2] | (in.d[3] << 8)) == seq)
+            acked = true;
+        }
+      }
+      if (!acked) ok = false;
+      sent += (size_t)n;
+      seq++;
+      tft.fillRect(20, 200, (int)(200 * sent / (size ? size : 1)), 10, C_GREEN);
+    }
+    if (ok) {
+      uint8_t e[2] = {0xA5, 'E'};
+      for (int i = 0; i < 3; i++) {
+        esp_now_send(peer, e, 2);
+        delay(30);
+      }
+    }
+  }
+  f.close();
+  ftxEnd();
+  viewAnswer(ok ? L3("Пульт отправлен.", "The remote was sent.", "遥控器已发送。")
+                : got ? L3("Связь прервалась - пульт не отправлен.", "The link broke - not sent.", "连接中断，未发送。")
+                      : L3("Никто не принял пульт.", "Nobody accepted the remote.", "没有设备接收。"),
+             ok ? C_GREEN : C_YELLOW);
+}
+
+void ftxReceiveRemote() {
+  int slot = irFreeSlot();
+  if (slot < 0 || !irRoom()) {
+    viewAnswer(L3("Нет места для новых пультов - удалите какой-нибудь.", "No room for new remotes - delete one.", "没有空间。"), C_RED);
+    return;
+  }
+  ftxBegin();
+  showMsg(L3("Жду пульт от гаджета рядом...\n\nНа нём: открыть пульт -> «Ещё» -> «Отправить на другой гаджет».\n\nДержать кнопку - отмена.",
+             "Waiting for a remote from a nearby device...\n\nOn it: open the remote -> More -> Send to another device.\n\nHold the button to cancel.",
+             "等待附近设备发送遥控器……\n\n长按取消。"),
+          C_YELLOW);
+  FtxPkt& in = ftxIn;
+  bool ok = false;
+  uint8_t peer[6];
+  String name;
+  uint32_t size = 0;
+  if (ftxWait('O', 120000) && in.len >= 7) {
+    int nl = in.d[2];
+    name = "";
+    for (int i = 0; i < nl && 3 + i < in.len; i++) name += (char)in.d[3 + i];
+    memcpy(&size, in.d + 3 + nl, 4);
+    memcpy(peer, in.mac, 6);
+    std::vector<String> yn = splitBar(L3("Принять|Отказаться", "Accept|Decline", "接收|拒绝"));
+    if (size > 0 && size < 60000 &&
+        choiceScreen(String(L3("Принять пульт «", "Accept the remote \"", "接收遥控器“")) + name + "» (" + String((unsigned long)size) + L3(" байт)?", " bytes)?", " 字节)？"), yn) == 0) {
+      enow::addPeer(peer);
+      uint8_t k[2] = {0xA5, 'K'};
+      esp_now_send(peer, k, 2);
+      File f = LittleFS.open(irPath(slot).c_str(), "w");
+      if (f) {
+        showMsg(String(L3("Принимаю «", "Receiving \"", "接收“")) + name + "»...", C_WHITE);
+        int expect = 0;
+        uint32_t got = 0, tLast = millis();
+        bool kSent = false;
+        while (millis() - tLast < 6000) {
+          if (xQueueReceive(ftx::q, &in, pdMS_TO_TICKS(50)) != pdTRUE) {
+            if (!kSent || got == 0) esp_now_send(peer, k, 2);   // согласие могло потеряться
+            continue;
+          }
+          if (memcmp(in.mac, peer, 6) != 0) continue;
+          char t = (char)in.d[1];
+          if (t == 'D' && in.len >= 5) {
+            kSent = true;
+            int sq = in.d[2] | (in.d[3] << 8), n = in.d[4];
+            if (sq == expect && n <= in.len - 5) {   // новый кусок - записать
+              f.write(in.d + 5, (size_t)n);
+              got += (uint32_t)n;
+              expect++;
+              tft.fillRect(20, 200, (int)(200 * got / size), 10, C_GREEN);
+            }
+            uint8_t a[4] = {0xA5, 'k', in.d[2], in.d[3]};   // подтверждаем (и повтор тоже)
+            esp_now_send(peer, a, 4);
+            tLast = millis();
+          } else if (t == 'E') {
+            ok = got == size;
+            break;
+          }
+        }
+        f.close();
+        if (!ok) LittleFS.remove(irPath(slot).c_str());
+      }
+    }
+  }
+  ftxEnd();
+  viewAnswer(ok ? String(L3("Пульт «", "Remote \"", "遥控器“")) + name + L3("» сохранён.", "\" saved.", "”已保存。")
+                : String(L3("Пульт не принят.", "No remote received.", "未接收到遥控器。")),
+             ok ? C_GREEN : C_YELLOW);
+}
+#endif
 #endif
 
 bool g_netDirect = false;                            // игра идёт напрямую (ESP-NOW), а не через сервер
@@ -14483,7 +15245,13 @@ void chatAsk(String q) {
     chat.push_back({true, q});
     chat.push_back({false, result});
     trimHistory();
+#if BOARD_S3
+    if (cfgSpeak) speakText(result, speakLang());     // озвучка идёт в фоне, пока читаешь
+#endif
     int act = viewChat();
+#if BOARD_S3
+    sndStop();
+#endif
     if (act == 0) return;
     if (!waitWifi(false)) return;
     q = act == 1 ? L3("Распиши решение по шагам, подробно, с пояснением каждого шага.", "Show the solution step by step, explaining every step.",
