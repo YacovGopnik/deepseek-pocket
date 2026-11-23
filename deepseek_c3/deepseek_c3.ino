@@ -12808,6 +12808,169 @@ void runTttNetVia(bool direct) {
   }
 }
 
+// ========================= ПИНГ-ПОНГ ВДВОЁМ (рядом, ESP-NOW) =========================
+// Хозяин (у кого метка меньше) считает мяч и играет левой ракеткой, гость играет правой и шлёт её положение.
+// Состояние от хозяина - один int: bx(8) by(8) py(8) очки хозяина(3) очки гостя(3).
+void runPongNear() {
+  if (!enow::begin()) {
+    viewAnswer(L3("Не удалось включить прямую связь.", "Could not start the direct link.", "无法启动直连。"), C_RED);
+    return;
+  }
+  g_netDirect = true;
+  struct Leave {
+    ~Leave() {
+      enow::end();
+      g_netDirect = false;
+    }
+  } leave;
+  const int PH = (int)arcade::pong::PH, PW = (int)arcade::pong::PW, BALL = (int)arcade::pong::BALL;
+  const int Y0 = (int)arcade::pong::FY0, Y1 = (int)arcade::pong::FY1 - PH;
+  for (;;) {
+    // --- поиск соперника ---
+    String peer, peerNick;
+    bool host = false;
+    netInbox.clear();
+    showMsg(L3("Ищу гаджет рядом. Пусть друг откроет «Пинг-понг рядом». Держать - выход.",
+               "Looking for a device nearby. Ask a friend to open Pong nearby. Hold - exit.",
+               "正在寻找附近的设备。请朋友打开“附近乒乓”。长按：退出。"), C_YELLOW);
+    uint32_t lastSeek = 0;
+    while (!peer.length()) {
+      if (btnEvent() == EV_LONG) return;
+      netPump();
+      if (netLinkUp() && millis() - lastSeek > 2000) {
+        lastSeek = millis();
+        netSend("pong\tseek");
+      }
+      String id, nick, game, cmd, to;
+      int arg;
+      while (netNext(id, nick, game, cmd, to, arg)) {
+        if (game != "pong") continue;
+        if (cmd == "seek" && strcmp(roomId.c_str(), id.c_str()) < 0) {
+          peer = id;
+          peerNick = nick;
+          host = true;
+          netSend(String("pong\tstart\t") + peer + "\t0");
+          break;
+        }
+        if (cmd == "start" && to == roomId) {
+          peer = id;
+          peerNick = nick;
+          break;
+        }
+      }
+      delay(10);
+    }
+    sndOk();
+    if (!peerNick.length()) peerNick = peer;
+    // --- партия ---
+    png.rnd = gameRandom;
+    png.reset();
+    png.cpuSpeed = 0;                                // правой ракеткой управляет гость, не бот
+    String left = host ? cfgNick : peerNick, right = host ? peerNick : cfgNick;
+    auto bar = [&]() {
+      SmallFont small;
+      tft.fillRect(0, 0, 240, 18, C_BLACK);
+      char b[80];
+      snprintf(b, sizeof(b), "%s  %d : %d  %s", left.c_str(), png.playerScore, png.cpuScore, right.c_str());
+      drawUtf8(b, (240 - textWidth(b)) / 2 < 0 ? 0 : (240 - textWidth(b)) / 2, 1, C_WHITE, C_BLACK);
+    };
+    tft.fillScreen(C_BLACK);
+    bar();
+    drawPongNet(0, 240);
+    int opy = (int)png.py, ocy = (int)png.cy, obx = (int)png.bx, oby = (int)png.by;
+    tft.fillRect((int)arcade::pong::PLAYER_X, opy, PW, PH, C_WHITE);
+    tft.fillRect((int)arcade::pong::CPU_X, ocy, PW, PH, C_WHITE);
+    float myY = png.cy;                              // положение ракетки гостя
+    int frame = 0;
+    bool gone = false, finished = false;
+    uint32_t next = millis(), lastHeard = millis();
+    while (!gone && !finished) {
+      if (btnEvent() == EV_LONG) {
+        netSend(String("pong\tbye\t") + peer);
+        return;
+      }
+      netPump();
+      String id, nick, game, cmd, to;
+      int arg;
+      while (netNext(id, nick, game, cmd, to, arg)) {
+        if (game != "pong" || id != peer) continue;
+        lastHeard = millis();
+        if (cmd == "bye") gone = true;
+        if (host && cmd == "p" && arg >= Y0 && arg <= Y1) myY = (float)arg;
+        if (!host && cmd == "s" && arg >= 0) {
+          png.bx = (float)(arg & 255);
+          png.by = (float)((arg >> 8) & 255);
+          png.py = (float)((arg >> 16) & 255);
+          int sh = (arg >> 24) & 7, sg = (arg >> 27) & 7;
+          if (sh != png.playerScore || sg != png.cpuScore) {
+            png.playerScore = sh;
+            png.cpuScore = sg;
+            beep(1, 900, 25);
+            bar();
+          }
+        }
+      }
+      if (millis() - lastHeard > 5000) gone = true;
+      if ((int32_t)(millis() - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 16;                                    // ~60 кадров в секунду
+      uint8_t raw = joyRaw();
+      int in = raw == J_UP ? -1 : raw == J_DOWN ? 1 : 0;
+      if (host) {
+        png.cy = myY;
+        int r = png.step(in);
+        if (r) {
+          beep(1, 900, 25);
+          bar();
+        }
+        if (png.over) finished = true;
+      } else {
+        myY += in * arcade::pong::PADDLE_SPEED;      // своя ракетка двигается сразу, без ожидания хозяина
+        if (myY < Y0) myY = (float)Y0;
+        if (myY > Y1) myY = (float)Y1;
+        png.cy = myY;
+        if (png.playerScore >= arcade::pong::WIN || png.cpuScore >= arcade::pong::WIN) finished = true;
+      }
+      if ((frame++ & 1) || finished) {               // ~30 пакетов в секунду
+        if (host) {
+          int bxp = png.bx < 0 ? 0 : png.bx > 255 ? 255 : (int)png.bx;
+          int st = bxp | ((int)png.by << 8) | ((int)png.py << 16) | (png.playerScore << 24) | (png.cpuScore << 27);
+          for (int k = 0; k < (finished ? 3 : 1); k++) {
+            netSend(String("pong\ts\t") + peer + "\t" + String(st));
+            if (finished) delay(30);
+          }
+        } else {
+          netSend(String("pong\tp\t") + peer + "\t" + String((int)myY));
+        }
+      }
+      int npy = (int)png.py, ncy = (int)png.cy, nbx = (int)png.bx, nby = (int)png.by;
+      tft.fillRect(obx, oby, BALL, BALL, C_BLACK);
+      drawPongNet(oby, oby + BALL);
+      movePaddle((int)arcade::pong::PLAYER_X, opy, npy);
+      movePaddle((int)arcade::pong::CPU_X, ocy, ncy);
+      tft.fillRect(nbx, nby, BALL, BALL, C_WHITE);
+      opy = npy;
+      ocy = ncy;
+      obx = nbx;
+      oby = nby;
+    }
+    if (gone) {
+      showMsg(L3("Соперник вышел из игры.", "The opponent has left.", "对手已离开。"), C_YELLOW);
+      delay(1800);
+      continue;
+    }
+    bool won = host ? png.playerScore >= arcade::pong::WIN : png.cpuScore >= arcade::pong::WIN;
+    char s[24];
+    snprintf(s, sizeof(s), "%d : %d", host ? png.playerScore : png.cpuScore, host ? png.cpuScore : png.playerScore);
+    if (!resultBox(won ? T().pongWin : T().pongLose, s, won ? C_GREEN : C_RED)) {
+      netSend(String("pong\tbye\t") + peer);
+      return;
+    }
+  }
+}
+
 // ========================= ШАХМАТЫ =========================
 // Игрок - белые (внизу). Соперник - DeepSeek (если есть интернет) или сама плата.
 chess::Board chs;
@@ -14084,9 +14247,10 @@ void runGamesMenu() {
                                  L3("Крестики рядом", "Tic-tac-toe nearby", "附近井字棋"), L3("Шахматы", "Chess", "国际象棋"),
                                  L3("Шахматы по сети", "Chess online", "联网国际象棋"), L3("Шахматы рядом", "Chess nearby", "附近国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
-                                 L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"), T().menuBack};
+                                 L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"),
+                                 L3("Пинг-понг рядом", "Pong nearby", "附近乒乓"), T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "", "", ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
@@ -14121,6 +14285,7 @@ void runGamesMenu() {
       case 23: runFps3d(); break;
       case 24: runSandbox(); break;
       case 25: runHiScores(); break;
+      case 26: runPongNear(); break;
       default: return;                               // «Назад» или удержание
     }
   }
