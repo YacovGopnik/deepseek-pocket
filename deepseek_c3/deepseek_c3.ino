@@ -14258,7 +14258,11 @@ void runGamesMenu() {
 #endif
     names.push_back(T().menuBack);
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "",
+#if ENABLE_PONG_NEAR
+                          "",
+#endif
+                          ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
