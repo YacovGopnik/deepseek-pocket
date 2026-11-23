@@ -14844,6 +14844,11 @@ void drawHomeStatus() {
     char b[8];
     snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
     drawUtf8(b, 4, 2, C_WHITE, C_BAR);
+    if (!admOn) {                                    // дата там, где иначе был бы блок ADMIN
+      char d[8];
+      snprintf(d, sizeof(d), "%02d.%02d", t.tm_mday, t.tm_mon + 1);
+      drawUtf8(d, 56, 2, C_LIGHT, C_BAR);
+    }
   }
   if (admOn) drawUtf8("ADMIN", 56, 2, 0xFB2C, C_BAR);
   if (roomUnread > 0) {                              // непрочитанные в комнате: конвертик и число
@@ -14872,9 +14877,9 @@ void drawHomeStatus() {
   }
 }
 
-void drawHomeCell(const std::vector<uint8_t>& apps, int page, int i, bool sel) {
+void drawHomeCell(const std::vector<uint8_t>& apps, int page, int i, bool sel, int dx = 0) {
   int idx = page * 9 + i;
-  int cx = (i % 3) * CELL_W, cy = HOME_TOP + (i / 3) * CELL_H;
+  int cx = (i % 3) * CELL_W + dx, cy = HOME_TOP + (i / 3) * CELL_H;
   int tx = cx + (CELL_W - TILE) / 2, ty = cy + 3;
   if (idx >= (int)apps.size()) {
     tft.fillRect(cx, cy, CELL_W, CELL_H, C_BLACK);
@@ -14896,17 +14901,40 @@ void drawHomeCell(const std::vector<uint8_t>& apps, int page, int i, bool sel) {
   }
 }
 
-void drawHomeIcons(const std::vector<uint8_t>& apps, int page, int selCell) {
-  tft.fillRect(0, HOME_TOP, 240, 240 - HOME_TOP, C_BLACK);
+// Рисует одну страницу иконок со сдвигом по X. Сдвиг нужен для анимации перелистывания.
+void drawHomePage(const std::vector<uint8_t>& apps, int page, int selCell, int dx) {
   for (int i = 0; i < 9; i++) {
     int idx = page * 9 + i;
     if (idx >= (int)apps.size()) break;
-    drawAppIcon(apps[(size_t)idx], (i % 3) * CELL_W + (CELL_W - TILE) / 2, HOME_TOP + (i / 3) * CELL_H + 3);
-    drawHomeCell(apps, page, i, i == selCell);
+    drawAppIcon(apps[(size_t)idx], (i % 3) * CELL_W + (CELL_W - TILE) / 2 + dx, HOME_TOP + (i / 3) * CELL_H + 3);
+    drawHomeCell(apps, page, i, i == selCell, dx);
   }
+}
+
+void drawHomeDots(const std::vector<uint8_t>& apps, int page) {
   int pages = ((int)apps.size() + 8) / 9;
   if (pages > 1)                                     // точки страниц
     for (int p = 0; p < pages; p++) tft.fillCircle(120 - (pages - 1) * 6 + p * 12, 235, p == page ? 3 : 2, p == page ? C_WHITE : 0x6B4D);
+}
+
+void drawHomeIcons(const std::vector<uint8_t>& apps, int page, int selCell) {
+  tft.fillRect(0, HOME_TOP, 240, 240 - HOME_TOP, C_BLACK);
+  drawHomePage(apps, page, selCell, 0);
+  drawHomeDots(apps, page);
+}
+
+// Короткая анимация: старая страница уезжает в сторону, новая приезжает на её место.
+// dir = 1 - вперёд, dir = -1 - назад. Границы экрана обрезают фигуры автоматически.
+void animateHomePage(const std::vector<uint8_t>& apps, int oldPage, int newPage, int newCell, int dir) {
+  const int FRAMES = 8;
+  for (int f = 1; f <= FRAMES; f++) {
+    int off = 240 * f / FRAMES;
+    tft.fillRect(0, HOME_TOP, 240, 240 - HOME_TOP, C_BLACK);
+    drawHomePage(apps, oldPage, -1, -dir * off);
+    drawHomePage(apps, newPage, f == FRAMES ? newCell : -1, dir * (240 - off));
+    delay(12);
+  }
+  drawHomeDots(apps, newPage);
 }
 
 void launchApp(int a) {
@@ -15008,7 +15036,7 @@ void runHome() {
       if (sel >= n) sel = n - 1;
       if (sel != old) {
         if (sel / 9 != old / 9) {
-          drawHomeIcons(apps, sel / 9, sel % 9);
+          animateHomePage(apps, old / 9, sel / 9, sel % 9, sel > old ? 1 : -1);
         } else {
           drawHomeCell(apps, page, old % 9, false);
           drawHomeCell(apps, page, sel % 9, true);
