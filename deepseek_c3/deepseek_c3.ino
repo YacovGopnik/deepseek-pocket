@@ -137,6 +137,9 @@ void ftxReceiveRemote();
 #endif
 #define ENABLE_JOYCAL (!(ENABLE_BLE && !BOARD_S3))    // калибровка джойстика (в C3 с Bluetooth нет места)  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
 #endif
+#ifndef ENABLE_PONG_NEAR
+#define ENABLE_PONG_NEAR (!(ENABLE_BLE && !BOARD_S3)) // «Пинг-понг рядом»: в C3 с Bluetooth нет места
+#endif
 #ifndef ENABLE_PCSCREEN
 #define ENABLE_PCSCREEN FULL_EDITION                 // «Экран ПК» (картинки с компьютера по USB)
 #endif
@@ -12808,6 +12811,7 @@ void runTttNetVia(bool direct) {
   }
 }
 
+#if ENABLE_PONG_NEAR
 // ========================= ПИНГ-ПОНГ ВДВОЁМ (рядом, ESP-NOW) =========================
 // Хозяин (у кого метка меньше) считает мяч и играет левой ракеткой, гость играет правой и шлёт её положение.
 // Состояние от хозяина - один int: bx(8) by(8) py(8) очки хозяина(3) очки гостя(3).
@@ -12970,6 +12974,7 @@ void runPongNear() {
     }
   }
 }
+#endif // ENABLE_PONG_NEAR
 
 // ========================= ШАХМАТЫ =========================
 // Игрок - белые (внизу). Соперник - DeepSeek (если есть интернет) или сама плата.
@@ -14247,8 +14252,11 @@ void runGamesMenu() {
                                  L3("Крестики рядом", "Tic-tac-toe nearby", "附近井字棋"), L3("Шахматы", "Chess", "国际象棋"),
                                  L3("Шахматы по сети", "Chess online", "联网国际象棋"), L3("Шахматы рядом", "Chess nearby", "附近国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
-                                 L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"),
-                                 L3("Пинг-понг рядом", "Pong nearby", "附近乒乓"), T().menuBack};
+                                 L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录")};
+#if ENABLE_PONG_NEAR
+    names.push_back(L3("Пинг-понг рядом", "Pong nearby", "附近乒乓"));
+#endif
+    names.push_back(T().menuBack);
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
                           "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "", "", ""};
     std::vector<String> right;
@@ -14285,7 +14293,9 @@ void runGamesMenu() {
       case 23: runFps3d(); break;
       case 24: runSandbox(); break;
       case 25: runHiScores(); break;
+#if ENABLE_PONG_NEAR
       case 26: runPongNear(); break;
+#endif
       default: return;                               // «Назад» или удержание
     }
   }
