@@ -4724,7 +4724,7 @@ void drawCubeRunFrame(const cube_run::Game& runner) {
         cubeRunSpan(row, x, x + 16, CUBE_GRID);
       }
     }
-    for (const Block& block : blocks) {
+    for (const Block& block : cube_run::blocks) {
       int x = block.x - runner.distance;
       if (x >= SCREEN_W) break;
       int surface = GROUND_Y - block.height;
