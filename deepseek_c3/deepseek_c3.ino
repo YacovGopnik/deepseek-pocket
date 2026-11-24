@@ -190,7 +190,7 @@ inline bool takeLine(std::string&) { return false; }
 
 // Поиск картинок (Wikimedia Commons). Нужна библиотека TJpg_Decoder (Менеджер библиотек, автор Bodmer).
 // Если не хотите её ставить - поставьте 0: всё остальное соберётся и будет работать.
-#define ENABLE_IMAGES 1
+#define ENABLE_IMAGES (!(ENABLE_BLE && !BOARD_S3))   // в C3 с Bluetooth нет места под галерею и аватарки
 #if ENABLE_IMAGES
 #include <TJpg_Decoder.h>
 #endif
@@ -843,6 +843,16 @@ const Texts TEXTS[N_LANGS] = {
 
 // ========================= СОХРАНЁННЫЕ НАСТРОЙКИ =========================
 Preferences prefs;
+#if ENABLE_BLE
+#define LLM_URL API_URL
+#define LLM_MODEL(a) ((a).model)
+#define LLM_CUSTOM false
+#else
+String cfgUrl, cfgModel;                            // другой сервис (например VseGPT): адрес и имя модели, пусто = DeepSeek
+#define LLM_URL (cfgUrl.length() ? cfgUrl.c_str() : API_URL)
+#define LLM_MODEL(a) (cfgModel.length() ? cfgModel.c_str() : (a).model)
+#define LLM_CUSTOM (cfgUrl.length() || cfgModel.length())
+#endif
 String cfgSsid, cfgPass, cfgKey;                    // cfgSsid/cfgPass - сеть, к которой подключаемся сейчас
 // Запомненные сети (до 5): дом, телефон, школа... Плата по очереди пробует их, пока не подключится.
 const size_t MAX_NETS = 5;
@@ -931,6 +941,10 @@ void loadSettings() {
     cfgPass = netSsid.empty() ? String("") : netPass[0];
   }
   cfgKey = prefs.getString("key", DEFAULT_API_KEY);
+#if !ENABLE_BLE
+  cfgUrl = prefs.getString("url", "");
+  cfgModel = prefs.getString("mdl", "");
+#endif
   cfgLang = prefs.getUChar("lang", LANG_RU);
   cfgBright = (int)prefs.getUChar("bri", 4);
   cfgSound = (int)prefs.getUChar("snd", 1);
@@ -1017,6 +1031,17 @@ void saveKey(const String& key) {
   prefs.putString("key", key);
   prefs.end();
 }
+
+#if !ENABLE_BLE
+void saveLlm(const String& u, const String& m) {
+  prefs.begin("dsk", false);
+  prefs.putString("url", u);
+  prefs.putString("mdl", m);
+  prefs.end();
+  cfgUrl = u;
+  cfgModel = m;
+}
+#endif
 
 String fmt(const char* f, int v) {
   char b[160];
@@ -2787,7 +2812,12 @@ void handleRoot() {
   h += T().webKeyHint;
   String mk = maskedKey();
   if (mk.length()) { h += " ("; h += htmlEscape(mk); h += ")"; }
-  h += "</small></label><button type='submit'>"; h += T().webSave; h += "</button></form>";
+  h += "</small></label>";
+#if !ENABLE_BLE
+  h += "<label>API: vsegpt, URL или пусто (DeepSeek)<input name='u' value='"; h += htmlEscape(cfgUrl); h += "'></label>";
+  h += "<label>Model (openai/gpt-4o-mini ...)<input name='md' value='"; h += htmlEscape(cfgModel); h += "'></label>";
+#endif
+  h += "<button type='submit'>"; h += T().webSave; h += "</button></form>";
   // конспекты: текст с телефона сохраняется в память платы и читается без интернета
   h += "<hr><h2>"; h += L3("Конспект", "Note", "笔记"); h += "</h2><form method='post' action='/note'>";
   h += "<label>"; h += L3("Название", "Title", "标题"); h += "<input name='t' maxlength='60'></label>";
@@ -2862,6 +2892,18 @@ void handleSave() {
     saveKey(key);
     changed = true;
   }
+#if !ENABLE_BLE
+  if (server.hasArg("md")) {
+    String u = server.arg("u"), m = server.arg("md");
+    u.trim();
+    m.trim();
+    if (u == "vsegpt") u = "https://api.vsegpt.ru/v1/chat/completions";
+    if (u != cfgUrl || m != cfgModel) {
+      saveLlm(u, m);
+      changed = true;
+    }
+  }
+#endif
   if (!changed) {
     server.send(200, "text/html; charset=utf-8", pageHead() + "<p>" + T().webNoSsid + "</p><p><a href='/'>&larr;</a></p></body></html>");
     return;
@@ -5268,7 +5310,7 @@ bool g_streamed = false;                              // последний от
 int apiCall(const Attempt& a, const char* system, const std::vector<ChatMsg>& history, const String& question,
             int maxTokens, String& payload) {
   JsonDocument doc;
-  doc["model"] = a.model;
+  doc["model"] = LLM_MODEL(a);
   JsonArray msgs = doc["messages"].to<JsonArray>();
   JsonObject sys = msgs.add<JsonObject>();
   sys["role"] = "system";
@@ -5282,7 +5324,7 @@ int apiCall(const Attempt& a, const char* system, const std::vector<ChatMsg>& hi
   usr["role"] = "user";
   usr["content"] = question;
   doc["max_tokens"] = maxTokens;
-  if (a.noThink) doc["thinking"]["type"] = "disabled";
+  if (a.noThink && !LLM_CUSTOM) doc["thinking"]["type"] = "disabled";
   bool stream = (bool)g_streamCb;
   if (stream) doc["stream"] = true;
   g_streamed = false;
@@ -5295,7 +5337,7 @@ int apiCall(const Attempt& a, const char* system, const std::vector<ChatMsg>& hi
   HTTPClient http;
   http.setConnectTimeout(15000);
   http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(client, API_URL)) return -100;
+  if (!http.begin(client, LLM_URL)) return -100;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + cfgKey);
   int code = http.POST(body);
@@ -5365,7 +5407,7 @@ bool askWith(const char* system, const std::vector<ChatMsg>& history, const Stri
       return true;
     }
     Serial.println(payload.substring(0, 300));
-    if (code != 400 && code != 404 && code != 422) break;  // ошибка модели - пробуем другое имя
+    if (LLM_CUSTOM || (code != 400 && code != 404 && code != 422)) break;  // ошибка модели - пробуем другое имя
   }
   result = errorText(code, payload);
   return false;
