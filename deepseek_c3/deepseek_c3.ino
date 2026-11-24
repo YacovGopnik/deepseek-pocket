@@ -73,6 +73,7 @@
 #include "falling_game.h"
 #include "arcade_games.h"
 #include "cube_run.h"
+#include <math.h>
 #include "ai_games.h"
 #include "race_game.h"
 #include "pixabay.h"
@@ -4685,88 +4686,166 @@ void runFlappy() {
 
 // ========================= КУБ-РАННЕР =========================
 const uint16_t CUBE_BG = 0x084D, CUBE_FLOOR = 0x190E, CUBE_GRID = 0x49B6;
-const uint16_t CUBE_BODY = 0x47FF, CUBE_SPIKE = 0xFBB1;
-const char CUBE_BEST_KEY[] = "bcube";
+const uint16_t CUBE_BODY = 0x47FF, CUBE_SPIKE = 0xFBB1, CUBE_PLATFORM = 0x31B5;
+const char CUBE_PROGRESS_KEY[] = "cubePct";
 
-void drawCubeRunFrame(const cube_run::Game& runner, const cube_run::Game& previous, int floorOffset) {
+void cubeRunSpan(uint16_t* row, int left, int right, uint16_t color) {
+  if (left < 0) left = 0;
+  if (right > cube_run::SCREEN_W) right = cube_run::SCREEN_W;
+  for (int x = left; x < right; ++x) row[x] = color;
+}
+
+void drawCubeRunFrame(const cube_run::Game& runner) {
   using namespace cube_run;
+  constexpr int top = 48, bottom = 208, rows = 8;
+  static uint16_t pixels[rows][SCREEN_W];
+  const int centerX = CUBE_X + CUBE_SIZE / 2;
+  const int centerY = runner.cubeY() + CUBE_SIZE / 2;
+  const float angle = runner.rotation * 0.0174532925f;
+  const int cosine = lroundf(cosf(angle) * 256);
+  const int sine = lroundf(sinf(angle) * 256);
+  const uint16_t grid = runner.distance % BEAT < 12 ? 0x2172 : 0x1130;
+  const uint16_t body = runner.over ? C_RED : CUBE_BODY;
+  const int finishX = FINISH + centerX - runner.distance;
+
   tft.startWrite();
-  tft.writeFillRect(CUBE_X, previous.cubeY(), CUBE_SIZE, CUBE_SIZE, CUBE_BG);
-  for (const Spikes& group : previous.spikes) {
-    if (group.count) tft.writeFillRect(group.x, GROUND_Y - SPIKE_H, group.count * SPIKE_W, SPIKE_H, CUBE_BG);
-  }
-  for (const Spikes& group : runner.spikes) {
-    for (uint8_t i = 0; i < group.count; ++i) {
-      int center = group.x + i * SPIKE_W + SPIKE_W / 2;
-      for (int h = 0; h < SPIKE_H; ++h) {
-        int half = spikeHalfWidth(h);
-        tft.writeFastHLine(center - half, GROUND_Y - 1 - h, 2 * half + 1, CUBE_SPIKE);
+  tft.setAddrWindow(0, top, SCREEN_W, bottom - top);
+  for (int y = top; y < bottom; ++y) {
+    uint16_t* row = pixels[(y - top) % rows];
+    cubeRunSpan(row, 0, SCREEN_W, y >= GROUND_Y ? CUBE_FLOOR : CUBE_BG);
+    if (y < GROUND_Y) {
+      for (int x = -(runner.distance % BEAT); x < SCREEN_W; x += BEAT) {
+        cubeRunSpan(row, x, x + 1, grid);
       }
     }
-  }
-  int y = runner.cubeY();
-  tft.writeFillRect(CUBE_X, y, CUBE_SIZE, CUBE_SIZE, runner.over ? C_RED : CUBE_BODY);
-  tft.writeFillRect(CUBE_X + 4, y + 4, 10, 10, CUBE_BG);
-  tft.writeFillRect(CUBE_X + 7, y + 7, 4, 4, C_WHITE);
-  tft.writeFillRect(0, GROUND_Y + 10, SCREEN_W, 3, CUBE_FLOOR);
-  for (int x = -floorOffset; x < SCREEN_W; x += 32) {
-    tft.writeFillRect(x, GROUND_Y + 10, 14, 3, CUBE_GRID);
+    if (y == GROUND_Y) cubeRunSpan(row, 0, SCREEN_W, CUBE_BODY);
+    if (y >= GROUND_Y + 10 && y < GROUND_Y + 13) {
+      for (int x = -(runner.distance % BEAT); x < SCREEN_W; x += BEAT) {
+        cubeRunSpan(row, x, x + 16, CUBE_GRID);
+      }
+    }
+    for (const Block& block : blocks) {
+      int x = block.x - runner.distance;
+      if (x >= SCREEN_W) break;
+      int surface = GROUND_Y - block.height;
+      if (x + block.width <= 0 || y < surface || y >= GROUND_Y) continue;
+      cubeRunSpan(row, x, x + block.width, y < surface + 3 ? CUBE_BODY : CUBE_PLATFORM);
+      if (y >= surface + 5) {
+        for (int seam = x + 24; seam < x + block.width; seam += 24) {
+          cubeRunSpan(row, seam, seam + 1, CUBE_GRID);
+        }
+      }
+    }
+    for (const Spike& spike : spikes) {
+      int x = spike.x - runner.distance;
+      if (x >= SCREEN_W) break;
+      int height = GROUND_Y - spike.height - 1 - y;
+      if (x + SPIKE_W <= 0 || height < 0 || height >= SPIKE_H) continue;
+      int half = spikeHalfWidth(height);
+      int center = x + SPIKE_W / 2;
+      cubeRunSpan(row, center - half, center + half + 1, CUBE_SPIKE);
+    }
+    if (y >= GROUND_Y - 62 && y < GROUND_Y) {
+      for (int square = 0; square < 2; ++square) {
+        int x = finishX + square * 5;
+        uint16_t color = ((y - GROUND_Y + 62) / 5 + square) % 2 ? CUBE_GRID : C_WHITE;
+        cubeRunSpan(row, x, x + 5, color);
+      }
+    }
+    int dy = y - centerY;
+    if (dy >= -13 && dy <= 13) {
+      for (int dx = -13; dx <= 13; ++dx) {
+        int u = dx * cosine + dy * sine + CUBE_SIZE * 128;
+        int v = -dx * sine + dy * cosine + CUBE_SIZE * 128;
+        if (u < 0 || v < 0 || u >= CUBE_SIZE * 256 || v >= CUBE_SIZE * 256) continue;
+        int px = u / 256, py = v / 256;
+        uint16_t color = body;
+        if (px >= 3 && px < 15 && py >= 3 && py < 15) color = CUBE_BG;
+        if (py >= 5 && py < 9 && ((px >= 5 && px < 7) || (px >= 11 && px < 13))) color = C_WHITE;
+        if (py >= 11 && py < 13 && px >= 6 && px < 12) color = C_WHITE;
+        row[centerX + dx] = color;
+      }
+    }
+    if ((y - top) % rows == rows - 1) tft.writePixels(&pixels[0][0], rows * SCREEN_W, true);
   }
   tft.endWrite();
 }
 
+void drawCubeRunProgress(int progress, unsigned best) {
+  char line[32];
+  snprintf(line, sizeof(line), "%d%%   /   %u%%", progress, best);
+  tft.fillRect(0, 0, 240, 32, CUBE_BG);
+  drawSmallCenteredBg(line, 5, C_WHITE, CUBE_BG);
+  tft.fillRect(12, 24, 216, 4, CUBE_FLOOR);
+  if (progress) tft.fillRect(12, 24, 216 * progress / 100, 4, CUBE_BODY);
+}
+
 void runCubeRunner() {
-  uint32_t best = loadBestKey(CUBE_BEST_KEY);
+  unsigned best = loadBestKey(CUBE_PROGRESS_KEY);
+  cube_run::Game runner;
+  tft.fillScreen(CUBE_BG);
+  drawCubeRunProgress(0, best);
+  drawCubeRunFrame(runner);
+  drawSmallCenteredBg(L3("Клик или вверх: старт", "Click or up: start", "短按或向上：开始"), 65, C_WHITE, CUBE_BG);
+  drawSmallCenteredBg(L3("Удержание: выход", "Hold: exit", "长按：退出"), 83, C_LIGHT, CUBE_BG);
+  bool started = false, jump = false;
+  uint32_t next = millis();
+  int lastProgress = 0;
   for (;;) {
-    cube_run::Game runner;
-    tft.fillScreen(CUBE_BG);
-    tft.fillRect(0, cube_run::GROUND_Y, cube_run::SCREEN_W, 240 - cube_run::GROUND_Y, CUBE_FLOOR);
-    tft.drawFastHLine(0, cube_run::GROUND_Y, cube_run::SCREEN_W, CUBE_BODY);
-    drawScoreBar(0, best);
-    drawSmallCenteredBg(L3("Клик или вверх: прыжок", "Click or up: jump", "短按或向上：跳跃"), 54, C_WHITE, CUBE_BG);
-    drawSmallCenteredBg(L3("Удержание: выход", "Hold: exit", "长按：退出"), 72, C_LIGHT, CUBE_BG);
-    drawCubeRunFrame(runner, runner, 0);
-    bool started = false, jump = false;
-    uint32_t next = millis();
-    int floorOffset = 0;
-    for (;;) {
-      BtnEvent e = btnEvent();
-      if (e == EV_LONG) {
-        saveBestKey(CUBE_BEST_KEY, best);
-        return;
-      }
-      uint8_t j = joyEvent();
-      if (e == EV_CLICK || (j == J_UP && !g_joyRepeated)) {
-        jump = true;
-        if (!started) {
-          started = true;
-          tft.fillRect(0, 54, cube_run::SCREEN_W, 34, CUBE_BG);
-          next = millis();
-        }
-      }
-      uint32_t now = millis();
-      if (!started || (int32_t)(now - next) < 0) {
-        delay(1);
-        continue;
-      }
-      next += 20;
-      if ((int32_t)(now - next) >= 0) next = now + 20;
-      const cube_run::Game previous = runner;
+    BtnEvent e = btnEvent();
+    if (e == EV_LONG) {
+      saveBestKey(CUBE_PROGRESS_KEY, best);
+      return;
+    }
+    uint8_t j = joyEvent();
+    bool pressed = e == EV_CLICK || (j == J_UP && !g_joyRepeated);
+    if (pressed && !started) {
+      started = true;
+      next = millis();
+    } else if (pressed) {
+      jump = true;
+    }
+    uint32_t now = millis();
+    if (!started || (int32_t)(now - next) < 0) {
+      delay(1);
+      continue;
+    }
+    // Keep simulation ticks fixed when a display transfer takes longer than a frame.
+    for (int tick = 0; tick < 3 && (int32_t)(now - next) >= 0; ++tick) {
       runner.step(jump);
       jump = false;
-      floorOffset = (floorOffset + previous.speed) % 32;
-      drawCubeRunFrame(runner, previous, floorOffset);
-      if (runner.score != previous.score) {
-        if (runner.score > best) best = runner.score;
-        drawScoreBar(runner.score, best);
-        beep(1, 1600, 10);
-      }
-      if (runner.over) {
-        saveBestKey(CUBE_BEST_KEY, best);
-        if (!gameOverBox(runner.score)) return;
-        break;
-      }
+      next += 20;
     }
+    if ((int32_t)(now - next) >= 0) next = now + 20;
+    drawCubeRunFrame(runner);
+    int progress = runner.progress();
+    if ((unsigned)progress > best) best = progress;
+    if (progress != lastProgress) {
+      drawCubeRunProgress(progress, best);
+      lastProgress = progress;
+    }
+    if (!runner.over && !runner.finished) continue;
+
+    saveBestKey(CUBE_PROGRESS_KEY, best);
+    tft.fillRect(6, 74, 228, 92, C_BLACK);
+    drawSmallCenteredBg(
+        runner.finished ? L3("Финиш!", "Level complete!", "通关！")
+                        : L3("Столкновение", "Crashed", "撞到了"),
+        92, runner.finished ? C_GREEN : C_RED, C_BLACK);
+    drawSmallCenteredBg(L3("Клик или вверх: заново", "Click or up: retry", "短按或向上：重试"), 119, C_WHITE, C_BLACK);
+    for (;;) {
+      BtnEvent result = btnEvent();
+      if (result == EV_LONG) return;
+      uint8_t direction = joyEvent();
+      if (result == EV_CLICK || (direction == J_UP && !g_joyRepeated)) break;
+      delay(1);
+    }
+    // The retry input starts the next attempt immediately.
+    runner = cube_run::Game{};
+    tft.fillScreen(CUBE_BG);
+    drawCubeRunProgress(0, best);
+    lastProgress = 0;
+    next = millis();
   }
 }
 
@@ -14509,7 +14588,7 @@ void runGamesMenu() {
                                  T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
                           "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "",
-                          CUBE_BEST_KEY
+                          CUBE_PROGRESS_KEY
 #if !ENABLE_BLE
                           , ""
 #endif
@@ -14517,7 +14596,7 @@ void runGamesMenu() {
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
-      right.push_back(v ? String((unsigned)v) : String(""));
+      right.push_back(v ? String((unsigned)v) + (keys[i] == CUBE_PROGRESS_KEY ? "%" : "") : String(""));
     }
     sel = listScreen(T().menuGames, names, right, sel);
     InGame inGame;                                   // наклон гаджета работает только внутри игр
