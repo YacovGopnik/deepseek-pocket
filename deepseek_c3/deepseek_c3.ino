@@ -847,11 +847,16 @@ Preferences prefs;
 #define LLM_URL API_URL
 #define LLM_MODEL(a) ((a).model)
 #define LLM_CUSTOM false
+#define LLM_KEY cfgKey
 #else
 String cfgUrl, cfgModel;                            // другой сервис (например VseGPT): адрес и имя модели, пусто = DeepSeek
-#define LLM_URL (cfgUrl.length() ? cfgUrl.c_str() : API_URL)
-#define LLM_MODEL(a) (cfgModel.length() ? cfgModel.c_str() : (a).model)
-#define LLM_CUSTOM (cfgUrl.length() || cfgModel.length())
+String cfgKeyDs;                                    // второй ключ - родной DeepSeek (api.deepseek.com); вводится с телефона
+int cfgUseDs = 0;                                   // 1 - работаем через DeepSeek со вторым ключом (Настройки -> ИИ-сервис)
+#define LLM_ON_DS (cfgUseDs && cfgKeyDs.length())   // без второго ключа переключатель ничего не меняет
+#define LLM_URL ((!LLM_ON_DS && cfgUrl.length()) ? cfgUrl.c_str() : API_URL)
+#define LLM_MODEL(a) ((!LLM_ON_DS && cfgModel.length()) ? cfgModel.c_str() : (a).model)
+#define LLM_CUSTOM (!LLM_ON_DS && (cfgUrl.length() || cfgModel.length()))
+#define LLM_KEY (LLM_ON_DS ? cfgKeyDs : cfgKey)
 #endif
 String cfgSsid, cfgPass, cfgKey;                    // cfgSsid/cfgPass - сеть, к которой подключаемся сейчас
 // Запомненные сети (до 5): дом, телефон, школа... Плата по очереди пробует их, пока не подключится.
@@ -944,6 +949,8 @@ void loadSettings() {
 #if !ENABLE_BLE
   cfgUrl = prefs.getString("url", "");
   cfgModel = prefs.getString("mdl", "");
+  cfgKeyDs = prefs.getString("key2", "");
+  cfgUseDs = prefs.getUChar("useds", 0) ? 1 : 0;
 #endif
   cfgLang = prefs.getUChar("lang", LANG_RU);
   cfgBright = (int)prefs.getUChar("bri", 4);
@@ -1040,6 +1047,18 @@ void saveLlm(const String& u, const String& m) {
   prefs.end();
   cfgUrl = u;
   cfgModel = m;
+}
+
+void saveKeyDs(const String& key) {
+  prefs.begin("dsk", false);
+  prefs.putString("key2", key);
+  prefs.end();
+}
+
+void saveUseDs() {
+  prefs.begin("dsk", false);
+  prefs.putUChar("useds", (uint8_t)(cfgUseDs ? 1 : 0));
+  prefs.end();
 }
 #endif
 
@@ -2195,10 +2214,12 @@ String pageHead() {
                 "</style></head><body>";
 }
 
-String maskedKey() {
-  if (cfgKey.length() < 8) return "";
-  return cfgKey.substring(0, 3) + "..." + cfgKey.substring(cfgKey.length() - 4);
+String maskKey(const String& k) {
+  if (k.length() < 8) return "";
+  return k.substring(0, 3) + "..." + k.substring(k.length() - 4);
 }
+
+String maskedKey() { return maskKey(cfgKey); }
 
 int noteCount();
 bool addNote(const String& title, const String& text);
@@ -2816,6 +2837,16 @@ void handleRoot() {
 #if !ENABLE_BLE
   h += "<label>API: vsegpt, URL или пусто (DeepSeek)<input name='u' value='"; h += htmlEscape(cfgUrl); h += "'></label>";
   h += "<label>Model (openai/gpt-4o-mini ...)<input name='md' value='"; h += htmlEscape(cfgModel); h += "'></label>";
+  // второй ключ: родной DeepSeek. Переключение между ключами - на самом гаджете (Настройки -> ИИ-сервис)
+  h += "<label>";
+  h += L3("Второй ключ: DeepSeek (platform.deepseek.com)", "Second key: DeepSeek (platform.deepseek.com)", "第二个密钥：DeepSeek");
+  h += "<input name='k2' autocomplete='off' placeholder='sk-...'><small>";
+  h += L3("Пусто - оставить как есть. Переключиться на него можно на гаджете: Настройки -> ИИ-сервис.",
+          "Leave empty to keep the current one. Switch to it on the device: Settings -> AI service.",
+          "留空则保持不变。在设备上切换：设置 -> AI服务。");
+  String mk2 = maskKey(cfgKeyDs);
+  if (mk2.length()) { h += " ("; h += htmlEscape(mk2); h += ")"; }
+  h += "</small></label>";
 #endif
   h += "<button type='submit'>"; h += T().webSave; h += "</button></form>";
   // конспекты: текст с телефона сохраняется в память платы и читается без интернета
@@ -2893,6 +2924,12 @@ void handleSave() {
     changed = true;
   }
 #if !ENABLE_BLE
+  String key2 = server.arg("k2");
+  key2.trim();
+  if (key2.length()) {
+    saveKeyDs(key2);
+    changed = true;
+  }
   if (server.hasArg("md")) {
     String u = server.arg("u"), m = server.arg("md");
     u.trim();
@@ -3545,7 +3582,7 @@ bool blocksAdvice(int& slot, int& row, int& col, String& why) {
   if (!n) return false;
   int pick = 0;
   bool ai = false;
-  if (wifiOk() && cfgKey.length()) {
+  if (wifiOk() && LLM_KEY.length()) {
     drawGameHint(L3("DeepSeek думает...", "DeepSeek is thinking...", "DeepSeek思考中……"));
     std::vector<ChatMsg> none;
     String reply;
@@ -3742,6 +3779,63 @@ void drawSmallCenteredBg(const char* s, int y, uint16_t col, uint16_t bg) {
 }
 
 void drawSmallCentered(const char* s, int y, uint16_t col) { drawSmallCenteredBg(s, y, col, C_BLACK); }
+
+// ========================= ПРЕДУПРЕЖДЕНИЕ О ЗАРЯДЕ =========================
+// Предупреждение на весь экран: один раз, когда заряд упал до BAT_WARN_PCT, и ещё раз - до BAT_WARN2_PCT.
+// Снова «взводится», когда заряд поднялся выше BAT_REARM_PCT или подключили USB.
+// Показывается там, где вызывается admService(): главный экран, ввод текста, комната и т. п.
+// В играх (у них свой цикл) - после выхода из игры.
+const int BAT_WARN_PCT = 10;
+const int BAT_WARN2_PCT = 5;
+const int BAT_REARM_PCT = 15;
+
+void drawBatWarn(int pct) {
+  tft.fillScreen(C_BLACK);
+  tft.drawRect(0, 0, 240, 240, C_RED);
+  tft.drawRect(1, 1, 238, 238, C_RED);
+  const int bx = 70, by = 36;                        // большой значок батареи
+  tft.fillRect(bx, by, 96, 50, C_RED);
+  tft.fillRect(bx + 4, by + 4, 88, 42, C_BLACK);
+  tft.fillRect(bx + 96, by + 15, 8, 20, C_RED);
+  int fw = (80 * pct + 50) / 100;
+  if (fw < 4) fw = 4;                                // даже при 0% видна красная полоска
+  tft.fillRect(bx + 8, by + 8, fw, 34, C_RED);
+  bool last = pct <= BAT_WARN2_PCT;
+  drawSmallCenteredBg(last ? L3("БАТАРЕЯ РАЗРЯЖЕНА!", "BATTERY EMPTY!", "电量耗尽！")
+                           : L3("Низкий заряд", "Low battery", "电量低"), 104, C_RED, C_BLACK);
+  char b[16];
+  snprintf(b, sizeof(b), "%d%%", pct);
+  drawSmallCenteredBg(b, 128, C_YELLOW, C_BLACK);
+  drawSmallCenteredBg(L3("Подключите зарядку", "Plug in the charger", "请接上充电器"), 156, C_WHITE, C_BLACK);
+  drawSmallCenteredBg(last ? L3("Гаджет скоро выключится", "The device will switch off soon", "设备即将关机")
+                           : L3("Иначе гаджет выключится", "or it will switch off", "否则设备将关机"), 176, C_WHITE, C_BLACK);
+  drawSmallCenteredBg(L3("Кнопка - закрыть", "Press the button to close", "按键关闭"), 212, C_LIGHT, C_BLACK);
+}
+
+// true - экран был занят предупреждением, его нужно перерисовать.
+bool batWarnService() {
+  static int shown = 0;                              // 0 - не предупреждали, 1 - на BAT_WARN_PCT, 2 - на BAT_WARN2_PCT
+  if (!BATTERY_ENABLED) return false;
+  updateBattery();                                   // сама спрашивает АЦП не чаще раза в 5 секунд
+  int p = batShownPct;
+  if (p == -1 || p > BAT_REARM_PCT) shown = 0;       // USB или зарядили - снова взводим
+  if (p < 0 || screenAsleep) return false;           // не измерено / USB; спящий экран не будим (покажем позже)
+  int level = p <= BAT_WARN2_PCT ? 2 : p <= BAT_WARN_PCT ? 1 : 0;
+  if (level <= shown) return false;
+  shown = level;
+  noteActivity();                                    // пока читают, экран не погаснет
+  drawBatWarn(p);
+  static const uint16_t alarm[] = {1800, 120, 0, 80, 1800, 120, 0, 80, 1200, 250};
+  playNotes(1, alarm, 5);
+  uint32_t t0 = millis();
+  while (millis() - t0 < 30000) {                    // ждём кнопку; не дождались - возвращаемся к делам
+    BtnEvent e = btnEvent();
+    if (screenAsleep) break;
+    if (e != EV_NONE && millis() - t0 > 600) break;  // первые 0,6 с игнорируем: могли ещё нажимать кнопку
+    delay(10);
+  }
+  return true;
+}
 
 // ========================= 2048 =========================
 g2048::Game g48;
@@ -5339,7 +5433,7 @@ int apiCall(const Attempt& a, const char* system, const std::vector<ChatMsg>& hi
   http.setTimeout(HTTP_TIMEOUT_MS);
   if (!http.begin(client, LLM_URL)) return -100;
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", String("Bearer ") + cfgKey);
+  http.addHeader("Authorization", String("Bearer ") + LLM_KEY);
   int code = http.POST(body);
   if (code == 200 && stream) {
     SseSink sink;
@@ -5376,7 +5470,7 @@ String errorText(int code, const String& payload) {
 // true = в result текст ответа, false = в result текст ошибки.
 bool askWith(const char* system, const std::vector<ChatMsg>& history, const String& question, int maxTokens,
              String& result) {
-  if (cfgKey.length() == 0) {
+  if (LLM_KEY.length() == 0) {
     result = T().errNoKey;
     return false;
   }
@@ -9788,6 +9882,7 @@ bool admCountdown(const String& what) {
 bool admService() {
   sdRetryService();
   bool used = bleService();                          // заодно: уведомления с телефона по Bluetooth
+  if (batWarnService()) used = true;                 // заодно: предупреждение о критическом заряде
   if (admPendingAnn.length()) {
     String t = admPendingAnn;
     admPendingAnn = "";
@@ -10431,6 +10526,10 @@ bool runSettings() {
 #if BOARD_S3
     items.insert(items.end() - 1, String(L3("Озвучка ответов", "Read answers aloud", "朗读回答")));
 #endif
+#if !ENABLE_BLE
+    const int idxAi = (int)items.size() - 1;         // «ИИ-сервис» встаёт перед «Назад»
+    items.insert(items.end() - 1, String(L3("ИИ-сервис", "AI service", "AI服务")));
+#endif
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -10462,7 +10561,29 @@ bool runSettings() {
 #if BOARD_S3
     right[19] = cfgSpeakBoot ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
 #endif
+#if !ENABLE_BLE
+    right[idxAi] = !cfgKeyDs.length() ? L3("нет ключа", "no key", "无密钥") : cfgUseDs ? "DeepSeek" : L3("основной", "main", "主要");
+#endif
     sel = listScreen(L3("Настройки", "Settings", "设置"), items, right, sel);
+#if !ENABLE_BLE
+    if (sel == idxAi) {                              // переключить основной сервис <-> DeepSeek со вторым ключом
+      if (!cfgKeyDs.length()) {
+        viewAnswer(L3("Второго ключа нет. На телефоне: Wi-Fi и ключ -> поле «Второй ключ: DeepSeek».",
+                      "There is no second key. On the phone: Wi-Fi and key -> the \"Second key: DeepSeek\" field.",
+                      "没有第二个密钥。请在手机上：Wi-Fi和密钥 -> “第二个密钥：DeepSeek”。"),
+                   C_YELLOW);
+        continue;
+      }
+      cfgUseDs = !cfgUseDs;
+      saveUseDs();
+      bestAttempt = 0;                               // у сервисов разные имена моделей - подбор начинаем заново
+      sndOk();
+      showMsg(cfgUseDs ? L3("Теперь: DeepSeek", "Now: DeepSeek", "当前：DeepSeek")
+                       : L3("Теперь: основной сервис", "Now: main service", "当前：主要服务"), C_GREEN);
+      delay(900);
+      continue;
+    }
+#endif
     switch (sel) {
       case 0:
         cfgLang = (cfgLang + 1) % (ENABLE_CJK ? N_LANGS : 2);
@@ -13090,7 +13211,7 @@ chess::Move chessOpponentMove(int opp, String& say) {
   if (!n) return 0;
   chsEng.pause = chessPause;
   chsEng.rnd = gameRandom;
-  if (opp == 0 && wifiOk() && cfgKey.length()) {
+  if (opp == 0 && wifiOk() && LLM_KEY.length()) {
     chessStatus(L3("DeepSeek думает...", "DeepSeek is thinking...", "DeepSeek思考中……"), C_YELLOW);
     std::string sys = std::string("You are playing chess as Black against a human. You get the position in FEN and the list of "
                                   "legal moves. Choose a strong move. Reply in exactly this format:\nMOVE: one move copied from "
