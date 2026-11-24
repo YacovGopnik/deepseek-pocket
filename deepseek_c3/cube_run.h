@@ -16,7 +16,7 @@ struct Block { int x, width, height; };
 struct Spike { int x, height; };
 
 constexpr Block blocks[] = {
-    {10 * BEAT, 120, 20}, {14 * BEAT, 60, 30},
+    {10 * BEAT, 144, 16}, {14 * BEAT, 90, 24},
     {20 * BEAT, 180, 24}, {24 * BEAT, 90, 36},
     {31 * BEAT, 72, 24}, {33 * BEAT, 96, 38}, {36 * BEAT, 108, 22},
     {43 * BEAT, 120, 28}, {47 * BEAT, 120, 36},
@@ -26,8 +26,8 @@ constexpr Block blocks[] = {
 };
 
 constexpr Spike spikes[] = {
-    {4 * BEAT, 0}, {7 * BEAT, 0}, {7 * BEAT + SPIKE_W, 0},
-    {13 * BEAT, 0}, {17 * BEAT, 0}, {18 * BEAT, 0},
+    {4 * BEAT, 0}, {7 * BEAT, 0},
+    {17 * BEAT, 0}, {18 * BEAT, 0},
     {22 * BEAT, 24}, {27 * BEAT, 0}, {27 * BEAT + SPIKE_W, 0},
     {35 * BEAT, 0}, {39 * BEAT, 0}, {40 * BEAT, 0},
     {44 * BEAT, 28}, {46 * BEAT, 0}, {50 * BEAT, 0},

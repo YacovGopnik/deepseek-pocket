@@ -2130,7 +2130,8 @@ uint8_t joyEvent() {
 int joyVertical(uint8_t d) { return d == J_UP ? -1 : d == J_DOWN ? 1 : 0; }
 
 // Короткое нажатие срабатывает при отпускании, долгое - сразу по истечении времени.
-BtnEvent btnEvent() {
+BtnEvent readButtonEvent(bool* pressed) {
+  if (pressed) *pressed = false;
   static int last = HIGH;
   static uint32_t tChange = 0, tDown = 0;
   static bool longFired = false;
@@ -2162,6 +2163,7 @@ BtnEvent btnEvent() {
     if (v == LOW) {
       tDown = now;
       longFired = false;
+      if (pressed) *pressed = true;
     } else if (!longFired) {
       beep(2, 2200, 5);
       return EV_CLICK;
@@ -2174,6 +2176,8 @@ BtnEvent btnEvent() {
   }
   return EV_NONE;
 }
+
+BtnEvent btnEvent() { return readButtonEvent(nullptr); }
 
 BtnEvent waitButton() {
   for (;;) {
@@ -4771,9 +4775,9 @@ void drawCubeRunFrame(const cube_run::Game& runner) {
   tft.endWrite();
 }
 
-void drawCubeRunProgress(int progress, unsigned best) {
+void drawCubeRunProgress(int progress) {
   char line[32];
-  snprintf(line, sizeof(line), "%d%%   /   %u%%", progress, best);
+  snprintf(line, sizeof(line), "%d%%", progress);
   tft.fillRect(0, 0, 240, 32, CUBE_BG);
   drawSmallCenteredBg(line, 5, C_WHITE, CUBE_BG);
   tft.fillRect(12, 24, 216, 4, CUBE_FLOOR);
@@ -4784,7 +4788,7 @@ void runCubeRunner() {
   unsigned best = loadBestKey(CUBE_PROGRESS_KEY);
   cube_run::Game runner;
   tft.fillScreen(CUBE_BG);
-  drawCubeRunProgress(0, best);
+  drawCubeRunProgress(0);
   drawCubeRunFrame(runner);
   drawSmallCenteredBg(L3("Клик или вверх: старт", "Click or up: start", "短按或向上：开始"), 65, C_WHITE, CUBE_BG);
   drawSmallCenteredBg(L3("Удержание: выход", "Hold: exit", "长按：退出"), 83, C_LIGHT, CUBE_BG);
@@ -4792,13 +4796,14 @@ void runCubeRunner() {
   uint32_t next = millis();
   int lastProgress = 0;
   for (;;) {
-    BtnEvent e = btnEvent();
+    bool buttonPressed;
+    BtnEvent e = readButtonEvent(&buttonPressed);
     if (e == EV_LONG) {
       saveBestKey(CUBE_PROGRESS_KEY, best);
       return;
     }
     uint8_t j = joyEvent();
-    bool pressed = e == EV_CLICK || (j == J_UP && !g_joyRepeated);
+    bool pressed = (started ? buttonPressed : e == EV_CLICK) || (j == J_UP && !g_joyRepeated);
     if (pressed && !started) {
       started = true;
       next = millis();
@@ -4821,7 +4826,7 @@ void runCubeRunner() {
     int progress = runner.progress();
     if ((unsigned)progress > best) best = progress;
     if (progress != lastProgress) {
-      drawCubeRunProgress(progress, best);
+      drawCubeRunProgress(progress);
       lastProgress = progress;
     }
     if (!runner.over && !runner.finished) continue;
@@ -4832,7 +4837,10 @@ void runCubeRunner() {
         runner.finished ? L3("Финиш!", "Level complete!", "通关！")
                         : L3("Столкновение", "Crashed", "撞到了"),
         92, runner.finished ? C_GREEN : C_RED, C_BLACK);
-    drawSmallCenteredBg(L3("Клик или вверх: заново", "Click or up: retry", "短按或向上：重试"), 119, C_WHITE, C_BLACK);
+    char record[32];
+    snprintf(record, sizeof(record), "%s %u%%", L3("Рекорд", "Best", "最佳"), best);
+    drawSmallCenteredBg(record, 112, C_WHITE, C_BLACK);
+    drawSmallCenteredBg(L3("Клик или вверх: заново", "Click or up: retry", "短按或向上：重试"), 135, C_WHITE, C_BLACK);
     for (;;) {
       BtnEvent result = btnEvent();
       if (result == EV_LONG) return;
@@ -4843,7 +4851,7 @@ void runCubeRunner() {
     // The retry input starts the next attempt immediately.
     runner = cube_run::Game{};
     tft.fillScreen(CUBE_BG);
-    drawCubeRunProgress(0, best);
+    drawCubeRunProgress(0);
     lastProgress = 0;
     next = millis();
   }
