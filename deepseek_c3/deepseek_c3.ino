@@ -72,6 +72,7 @@
 #include "snake_game.h"
 #include "falling_game.h"
 #include "arcade_games.h"
+#include "cube_run.h"
 #include "ai_games.h"
 #include "race_game.h"
 #include "pixabay.h"
@@ -4676,6 +4677,93 @@ void runFlappy() {
         saveBestKey("bflap", fly.best);
         if (!gameOverBox(fly.score)) return;
         fly.reset();
+        break;
+      }
+    }
+  }
+}
+
+// ========================= КУБ-РАННЕР =========================
+const uint16_t CUBE_BG = 0x084D, CUBE_FLOOR = 0x190E, CUBE_GRID = 0x49B6;
+const uint16_t CUBE_BODY = 0x47FF, CUBE_SPIKE = 0xFBB1;
+const char CUBE_BEST_KEY[] = "bcube";
+
+void drawCubeRunFrame(const cube_run::Game& runner, const cube_run::Game& previous, int floorOffset) {
+  using namespace cube_run;
+  tft.startWrite();
+  tft.writeFillRect(CUBE_X, previous.cubeY(), CUBE_SIZE, CUBE_SIZE, CUBE_BG);
+  for (const Spikes& group : previous.spikes) {
+    if (group.count) tft.writeFillRect(group.x, GROUND_Y - SPIKE_H, group.count * SPIKE_W, SPIKE_H, CUBE_BG);
+  }
+  for (const Spikes& group : runner.spikes) {
+    for (uint8_t i = 0; i < group.count; ++i) {
+      int center = group.x + i * SPIKE_W + SPIKE_W / 2;
+      for (int h = 0; h < SPIKE_H; ++h) {
+        int half = spikeHalfWidth(h);
+        tft.writeFastHLine(center - half, GROUND_Y - 1 - h, 2 * half + 1, CUBE_SPIKE);
+      }
+    }
+  }
+  int y = runner.cubeY();
+  tft.writeFillRect(CUBE_X, y, CUBE_SIZE, CUBE_SIZE, runner.over ? C_RED : CUBE_BODY);
+  tft.writeFillRect(CUBE_X + 4, y + 4, 10, 10, CUBE_BG);
+  tft.writeFillRect(CUBE_X + 7, y + 7, 4, 4, C_WHITE);
+  tft.writeFillRect(0, GROUND_Y + 10, SCREEN_W, 3, CUBE_FLOOR);
+  for (int x = -floorOffset; x < SCREEN_W; x += 32) {
+    tft.writeFillRect(x, GROUND_Y + 10, 14, 3, CUBE_GRID);
+  }
+  tft.endWrite();
+}
+
+void runCubeRunner() {
+  uint32_t best = loadBestKey(CUBE_BEST_KEY);
+  for (;;) {
+    cube_run::Game runner;
+    tft.fillScreen(CUBE_BG);
+    tft.fillRect(0, cube_run::GROUND_Y, cube_run::SCREEN_W, 240 - cube_run::GROUND_Y, CUBE_FLOOR);
+    tft.drawFastHLine(0, cube_run::GROUND_Y, cube_run::SCREEN_W, CUBE_BODY);
+    drawScoreBar(0, best);
+    drawSmallCenteredBg(L3("Клик или вверх: прыжок", "Click or up: jump", "短按或向上：跳跃"), 54, C_WHITE, CUBE_BG);
+    drawSmallCenteredBg(L3("Удержание: выход", "Hold: exit", "长按：退出"), 72, C_LIGHT, CUBE_BG);
+    drawCubeRunFrame(runner, runner, 0);
+    bool started = false, jump = false;
+    uint32_t next = millis();
+    int floorOffset = 0;
+    for (;;) {
+      BtnEvent e = btnEvent();
+      if (e == EV_LONG) {
+        saveBestKey(CUBE_BEST_KEY, best);
+        return;
+      }
+      uint8_t j = joyEvent();
+      if (e == EV_CLICK || (j == J_UP && !g_joyRepeated)) {
+        jump = true;
+        if (!started) {
+          started = true;
+          tft.fillRect(0, 54, cube_run::SCREEN_W, 34, CUBE_BG);
+          next = millis();
+        }
+      }
+      uint32_t now = millis();
+      if (!started || (int32_t)(now - next) < 0) {
+        delay(1);
+        continue;
+      }
+      next += 20;
+      if ((int32_t)(now - next) >= 0) next = now + 20;
+      const cube_run::Game previous = runner;
+      runner.step(jump);
+      jump = false;
+      floorOffset = (floorOffset + previous.speed) % 32;
+      drawCubeRunFrame(runner, previous, floorOffset);
+      if (runner.score != previous.score) {
+        if (runner.score > best) best = runner.score;
+        drawScoreBar(runner.score, best);
+        beep(1, 1600, 10);
+      }
+      if (runner.over) {
+        saveBestKey(CUBE_BEST_KEY, best);
+        if (!gameOverBox(runner.score)) return;
         break;
       }
     }
@@ -14414,12 +14502,14 @@ void runGamesMenu() {
                                  L3("Шахматы по сети", "Chess online", "联网国际象棋"), L3("Шахматы рядом", "Chess nearby", "附近国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
                                  L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"),
+                                 L3("Куб-раннер", "Cube Runner", "方块跑酷"),
 #if !ENABLE_BLE
                                  L3("Пинг-понг рядом", "Pong nearby", "附近乒乓"),
 #endif
                                  T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", ""
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "",
+                          CUBE_BEST_KEY
 #if !ENABLE_BLE
                           , ""
 #endif
@@ -14458,8 +14548,9 @@ void runGamesMenu() {
       case 23: runFps3d(); break;
       case 24: runSandbox(); break;
       case 25: runHiScores(); break;
+      case 26: runCubeRunner(); break;
 #if !ENABLE_BLE
-      case 26: runPongNear(); break;
+      case 27: runPongNear(); break;
 #endif
       default: return;                               // «Назад» или удержание
     }
