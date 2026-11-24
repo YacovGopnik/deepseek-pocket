@@ -12972,8 +12972,6 @@ void runPongNear() {
   }
 }
 
-#else
-void runPongNear() { viewAnswer(L3("Нет в Bluetooth-сборке.", "Not in the Bluetooth build.", "蓝牙版中没有。"), C_YELLOW); }
 #endif
 
 // ========================= ШАХМАТЫ =========================
@@ -14253,9 +14251,16 @@ void runGamesMenu() {
                                  L3("Шахматы по сети", "Chess online", "联网国际象棋"), L3("Шахматы рядом", "Chess nearby", "附近国际象棋"),
                                  T().gQuiz, T().gStory, T().gGuess, L3("Подземелье 3D", "Dungeon 3D", "地牢3D"),
                                  L3("Песочница", "Sandbox", "沙盒"), L3("Рекорды игроков", "Players' records", "玩家记录"),
-                                 L3("Пинг-понг рядом", "Pong nearby", "附近乒乓"), T().menuBack};
+#if !ENABLE_BLE
+                                 L3("Пинг-понг рядом", "Pong nearby", "附近乒乓"),
+#endif
+                                 T().menuBack};
     const char* keys[] = {"best", "b2048", "bsnake", "bfall", "bmaze", "bmem", "bpong", "bflap", "brace", "brider",
-                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", "", "", ""};
+                          "bbrk", "binv", "bmines", "bsimon", "bttt", "", "", "bchess", "bchnet", "", "bquiz", "", "bguess", "bfps", "", ""
+#if !ENABLE_BLE
+                          , ""
+#endif
+                          , ""};
     std::vector<String> right;
     for (size_t i = 0; i < names.size(); i++) {
       uint32_t v = keys[i][0] ? loadBestKey(keys[i]) : 0;
@@ -14290,7 +14295,9 @@ void runGamesMenu() {
       case 23: runFps3d(); break;
       case 24: runSandbox(); break;
       case 25: runHiScores(); break;
+#if !ENABLE_BLE
       case 26: runPongNear(); break;
+#endif
       default: return;                               // «Назад» или удержание
     }
   }
