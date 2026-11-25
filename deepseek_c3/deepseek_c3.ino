@@ -15282,48 +15282,26 @@ void runPhonePad() {
 void debugLive(bool pins) {
   KeepAwake awake;
   uint32_t last = 0;
-  tft.fillScreen(C_BLACK);
   for (;;) {
-    if (!last || millis() - last >= 400) {
+    if (!last || millis() - last >= 500) {
       last = millis();
-      SmallFont small;
-      char b[64];
-      tft.fillRect(0, 0, 240, 240, C_BLACK);
-      drawUtf8(pins ? "GPIO / ADC" : "SYSTEM", 4, 4, C_GREEN, C_BLACK);
+      char b[250];
       if (pins) {
         int dx, dy;
         joyPhysical(dx, dy);
-        snprintf(b, sizeof(b), "X GPIO%d ADC %d", PIN_JOY_X, joyRead(PIN_JOY_X));
-        drawUtf8(b, 4, 34, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "Y GPIO%d ADC %d", PIN_JOY_Y, joyRead(PIN_JOY_Y));
-        drawUtf8(b, 4, 58, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "SW GPIO%d %s", PIN_SW, digitalRead(PIN_SW) == LOW ? "LOW" : "HIGH");
-        drawUtf8(b, 4, 82, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "dx %d  dy %d", dx, dy);
-        drawUtf8(b, 4, 106, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "SCK %d MOSI %d DC %d", PIN_SCK, PIN_MOSI, PIN_DC);
-        drawUtf8(b, 4, 138, C_LIGHT, C_BLACK);
-        snprintf(b, sizeof(b), "BLK %d", PIN_BLK);
-        drawUtf8(b, 4, 162, C_LIGHT, C_BLACK);
+        snprintf(b, sizeof(b), "GPIO / ADC\nX GPIO%d ADC %d\nY GPIO%d ADC %d\nSW GPIO%d %s\ndx %d dy %d\nSCK %d MOSI %d\nDC %d BLK %d",
+                 PIN_JOY_X, joyRead(PIN_JOY_X), PIN_JOY_Y, joyRead(PIN_JOY_Y),
+                 PIN_SW, digitalRead(PIN_SW) == LOW ? "LOW" : "HIGH", dx, dy,
+                 PIN_SCK, PIN_MOSI, PIN_DC, PIN_BLK);
       } else {
-        snprintf(b, sizeof(b), "%s  v%d", BOARD_S3 ? "ESP32-S3" : "ESP32-C3", (int)FW_VERSION);
-        drawUtf8(b, 4, 28, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "Heap: %u B", (unsigned)ESP.getFreeHeap());
-        drawUtf8(b, 4, 50, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "Largest: %u B", (unsigned)ESP.getMaxAllocHeap());
-        drawUtf8(b, 4, 72, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "PSRAM: %u B", (unsigned)ESP.getFreePsram());
-        drawUtf8(b, 4, 94, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "Uptime: %lu s", (unsigned long)(millis() / 1000));
-        drawUtf8(b, 4, 116, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "Reset reason: %d", (int)esp_reset_reason());
-        drawUtf8(b, 4, 138, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "Wi-Fi: %s  SD: %s", WiFi.status() == WL_CONNECTED ? "OK" : "OFF", sdOk ? "OK" : "OFF");
-        drawUtf8(b, 4, 160, C_WHITE, C_BLACK);
-        snprintf(b, sizeof(b), "BLE: %s  ACC: %s", ENABLE_BLE && cfgBle ? "ON" : "OFF", accOk ? "OK" : "OFF");
-        drawUtf8(b, 4, 182, C_LIGHT, C_BLACK);
+        snprintf(b, sizeof(b), "%s v%d\nHeap: %u B\nLargest: %u B\nPSRAM: %u B\nUptime: %lu s\nReset: %d\nWi-Fi:%s SD:%s\nBLE:%s ACC:%s",
+                 BOARD_S3 ? "ESP32-S3" : "ESP32-C3", (int)FW_VERSION,
+                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getFreePsram(),
+                 (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
+                 WiFi.status() == WL_CONNECTED ? "OK" : "OFF", sdOk ? "OK" : "OFF",
+                 ENABLE_BLE && cfgBle ? "ON" : "OFF", accOk ? "OK" : "OFF");
       }
-      drawUtf8(L3("Удержание: назад", "Hold: back", "长按返回"), 4, 216, C_LIGHT, C_BLACK);
+      showMsg(String(b) + L3("\nУдержание: назад", "\nHold: back", "\n长按返回"), C_GREEN);
     }
     joyEvent();
     if (btnEvent() == EV_LONG) return;
