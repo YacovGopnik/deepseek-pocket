@@ -1960,6 +1960,12 @@ struct UiPause {
 #include "driver/touch_sens.h"
 #endif
 const uint32_t TOUCH_MAX_COUNT = 0x3FFFFF;
+void touchCalScreen();
+uint16_t touchRatio[6] = {83,83,83,83,83,83}; // threshold per mille
+uint32_t touchDelta(uint32_t b, int i) {
+  uint32_t d = (uint64_t)b * touchRatio[i] / 1000;
+  return d < 3 ? 3 : d;
+}
 const int TOUCH_PINS[6] = {4, 5, 6, 13, 14, 7};             // вверх, вниз, влево, вправо
 const int PIN_VIBRO = 40;                            // вибромотор через транзистор
 #endif
@@ -2069,6 +2075,14 @@ void touchInit() {
   pinMode(PIN_VIBRO, OUTPUT);
   digitalWrite(PIN_VIBRO, LOW);
   if (!cfgTouch || cfgSd) return;
+  prefs.begin("dsk", true);
+  uint16_t saved[6] = {};
+  if (prefs.getBytesLength("touchcal") == sizeof(saved) &&
+      prefs.getBytes("touchcal", saved, sizeof(saved)) == sizeof(saved)) {
+    for (int i = 0; i < 6; ++i)
+      if (saved[i] >= 10 && saved[i] <= 4000) touchRatio[i] = saved[i];
+  }
+  prefs.end();
   touchReady = touchCalibrateValues(touchBase);
   if (!touchReady) debugLog("touch scan error: %d\n", touchScanError);
   debugLog("touch base: %u %u %u %u\n", (unsigned)touchBase[0], (unsigned)touchBase[1], (unsigned)touchBase[2], (unsigned)touchBase[3]);
@@ -2080,33 +2094,51 @@ uint8_t touchActive = 0;
 uint8_t touchCachedDir = J_NONE;
 
 void touchPoll() {
-  static uint32_t last = 0;
+  static uint32_t last = 0, heldAt[6] = {};
+  static uint8_t streak[6] = {}, blocked = 0;
   if (!touchReady || !cfgTouch || cfgSd) {
-    touchActive = 0;
-    touchCachedDir = J_NONE;
+    touchActive = 0; touchCachedDir = J_NONE;
+    memset(streak, 0, sizeof(streak)); blocked = 0;
     return;
   }
   if (millis() - last < 15) return;
   last = millis();
   uint8_t prev = touchActive;
   uint32_t values[6];
-  touchActive = 0;
-  touchCachedDir = J_NONE;
-  if (!touchScan(values)) return;
+  touchActive = 0; touchCachedDir = J_NONE;
+  if (!touchScan(values)) { memset(streak, 0, sizeof(streak)); return; }
   static const uint8_t dirs[4] = {J_UP, J_DOWN, J_LEFT, J_RIGHT};
   uint32_t best = 0;
   for (int i = 0; i < touchCount(); ++i) {
-    uint32_t v = values[i], b = touchBase[i];
-    if (b == 0 || b + b / 12 >= TOUCH_MAX_COUNT) continue;
+    uint32_t v = values[i], b = touchBase[i], delta = touchDelta(b, i);
+    uint8_t bit = 1 << i;
+    if (!b || b + delta >= TOUCH_MAX_COUNT || v >= TOUCH_MAX_COUNT) {
+      streak[i] = 0; continue;
+    }
     uint32_t over = v > b ? v - b : 0;
-    if (over > b / 12) {
-      touchActive |= 1 << i;
-      if (i < 4 && over > best) {
-        best = over;
-        touchCachedDir = dirs[i];
-      }
-    } else if (over < b / 40) {
-      touchBase[i] = (b * 63 + v) / 64;
+    uint32_t release = (delta * 2 + 2) / 3;
+    bool was = prev & bit;
+    if (over <= release) blocked &= ~bit;
+    bool candidate = over > (was ? release : delta);
+    if (!candidate) {
+      streak[i] = 0;
+      // Signed division avoids the old downward rounding bias of the baseline.
+      if (!was && over <= release)
+        touchBase[i] = b + ((int32_t)v - (int32_t)b) / 64;
+      continue;
+    }
+    if (blocked & bit) continue;
+    if (!was && ++streak[i] < 2) continue;
+    streak[i] = 2;
+    if (!was) heldAt[i] = last;
+    // Menus must not scroll forever when a direction becomes stuck.
+    if (i < 4 && !g_inGame && last - heldAt[i] >= 6000) {
+      blocked |= bit; streak[i] = 0; continue;
+    }
+    touchActive |= bit;
+    if (i < 4) {
+      uint32_t score = (uint64_t)over * 1000 / delta;
+      if (score > best) { best = score; touchCachedDir = dirs[i]; }
     }
   }
   if (touchActive & ~prev) vibe(18);
@@ -10877,6 +10909,7 @@ bool runSettings() {
     const int idxAi = (int)items.size() - 1;         // «ИИ-сервис» встаёт перед «Назад»
     items.insert(items.end() - 1, String(L3("ИИ-сервис", "AI service", "AI服务")));
 #endif
+    if (touchOnly()) items[6] = L3("Калибровка сенсоров", "Touch calibration", "触摸校准");
     std::vector<String> right;
     right.push_back(T().langName);
     right.push_back(String(BRIGHT_PCT[cfgBright]) + "%");
@@ -10886,7 +10919,7 @@ bool runSettings() {
     right.push_back(cfgLang == LANG_RU ? IDLE_RU[cfgIdle] : IDLE_EN[cfgIdle]);
     right.push_back(cfgSaver ? L3("часы", "clock", "时钟") : L3("нет", "off", "关"));
     right.push_back(String("UTC") + (cfgTz >= 0 ? "+" : "") + String(cfgTz));
-    right.push_back(String(L3("чувств. ", "sens. ", "灵敏度 ")) + String(cfgJoy + 1) + "/5");
+    right.push_back(touchOnly() ? String("Touch") : String(L3("чувств. ", "sens. ", "灵敏度 ")) + String(cfgJoy + 1) + "/5");
     right.push_back(torchOn ? L3("вкл", "on", "开") : L3("выкл", "off", "关"));
     right.push_back(String((int)netSsid.size()) + L3(" сет.", " net.", " 个"));
     right.resize(items.size());
@@ -10961,6 +10994,9 @@ bool runSettings() {
         if (ntpStarted) startNtp();
         break;
       case 6: {
+#if BOARD_S3
+        if (touchOnly()) { touchCalScreen(); break; }
+#endif
 #if !ENABLE_JOYCAL
         cfgJoy = (cfgJoy + 1) % 5;
         saveScreenSettings();
@@ -11072,7 +11108,9 @@ bool runSettings() {
         }
         std::vector<String> modes = splitBar(L3("Выключено|4 направления|6 кнопок + BOOT|Только сенсоры|Назад",
                                                "Off|4 directions|6 keys + BOOT|Touch only|Back", "关闭|四方向|六键+BOOT|仅触摸|返回"));
+        if (cfgTouch) modes.insert(modes.end() - 1, L3("Калибровка", "Calibrate", "校准"));
         int mode = choiceScreen(L3("Сенсорные кнопки", "Touch buttons", "触摸按键"), modes);
+        if (cfgTouch && mode == 4) { touchCalScreen(); break; }
         if (mode < 0 || mode > 3 || mode == cfgTouch) break;
         if (mode >= 2) {
           std::vector<String> confirm = splitBar(L3("Включить и перезапустить|Назад", "Enable and restart|Back", "开启并重启|返回"));
@@ -15487,6 +15525,52 @@ void debugJournal() {
 }
 
 #if BOARD_S3
+// Guided calibration: no touch navigation is used while taking measurements.
+void touchCalScreen() {
+  KeepAwake awake;
+  uint32_t base[6] = {}, values[6] = {};
+  uint16_t ratio[6] = {83,83,83,83,83,83};
+  const char* names[] = {"UP", "DOWN", "LEFT", "RIGHT", "OK", "ESC"};
+  while (digitalRead(0) == LOW) delay(10);
+  for (int step = -1; step < touchCount(); ++step) {
+    for (int t = 3; t > 0; --t) {
+      tft.fillScreen(C_BLACK);
+      drawSmallCentered(step < 0 ? L3("Не трогайте кнопки", "Release all pads", "松开所有按键") :
+                        L3("Держите кнопку:", "Hold pad:", "按住按键："), 40, C_WHITE);
+      if (step >= 0) drawSmallCentered(names[step], 80, C_GREEN);
+      char n[8]; snprintf(n, sizeof(n), "%d", t);
+      drawSmallCentered(n, 120, C_YELLOW);
+      drawSmallCentered("BOOT: cancel", 200, C_LIGHT);
+      for (int k = 0; k < 100; ++k) {
+        if (digitalRead(0) == LOW) { while (digitalRead(0) == LOW) delay(10); return; }
+        delay(10);
+      }
+    }
+    if (!touchCalibrateValues(values)) {
+      viewAnswer(L3("Ошибка замера.", "Scan failed.", "测量失败。"), C_RED); return;
+    }
+    if (step < 0) { memcpy(base, values, sizeof(base)); continue; }
+    uint32_t b = base[step], v = values[step];
+    if (!b || v >= TOUCH_MAX_COUNT || v <= b || v-b < 6 || (uint64_t)(v-b)*1000/b < 20) {
+      String msg = String(names[step]) + ": " + L3("слабый сигнал. Повторите калибровку.", "Weak signal. Repeat calibration.", "信号弱，请重试。");
+      viewAnswer(msg, C_YELLOW); return;
+    }
+    uint32_t r = (uint64_t)(v-b)*400/b;
+    ratio[step] = r < 10 ? 10 : r > 4000 ? 4000 : r;
+  }
+  showMsg(L3("Отпустите все кнопки", "Release all pads", "松开所有按键"), C_YELLOW);
+  delay(1500);
+  if (!touchCalibrateValues(base)) return;
+  memcpy(touchBase, base, sizeof(base));
+  memcpy(touchRatio, ratio, sizeof(ratio));
+  touchReady = true; touchActive = 0; touchCachedDir = J_NONE;
+  prefs.begin("dsk", false);
+  bool saved = prefs.putBytes("touchcal", ratio, sizeof(ratio)) == sizeof(ratio);
+  prefs.end();
+  viewAnswer(saved ? L3("Калибровка сохранена.", "Calibration saved.", "校准已保存。") :
+                     L3("Ошибка сохранения.", "Save failed.", "保存失败。"), saved ? C_GREEN : C_YELLOW);
+}
+
 // Прямые показания touchRead независимо от включения сенсорного управления.
 void debugTouch() {
   if (cfgSd) {
@@ -15527,7 +15611,7 @@ void debugTouch() {
       bool okay = touchScan(values);
       for (int i = 0; i < touchCount(); ++i) {
         uint32_t v = values[i];
-        uint32_t threshold = base[i] + base[i] / 12;
+        uint32_t threshold = base[i] + touchDelta(base[i], i);
         bool saturated = base[i] == 0 || threshold >= TOUCH_MAX_COUNT;
         bool active = okay && !saturated && v > threshold;
         char line[48];
