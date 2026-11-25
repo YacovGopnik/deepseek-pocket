@@ -897,7 +897,9 @@ int cfgJoy = 2;           // чувствительность ручки: 0 (н�
 int cfgSd = 0;            // подключена SD-карта (вместо ИК-пульта, фонарика и пищалки)
 int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
-int cfgTouch = 0;         // 1 - сенсорные кнопки (площадки из меди) работают как ручка (только S3)
+int cfgTouch = 0;         // 0 off, 1 four directions, 2 six keys + BOOT
+bool touchSix() { return BOARD_S3 && cfgTouch == 2 && !cfgSd; }
+int physicalButtonPin() { return touchSix() ? 0 : PIN_SW; }
 int cfgTilt = 0;          // 1 - наклон гаджета управляет в играх (датчик ADXL345, только S3)
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
 // Насколько отклонить ручку (из 2048), чтобы сработало: середина шкалы - JOY_THRESHOLD.
@@ -964,7 +966,8 @@ void loadSettings() {
   if (cfgJoy < 0 || cfgJoy > 4) cfgJoy = 2;
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
   cfgTilt = prefs.getUChar("tilt", 0) ? 1 : 0;
-  cfgTouch = prefs.getUChar("touch", 0) ? 1 : 0;
+  cfgTouch = prefs.getUChar("touch", 0);
+  if (cfgTouch > 2) cfgTouch = 0;
   cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
   cfgSd = prefs.getUChar("sd", 0) ? 1 : 0;
@@ -1457,7 +1460,7 @@ void soundInit() {
   static bool aud = false;
   if (!aud) {
     aud = true;
-    audioInit();
+    if (!touchSix()) audioInit();
     prefs.begin("dsk", true);
     cfgIrRx = prefs.getUChar("irrx", 44);
     cfgMusicVol = prefs.getUChar("mvol", 6);
@@ -1585,12 +1588,13 @@ RTC_NOINIT_ATTR uint32_t holdReset;                  // перезапуск б�
 void holdWatchTask(void*) {
   uint32_t down = 0;
   for (;;) {
-    if (digitalRead(PIN_SW) == LOW) {
+    if (digitalRead(physicalButtonPin()) == LOW) {
       if (!down) down = millis();
       else if (millis() - down > HOLD_RESET_MS) {
         holdReset = HOLD_RESET_MAGIC;
         analogWrite(PIN_BLK, 0);                     // экран гаснет - видно, что сработало
         delay(200);
+        if (touchSix()) while (digitalRead(0) == LOW) vTaskDelay(pdMS_TO_TICKS(50));
         esp_restart();
       }
     } else {
@@ -1945,10 +1949,10 @@ struct UiPause {
 #include "driver/touch_sens.h"
 #endif
 const uint32_t TOUCH_MAX_COUNT = 0x3FFFFF;
-const int TOUCH_PINS[4] = {4, 5, 6, 13};             // вверх, вниз, влево, вправо
+const int TOUCH_PINS[6] = {4, 5, 6, 13, 14, 7};             // вверх, вниз, влево, вправо
 const int PIN_VIBRO = 40;                            // вибромотор через транзистор
 #endif
-uint32_t touchBase[4];
+uint32_t touchBase[6];
 bool touchReady = false;
 uint32_t vibroOffAt = 0;
 
@@ -1973,9 +1977,10 @@ void vibroService() {
 
 #if BOARD_S3
 int touchScanError = 0;
+int touchCount() { return touchSix() ? 6 : 4; }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 static touch_sensor_handle_t touchController = nullptr;
-static touch_channel_handle_t touchChannels[4] = {};
+static touch_channel_handle_t touchChannels[6] = {};
 static bool touchControllerEnabled = false;
 
 bool touchStartController() {
@@ -1990,7 +1995,7 @@ bool touchStartController() {
     channel.active_thresh[0] = 2000;
     channel.charge_speed = TOUCH_CHARGE_SPEED_7;
     channel.init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT;
-    for (int i = 0; i < 4 && err == ESP_OK; ++i)
+    for (int i = 0; i < touchCount() && err == ESP_OK; ++i)
       err = touch_sensor_new_channel(touchController, TOUCH_PINS[i], &channel, &touchChannels[i]);
     if (err == ESP_OK) err = touch_sensor_enable(touchController);
   }
@@ -2010,13 +2015,13 @@ bool touchStartController() {
 #endif
 
 bool touchScan(uint32_t* values) {
-  memset(values, 0, 4 * sizeof(uint32_t));
+  memset(values, 0, 6 * sizeof(uint32_t));
   if (cfgSd) return false;
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
   if (!touchStartController()) return false;
   esp_err_t err = touch_sensor_trigger_oneshot_scanning(touchController, 30);
   if (err == ESP_OK) {
-    for (int i = 0; i < 4 && err == ESP_OK; ++i)
+    for (int i = 0; i < touchCount() && err == ESP_OK; ++i)
       err = touch_channel_read_data(touchChannels[i], TOUCH_CHAN_DATA_TYPE_RAW, &values[i]);
   }
   touchScanError = err;
@@ -2027,23 +2032,23 @@ bool touchScan(uint32_t* values) {
     touchSetCycles(16, 100);
     configured = true;
   }
-  for (int i = 0; i < 4; ++i) values[i] = touchRead(TOUCH_PINS[i]);
+  for (int i = 0; i < touchCount(); ++i) values[i] = touchRead(TOUCH_PINS[i]);
   return true;
 #endif
 }
 
 bool touchCalibrateValues(uint32_t* base) {
-  uint64_t sums[4] = {};
-  uint32_t values[4];
+  uint64_t sums[6] = {};
+  uint32_t values[6];
   for (int k = 0; k < 8; ++k) {
     if (!touchScan(values)) {
-      memset(base, 0, 4 * sizeof(uint32_t));
+      memset(base, 0, 6 * sizeof(uint32_t));
       return false;
     }
-    for (int i = 0; i < 4; ++i) sums[i] += values[i];
+    for (int i = 0; i < touchCount(); ++i) sums[i] += values[i];
     delay(2);
   }
-  for (int i = 0; i < 4; ++i) base[i] = sums[i] / 8;
+  for (int i = 0; i < touchCount(); ++i) base[i] = sums[i] / 8;
   return true;
 }
 #endif
@@ -2059,33 +2064,48 @@ void touchInit() {
 #endif
 }
 
-// Какая площадка нажата (J_NONE - никакая). На S3 значение при касании растёт.
-uint8_t touchDir() {
 #if BOARD_S3
-  if (!touchReady || !cfgTouch) return J_NONE;
+uint8_t touchActive = 0;
+uint8_t touchCachedDir = J_NONE;
+
+void touchPoll() {
   static uint32_t last = 0;
-  static uint8_t cached = J_NONE, prev = J_NONE;
-  if (millis() - last < 15) return cached;
+  if (!touchReady || !cfgTouch || cfgSd) {
+    touchActive = 0;
+    touchCachedDir = J_NONE;
+    return;
+  }
+  if (millis() - last < 15) return;
   last = millis();
-  static const uint8_t DIRS[4] = {J_UP, J_DOWN, J_LEFT, J_RIGHT};
-  uint8_t d = J_NONE;
-  uint32_t best = 0, values[4];
-  if (!touchScan(values)) { cached = prev = J_NONE; return J_NONE; }
-  for (int i = 0; i < 4; i++) {
+  uint8_t prev = touchActive;
+  uint32_t values[6];
+  touchActive = 0;
+  touchCachedDir = J_NONE;
+  if (!touchScan(values)) return;
+  static const uint8_t dirs[4] = {J_UP, J_DOWN, J_LEFT, J_RIGHT};
+  uint32_t best = 0;
+  for (int i = 0; i < touchCount(); ++i) {
     uint32_t v = values[i], b = touchBase[i];
     if (b == 0 || b + b / 12 >= TOUCH_MAX_COUNT) continue;
     uint32_t over = v > b ? v - b : 0;
-    if (over > b / 12 && over > best) {             // касание: больше покоя на ~8%
-      best = over;
-      d = DIRS[i];
+    if (over > b / 12) {
+      touchActive |= 1 << i;
+      if (i < 4 && over > best) {
+        best = over;
+        touchCachedDir = dirs[i];
+      }
     } else if (over < b / 40) {
-      touchBase[i] = (b * 63 + v) / 64;              // покой медленно подстраивается (влажность, температура)
+      touchBase[i] = (b * 63 + v) / 64;
     }
   }
-  if (d != J_NONE && d != prev) vibe(18);            // отклик на новое касание
-  prev = d;
-  cached = d;
-  return d;
+  if (touchActive & ~prev) vibe(18);
+}
+#endif
+
+uint8_t touchDir() {
+#if BOARD_S3
+  touchPoll();
+  return touchCachedDir;
 #else
   return J_NONE;
 #endif
@@ -2140,7 +2160,14 @@ bool swDown() {
 #if BOARD_S3
   if (mir::inputFresh() && mir::inBtn) return true;
 #endif
-  return digitalRead(PIN_SW) == LOW || wpad::heldBtn();
+#if BOARD_S3
+  if (touchSix()) {
+    touchPoll();
+    if (touchActive & (1 << 4)) return true;
+  }
+  if (digitalRead(0) == LOW) return true;
+#endif
+  return digitalRead(physicalButtonPin()) == LOW || wpad::heldBtn();
 }
 
 void joyMapAxes(int& dx, int& dy, unsigned mapping) {
@@ -2264,6 +2291,22 @@ BtnEvent readButtonEvent(bool* pressed) {
   static uint8_t swallow = 0;            // 1 - нажатие разбудило экран, 2 - экран спрятан удержанием: ждём отпускания
   int v = swDown() ? LOW : HIGH;
   uint32_t now = millis();
+#if BOARD_S3
+  static bool escWasDown = false;
+  bool esc = touchSix() && (touchActive & (1 << 5));
+  bool escEdge = esc && !escWasDown;
+  escWasDown = esc;
+  if (escEdge) {
+    bool asleep = screenAsleep;
+    if (asleep) wakeScreen();
+    noteActivity();
+    last = v;
+    tChange = now;
+    longFired = true;
+    swallow = 0;
+    return asleep ? EV_NONE : EV_LONG;
+  }
+#endif
   if (swallow == 0 && v == LOW && screenAsleep) {
     wakeScreen();
     swallow = 1;
@@ -10838,7 +10881,7 @@ bool runSettings() {
     right[15] = !cfgSd ? (sdDiag != -9 ? String(L3("сбой ", "fail ", "失败 ")) + String(sdDiag) : String(L3("нет", "off", "关"))) : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     right[16] = !accOk ? L3("нет датчика", "no sensor", "无传感器") : cfgTilt ? L3("в играх", "in games", "游戏中") : L3("выкл", "off", "关");
-    right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
+    right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch == 2 ? "6 + BOOT" : cfgTouch ? "4" : L3("выкл", "off", "关");
 #if BOARD_S3
     right[18] = mir::on ? L3("идёт", "on", "开") : cfgMirBoot ? L3("при запуске", "on boot", "开机") : L3("выкл", "off", "关");
 #elif ENABLE_MIRVIEW
@@ -10960,6 +11003,10 @@ bool runSettings() {
         break;
       case 15: {
 #if BOARD_S3
+        if (!cfgSd && cfgTouch == 2) {
+          viewAnswer(L3("Сначала выключите режим 6 кнопок.", "Disable 6-key mode first.", "先关闭六键模式。"), C_YELLOW);
+          break;
+        }
         if (cfgSd && !sdOk) {                        // карта включена, но не нашлась - предлагаем проверку
           std::vector<String> ch = splitBar(L3("Проверить карту и провода|Выключить SD-карту|Назад",
                                                "Check the card and wires|Turn the SD card off|Back", "检查|关闭|返回"));
@@ -10999,30 +11046,32 @@ bool runSettings() {
       case 16:
         runTilt();
         break;
-      case 17:
-        if (!BOARD_S3) {
-          viewAnswer(L3("Сенсорные кнопки работают только на гаджете с ESP32-S3.", "Touch buttons work only on the ESP32-S3 gadget.", "仅ESP32-S3支持。"), C_YELLOW);
+      case 17: {
+#if BOARD_S3
+        if (cfgSd) {
+          viewAnswer(L3("Сначала отключите SD-карту.", "Disable SD first.", "先关闭SD卡。"), C_YELLOW);
           break;
         }
-        if (cfgSd && !cfgTouch) {
-          viewAnswer(L3("Площадки на выводах 4, 5, 6, 13 - сейчас они у SD-карты. Выключите SD-карту, чтобы проверить сенсорные кнопки.",
-                        "The pads use pins 4, 5, 6, 13, now taken by the SD card. Turn the SD card off to try touch buttons.", "引脚被SD卡占用。"),
-                     C_YELLOW);
-          break;
+        std::vector<String> modes = splitBar(L3("Выключено|4 направления|6 кнопок + BOOT|Назад",
+                                               "Off|4 directions|6 keys + BOOT|Back", "关闭|四方向|六键+BOOT|返回"));
+        int mode = choiceScreen(L3("Сенсорные кнопки", "Touch buttons", "触摸按键"), modes);
+        if (mode < 0 || mode > 2 || mode == cfgTouch) break;
+        if (mode == 2) {
+          std::vector<String> confirm = splitBar(L3("Включить и перезапустить|Назад", "Enable and restart|Back", "开启并重启|返回"));
+          if (choiceScreen(L3("GPIO14 OK, GPIO7 ESC, BOOT OK. Отсоедините SW от GPIO7 и звук I2S от GPIO14.",
+                              "GPIO14 OK, GPIO7 ESC, BOOT OK. Disconnect SW from GPIO7 and I2S from GPIO14.",
+                              "GPIO14确认，GPIO7返回。断开SW和I2S。"), confirm) != 0) break;
         }
-        cfgTouch = !cfgTouch;
+        cfgTouch = mode;
         saveScreenSettings();
-        if (cfgTouch) {
-          viewAnswer(L3("Сенсорные кнопки: вверх - 4, вниз - 5, влево - 6, вправо - 13 (квадратики медного скотча ~12x12 мм). "
-                        "Не трогайте площадки - сейчас запомню их «покой». Вибромотор - вывод 40 через транзистор.",
-                        "Touch buttons: up 4, down 5, left 6, right 13 (copper tape squares ~12x12 mm). Do not touch them now - calibrating. Vibration motor: pin 40 via a transistor.",
-                        "触摸按键：上4 下5 左6 右13。"),
-                     C_WHITE);
-          touchInit();
-        } else {
-          touchReady = false;
-        }
+        showMsg(L3("Перезапуск...", "Restarting...", "重启……"), C_GREEN);
+        delay(500);
+        esp_restart();
+#else
+        viewAnswer(L3("Только ESP32-S3.", "ESP32-S3 only.", "仅ESP32-S3。"), C_YELLOW);
+#endif
         break;
+      }
 #if ENABLE_MIRVIEW
       case 18:
         runMirrorSettings();
@@ -12565,7 +12614,7 @@ void runMirrorView() {
   } leave;
   uint32_t held = 0;                                 // с какого момента держат кнопку
   auto exitHeld = [&]() {
-    bool d = digitalRead(PIN_SW) == LOW;
+    bool d = digitalRead(physicalButtonPin()) == LOW;
     if (!d) {
       held = 0;
       return false;
@@ -12617,7 +12666,7 @@ void runMirrorView() {
     }
     // своя ручка и кнопка -> гаджету A (кнопку держим не дольше 1,5 с: дольше - это выход у нас)
     uint8_t d = joyRawDir();
-    bool down = digitalRead(PIN_SW) == LOW;
+    bool down = digitalRead(physicalButtonPin()) == LOW;
     if (down && !held) held = now;
     if (!down) held = 0;
     if (held && now - held > 3000) return;
@@ -12791,7 +12840,7 @@ void runWalkie() {
   uint32_t lastDraw = 0;
   for (;;) {
     if (joyRawDir() == J_LEFT) break;
-    bool talk = digitalRead(PIN_SW) == LOW;
+    bool talk = digitalRead(physicalButtonPin()) == LOW;
     int level = 0;
     if (talk) {
       size_t got = audioI2s.readBytes((char*)io, sizeof(io));
@@ -15370,7 +15419,7 @@ void debugLive(bool pins) {
         joyPhysical(dx, dy);
         snprintf(b, sizeof(b), "GPIO / ADC\nX GPIO%d ADC %d\nY GPIO%d ADC %d\nSW GPIO%d %s\ndx %d dy %d\nSCK %d MOSI %d\nDC %d BLK %d",
                  PIN_JOY_X, joyRead(PIN_JOY_X), PIN_JOY_Y, joyRead(PIN_JOY_Y),
-                 PIN_SW, digitalRead(PIN_SW) == LOW ? "LOW" : "HIGH", dx, dy,
+                 physicalButtonPin(), digitalRead(physicalButtonPin()) == LOW ? "LOW" : "HIGH", dx, dy,
                  PIN_SCK, PIN_MOSI, PIN_DC, PIN_BLK);
       } else {
         snprintf(b, sizeof(b), "%s v%d\nHeap: %u B\nLargest: %u B\nPSRAM: %u B\nUptime: %lu s\nReset: %d\nWi-Fi:%s SD:%s\nBLE:%s ACC:%s",
@@ -15428,10 +15477,10 @@ void debugTouch() {
     return;
   }
   KeepAwake awake;
-  uint32_t base[4] = {};
+  uint32_t base[6] = {};
   bool calibrate = true;
   uint32_t last = 0;
-  const char* names[] = {"UP", "DOWN", "LEFT", "RIGHT"};
+  const char* names[] = {"UP", "DOWN", "LEFT", "RIGHT", "OK", "ESC"};
   for (;;) {
     BtnEvent event = btnEvent();
     if (event == EV_LONG) return;
@@ -15449,29 +15498,29 @@ void debugTouch() {
       tft.fillScreen(C_BLACK);
       SmallFont small;
       drawUtf8("TOUCH / GPIO", 4, 4, C_GREEN, C_BLACK);
-      drawUtf8(L3("Сырое / покой / порог", "Raw / base / threshold", "原始/基线/阈值"), 4, 24, C_LIGHT, C_BLACK);
-      drawUtf8(L3("OK: повторить замер", "OK: recalibrate", "确认：校准"), 4, 204, C_LIGHT, C_BLACK);
-      drawUtf8(L3("Удержание: назад", "Hold: back", "长按返回"), 4, 222, C_LIGHT, C_BLACK);
+      if (!touchSix()) drawUtf8(L3("Сырое / покой / порог", "Raw / base / threshold", "原始/基线/阈值"), 4, 24, C_LIGHT, C_BLACK);
+      drawUtf8(L3("OK: повторить замер", "OK: recalibrate", "确认：校准"), 4, touchSix() ? 214 : 204, C_LIGHT, C_BLACK);
+      if (!touchSix()) drawUtf8(L3("Удержание: назад", "Hold: back", "长按返回"), 4, 222, C_LIGHT, C_BLACK);
     }
     if (!last || millis() - last >= 120) {
       last = millis();
       SmallFont small;
-      uint32_t values[4];
+      uint32_t values[6];
       bool okay = touchScan(values);
-      for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < touchCount(); ++i) {
         uint32_t v = values[i];
         uint32_t threshold = base[i] + base[i] / 12;
         bool saturated = base[i] == 0 || threshold >= TOUCH_MAX_COUNT;
         bool active = okay && !saturated && v > threshold;
         char line[48];
         snprintf(line, sizeof(line), "%s GPIO%d%s", names[i], TOUCH_PINS[i], !okay ? " ERR" : saturated ? " SAT" : active ? " *" : "");
-        int y = 46 + i * 38;
-        tft.fillRect(0, y, 240, 36, C_BLACK);
+        int y = touchSix() ? 20 + i * 32 : 44 + i * 38;
+        tft.fillRect(0, y, 240, touchSix() ? 32 : 36, C_BLACK);
         drawUtf8(line, 4, y, !okay || saturated ? C_RED : active ? C_GREEN : C_WHITE, C_BLACK);
         if (!okay) snprintf(line, sizeof(line), "ERR %d", touchScanError);
         else snprintf(line, sizeof(line), "%lu/%lu/%lu", (unsigned long)v,
                  (unsigned long)base[i], (unsigned long)threshold);
-        drawUtf8(line, 4, y + 17, C_LIGHT, C_BLACK);
+        drawUtf8(line, 4, y + (touchSix() ? 16 : 17), C_LIGHT, C_BLACK);
       }
     }
     delay(10);
@@ -15958,7 +16007,10 @@ void setup() {
 
   analogReadResolution(12);
   if (BATTERY_ENABLED) analogSetPinAttenuation(PIN_BAT, ADC_11db);
-  pinMode(PIN_SW, INPUT_PULLUP);
+  pinMode(physicalButtonPin(), INPUT_PULLUP);
+#if BOARD_S3
+  pinMode(0, INPUT_PULLUP);
+#endif
   bool afterHoldReset = holdReset == HOLD_RESET_MAGIC;
   holdReset = 0;
   if (afterHoldReset) debugLog("restarted by holding the button\n");
@@ -15991,12 +16043,12 @@ void setup() {
   // SD-карта (если включена в настройках). Защита: если прошлый запуск с картой не дошёл до конца
   // или при включении зажата кнопка джойстика - карта выключается, чтобы гаджет точно загрузился.
   if (cfgSd) {
-    pinMode(PIN_SW, INPUT_PULLUP);
+    pinMode(physicalButtonPin(), INPUT_PULLUP);
     delay(5);
     prefs.begin("dsk", false);
     bool failed = prefs.getUChar("sdboot", 0) != 0;
     // кнопка всё ещё зажата после аварийного перезапуска - это не просьба выключить карту
-    if (failed || (digitalRead(PIN_SW) == LOW && !afterHoldReset)) {
+    if (failed || (digitalRead(physicalButtonPin()) == LOW && !afterHoldReset)) {
       cfgSd = 0;
       prefs.putUChar("sd", 0);
       prefs.putUChar("sdboot", 0);
