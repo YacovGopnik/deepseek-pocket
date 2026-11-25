@@ -1102,10 +1102,13 @@ struct SmallFont {
   ~SmallFont() { g_big = prev; }
 };
 
-#if BOARD_S3
+#if BOARD_S3 || ENABLE_PCSCREEN
 // ---------- Трансляция экрана: копия всего, что рисуется, в памяти PSRAM ----------
 // Гаджет с разбитым экраном шлёт эту копию соседнему гаджету по ESP-NOW (см. «Трансляция экрана» ниже).
 namespace mir {
+constexpr int SIDE = BOARD_S3 ? 240 : 120;
+constexpr int SCALE = 240 / SIDE;
+bool usbActive = false;
 uint16_t* fb = nullptr;                               // 240x240, те же координаты, что у рисования
 bool fbTried = false;
 volatile uint8_t dirty[240];                          // строка изменилась: от dx0 до dx1
@@ -1115,9 +1118,15 @@ uint32_t wpos = 0;
 
 inline bool ready() {
   if (!fb && !fbTried) {
+#if BOARD_S3
     fbTried = true;
-    fb = (uint16_t*)ps_malloc(240 * 240 * 2);
-    if (fb) memset(fb, 0, 240 * 240 * 2);
+    fb = (uint16_t*)ps_malloc(SIDE * SIDE * 2);
+#else
+    if (!usbActive) return false;
+    fbTried = true;
+    fb = (uint16_t*)malloc(SIDE * SIDE * 2);
+#endif
+    if (fb) memset(fb, 0, SIDE * SIDE * 2);
   }
   return fb != nullptr;
 }
@@ -1141,10 +1150,12 @@ void shade(int x, int y, int w, int h, uint16_t c) {
   if (x + w > 240) w = 240 - x;
   if (y + h > 240) h = 240 - y;
   if (w <= 0 || h <= 0) return;
-  for (int yy = y; yy < y + h; yy++) {
-    uint16_t* r = fb + yy * 240 + x;
-    for (int i = 0; i < w; i++) r[i] = c;
+  for (int yy = (y + SCALE - 1) / SCALE * SCALE; yy < y + h; yy += SCALE) {
+    uint16_t* r = fb + yy / SCALE * SIDE;
+    for (int xx = (x + SCALE - 1) / SCALE * SCALE; xx < x + w; xx += SCALE) r[xx / SCALE] = c;
+#if BOARD_S3
     markRow(yy, x, x + w - 1);
+#endif
   }
 }
 void window(int x, int y, int w, int h) {
@@ -1160,7 +1171,8 @@ void pixels(const uint16_t* c, uint32_t n, bool bigEndian) {
     if (px < 0 || px >= 240 || py < 0 || py >= 240) continue;
     uint16_t v = c[i];
     if (bigEndian) v = (uint16_t)((v >> 8) | (v << 8));
-    fb[py * 240 + px] = v;
+    if (px % SCALE || py % SCALE) continue;
+    fb[(py / SCALE) * SIDE + px / SCALE] = v;
     if (py != lastRow) {
       if (lastRow >= 0) markRow(lastRow, ra, rb);
       lastRow = py;
@@ -2158,7 +2170,13 @@ uint8_t joyEvent() {
 int joyVertical(uint8_t d) { return d == J_UP ? -1 : d == J_DOWN ? 1 : 0; }
 
 // Короткое нажатие срабатывает при отпускании, долгое - сразу по истечении времени.
+#if ENABLE_PCSCREEN
+void pcMirrorPoll();
+#endif
 BtnEvent readButtonEvent(bool* pressed) {
+#if ENABLE_PCSCREEN
+  pcMirrorPoll();
+#endif
   if (pressed) *pressed = false;
   static int last = HIGH;
   static uint32_t tChange = 0, tDown = 0;
@@ -14771,7 +14789,74 @@ void pcFrame(int& lastW, int& lastH) {
   Serial.println("DSPC OK");
 }
 
+uint8_t pcMirrorMatched = 0;
+
+void pcMirrorStop() {
+  pcMirrorMatched = 0;
+  mir::usbActive = false;
+#if !BOARD_S3
+  free(mir::fb);
+  mir::fb = nullptr;
+  mir::fbTried = false;
+#endif
+}
+
+void pcMirrorPoll() {
+  if (!mir::usbActive || !mir::fb) return;
+  uint8_t& matched = pcMirrorMatched;
+  static const char magic[] = "DSR1";
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (matched < 4) {
+      matched = c == magic[matched] ? matched + 1 : c == 'D' ? 1 : 0;
+      continue;
+    }
+    matched = 0;
+    int y = c;
+    if (y >= mir::SIDE || y < 0) continue;
+    int rows = min(4, mir::SIDE - y);
+    static char line[4 * mir::SIDE * 4 + 32];
+    int pos = snprintf(line, sizeof(line), "DSPM %d %d ", mir::SIDE, y);
+    const char hex[] = "0123456789abcdef";
+    for (int n = 0; n < rows * mir::SIDE; ++n) {
+      uint16_t color = mir::fb[y * mir::SIDE + n];
+      line[pos++] = hex[color >> 12];
+      line[pos++] = hex[(color >> 8) & 15];
+      line[pos++] = hex[(color >> 4) & 15];
+      line[pos++] = hex[color & 15];
+    }
+    line[pos++] = '\n';
+    Serial.write((const uint8_t*)line, pos);
+    return;
+  }
+}
+
 void runPcScreen() {
+  std::vector<String> options = {
+    L3("ПК → гаджет", "PC to gadget", "电脑到设备"),
+    mir::usbActive ? L3("Остановить вывод на ПК", "Stop USB mirror", "停止屏幕共享")
+                   : L3("Гаджет → ПК", "Gadget to PC", "设备到电脑"),
+    L3("Назад", "Back", "返回")
+  };
+  int mode = choiceScreen(L3("Экран ПК", "PC screen", "电脑屏幕"), options);
+  if (mode == 1) {
+    if (mir::usbActive) {
+      pcMirrorStop();
+      return;
+    }
+    mir::usbActive = true;
+    if (!mir::ready()) {
+      pcMirrorStop();
+      viewAnswer(L3("Недостаточно памяти для трансляции.", "Not enough memory for mirroring.", "内存不足。"), C_RED);
+      return;
+    }
+    viewAnswer(L3("USB-трансляция включена. На ПК откройте pc.html и нажмите «Экран гаджета». Вернитесь в меню и пользуйтесь гаджетом.",
+                  "USB mirroring enabled. Open pc.html on PC and press Gadget screen. Return and use the gadget.",
+                  "USB共享已开启。电脑打开pc.html并选择设备屏幕。"), C_GREEN);
+    return;
+  }
+  if (mode != 0) return;
+  pcMirrorStop();
   pcIntro();
   KeepAwake awake;
   static const char MAGIC[4] = {'D', 'S', 'J', '1'};

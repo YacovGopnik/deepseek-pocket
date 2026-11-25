@@ -30,6 +30,8 @@
   #drop { border: 2px dashed var(--line); border-radius: 12px; padding: 18px; text-align: center; color: var(--muted); cursor: pointer; }
   #drop.over { border-color: var(--accent); color: var(--accent); }
   #log { font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); max-height: 120px; overflow: auto; white-space: pre-wrap; }
+  #mirrorPreview { display: block; max-width: 100%; aspect-ratio: 1; background: #000; image-rendering: pixelated; }
+  #mirrorPreview:fullscreen { width: 100vw !important; height: 100vh; object-fit: contain; }
   #fps { font-variant-numeric: tabular-nums; }
 </style>
 </head>
@@ -42,6 +44,18 @@
     <p class="hint">Нужен Chrome или Edge на компьютере. Гаджет подключите по USB и откройте на нём приложение <b>«Экран ПК»</b>. Монитор порта в Arduino IDE должен быть закрыт: порт может занять только одна программа.</p>
   </div>
 
+  <div class="card">
+    <h2>Экран гаджета → ПК</h2>
+    <p class="hint">На гаджете откройте «Экран ПК» → «Гаджет → ПК», затем вернитесь в меню.</p>
+    <canvas id="mirrorPreview" width="240" height="240" style="width:240px"></canvas>
+    <div class="row">
+      <button id="mirror" disabled>Экран гаджета</button>
+      <label>Масштаб <select id="zoom"><option>1</option><option>2</option><option>3</option></select>×</label>
+      <button id="fullscreen" class="sec">На весь экран</button>
+      <button id="snapshot" class="sec" disabled>Скриншот</button>
+      <span id="mirrorStatus" class="hint"></span>
+    </div>
+  </div>
   <div class="grid">
     <div>
       <div class="card">
@@ -89,6 +103,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let port = null, writer = null, ready = false, busy = false;
+let mirroring = false, mirrorPending = null, mirrorRunning = false;
 let pending = null;                // ожидание ответа гаджета
 let picture = null;                // выбранная картинка (ImageBitmap)
 let stream = null, video = null, casting = false;
@@ -101,8 +116,10 @@ function setState(t, cls) {
   $("state").textContent = t;
   $("state").className = cls || "";
   const can = !!writer;
-  $("show").disabled = $("save").disabled = !(can && picture);
-  $("cast").disabled = !can && !casting;
+  $("show").disabled = $("save").disabled = !(can && picture) || mirroring || mirrorRunning || casting || busy;
+  $("cast").disabled = (!can && !casting) || mirroring || mirrorRunning || (busy && !casting);
+  $("mirror").disabled = !can || casting || busy || (mirrorRunning && !mirroring);
+  $("mirror").textContent = mirroring ? "Остановить просмотр" : "Экран гаджета";
 }
 
 // ---------- связь ----------
@@ -111,6 +128,7 @@ async function connect() {
     setState("этот браузер не умеет работать с USB-портом — откройте страницу в Chrome или Edge на компьютере", "err");
     return;
   }
+  if (writer) return;
   try {
     port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
     await port.open({ baudRate: 115200, bufferSize: 8192 });
@@ -141,19 +159,36 @@ async function readLoop() {
         part = part.slice(i + 1);
         onLine(line);
       }
-      if (part.length > 2000) part = "";
+      if (part.length > 8192) part = "";
     }
   } catch (e) {
     log("связь потеряна: " + e.message);
   }
   reader.releaseLock();
+  if (writer) { try { writer.releaseLock(); } catch (_) {} }
   writer = null;
+  if (port) await port.close().catch(() => {});
+  port = null;
+  stopMirror();
   ready = false;
   stopCast();
   setState("отключено", "err");
 }
 
 function onLine(line) {
+  const mirror = line.indexOf("DSPM ");
+  if (mirror >= 0) {
+    if (mirrorPending) {
+      const p = mirrorPending;
+      const parts = /^DSPM (120|240) (\d+) ([0-9a-f]+)$/.exec(line.slice(mirror));
+      if (parts && +parts[2] === p.y) {
+        mirrorPending = null;
+        clearTimeout(p.timer);
+        p.resolve({ width: +parts[1], y: +parts[2], hex: parts[3] });
+      }
+    }
+    return;
+  }
   const i = line.indexOf("DSPC ");
   if (i < 0) return;                                  // прочие строки - журнал прошивки
   const msg = line.slice(i + 5);
@@ -240,8 +275,9 @@ async function setPicture(fileOrBlob) {
 }
 
 async function showPicture(save) {
-  if (!picture || busy) return;
+  if (!picture || busy || casting || mirroring || mirrorRunning) return;
   busy = true;
+  setState($("state").textContent, $("state").className);
   try {
     // галерея гаджета показывает картинки 240×200 и хранит файлы до 40 КБ
     const c = save ? renderPicture(240, 200) : renderPicture(240, 240);
@@ -253,14 +289,20 @@ async function showPicture(save) {
     log("ошибка: " + e.message);
   }
   busy = false;
+  setState($("state").textContent, $("state").className);
 }
 
 // ---------- трансляция ----------
 async function startCast() {
+  if (!writer || busy || mirroring || mirrorRunning) return;
+  busy = true;
+  setState($("state").textContent, $("state").className);
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
   } catch (e) {
     log("трансляция отменена");
+    busy = false;
+    setState($("state").textContent, $("state").className);
     return;
   }
   video = document.createElement("video");
@@ -269,6 +311,8 @@ async function startCast() {
   await video.play();
   stream.getVideoTracks()[0].addEventListener("ended", stopCast);
   casting = true;
+  busy = false;
+  setState($("state").textContent, $("state").className);
   $("cast").textContent = "Остановить трансляцию";
   log("трансляция началась");
   castLoop();
@@ -286,6 +330,7 @@ function stopCast() {
 }
 
 async function castLoop() {
+  busy = true;
   const c = $("preview"), ctx = c.getContext("2d");
   let frames = 0, t0 = performance.now();
   while (casting) {
@@ -307,7 +352,92 @@ async function castLoop() {
     const wait = 1000 / +$("rate").value - (performance.now() - start);
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   }
+  busy = false;
+  setState($("state").textContent, $("state").className);
 }
+
+// ---------- гаджет -> ПК ----------
+async function requestRows(y) {
+  const reply = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      mirrorPending = null;
+      reject(new Error("Нет ответа. Включите «Гаджет → ПК» на устройстве."));
+    }, 1800);
+    mirrorPending = { y, resolve, reject, timer };
+  });
+  try {
+    await writer.write(new Uint8Array([68, 83, 82, 49, y]));
+  } catch (error) {
+    const p = mirrorPending;
+    if (p) { clearTimeout(p.timer); mirrorPending = null; p.reject(error); }
+  }
+  return reply;
+}
+
+function decodeRows(packet, image) {
+  const width = packet.width;
+  const count = Math.min(4, width - packet.y) * width;
+  if (packet.hex.length !== count * 4 || image.width !== width) throw new Error("Повреждённый кадр");
+  for (let i = 0; i < count; i++) {
+    const color = parseInt(packet.hex.slice(i * 4, i * 4 + 4), 16);
+    const offset = (packet.y * width + i) * 4;
+    image.data[offset] = Math.round((color >> 11) * 255 / 31);
+    image.data[offset + 1] = Math.round(((color >> 5) & 63) * 255 / 63);
+    image.data[offset + 2] = Math.round((color & 31) * 255 / 31);
+    image.data[offset + 3] = 255;
+  }
+}
+
+function stopMirror() {
+  mirroring = false;
+  $("mirrorStatus").textContent = "Просмотр остановлен";
+  setState($("state").textContent, $("state").className);
+}
+
+async function startMirror() {
+  if (!writer || busy || casting || mirrorRunning) return;
+  mirroring = mirrorRunning = true;
+  setState($("state").textContent, $("state").className);
+  $("mirrorStatus").textContent = "Ожидание гаджета…";
+  const canvas = $("mirrorPreview"), ctx = canvas.getContext("2d");
+  try {
+    while (mirroring && writer) {
+      const start = performance.now();
+      const first = await requestRows(0);
+      const width = first.width;
+      const image = ctx.createImageData(width, width);
+      decodeRows(first, image);
+      for (let y = 4; y < width && mirroring; y += 4) {
+        decodeRows(await requestRows(y), image);
+      }
+      if (!mirroring) break;
+      if (canvas.width !== width) canvas.width = canvas.height = width;
+      ctx.putImageData(image, 0, 0);
+      $("snapshot").disabled = false;
+      $("mirrorStatus").textContent = width + "×" + width + " · " + (1000 / Math.max(1, performance.now() - start)).toFixed(1) + " кадр/с";
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+  } catch (error) {
+    if (mirroring) $("mirrorStatus").textContent = error.message;
+  } finally {
+    mirroring = mirrorRunning = false;
+    setState($("state").textContent, $("state").className);
+  }
+}
+
+$("mirror").onclick = () => mirroring ? stopMirror() : startMirror();
+$("zoom").onchange = () => { $("mirrorPreview").style.width = (240 * +$("zoom").value) + "px"; };
+$("fullscreen").onclick = () => $("mirrorPreview").requestFullscreen().catch(e => log(e.message));
+$("snapshot").onclick = () => {
+  $("mirrorPreview").toBlob(blob => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url;
+    a.download = "deepseek-screen.png";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+};
 
 // ---------- кнопки ----------
 $("connect").onclick = connect;
