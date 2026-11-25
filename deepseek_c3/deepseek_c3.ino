@@ -15340,13 +15340,79 @@ void debugJournal() {
   }
 }
 
+#if BOARD_S3
+// Прямые показания touchRead независимо от включения сенсорного управления.
+void debugTouch() {
+  if (cfgSd) {
+    viewAnswer(L3("Выключите SD-карту: GPIO 4, 5, 6, 13 заняты.",
+                  "Disable SD: GPIO 4, 5, 6, 13 are in use.", "请关闭SD卡。"), C_YELLOW);
+    return;
+  }
+  KeepAwake awake;
+  uint32_t base[4] = {};
+  bool calibrate = true;
+  uint32_t last = 0;
+  const char* names[] = {"UP", "DOWN", "LEFT", "RIGHT"};
+  for (;;) {
+    BtnEvent event = btnEvent();
+    if (event == EV_LONG) return;
+    if (event == EV_CLICK) calibrate = true;
+    if (calibrate) {
+      showMsg(L3("Отпустите площадки...", "Release all pads...", "松开触摸板……"), C_YELLOW);
+      delay(500);
+      for (int i = 0; i < 4; ++i) {
+        uint64_t sum = 0;
+        for (int k = 0; k < 8; ++k) {
+          sum += touchRead(TOUCH_PINS[i]);
+          delay(2);
+        }
+        base[i] = (uint32_t)(sum / 8);
+        if (cfgTouch && touchReady) touchBase[i] = base[i];
+      }
+      calibrate = false;
+      last = 0;
+      tft.fillScreen(C_BLACK);
+      SmallFont small;
+      drawUtf8("TOUCH / GPIO", 4, 4, C_GREEN, C_BLACK);
+      drawUtf8(L3("Сырое / покой / порог", "Raw / base / threshold", "原始/基线/阈值"), 4, 24, C_LIGHT, C_BLACK);
+      drawUtf8(L3("OK: повторить замер", "OK: recalibrate", "确认：校准"), 4, 204, C_LIGHT, C_BLACK);
+      drawUtf8(L3("Удержание: назад", "Hold: back", "长按返回"), 4, 222, C_LIGHT, C_BLACK);
+    }
+    if (!last || millis() - last >= 120) {
+      last = millis();
+      SmallFont small;
+      for (int i = 0; i < 4; ++i) {
+        uint32_t v = touchRead(TOUCH_PINS[i]);
+        uint32_t threshold = base[i] + base[i] / 12;
+        bool active = v > threshold;
+        char line[48];
+        snprintf(line, sizeof(line), "%s GPIO%d%s", names[i], TOUCH_PINS[i], active ? " *" : "");
+        int y = 46 + i * 38;
+        tft.fillRect(0, y, 240, 36, C_BLACK);
+        drawUtf8(line, 4, y, active ? C_GREEN : C_WHITE, C_BLACK);
+        snprintf(line, sizeof(line), "%lu/%lu/%lu", (unsigned long)v,
+                 (unsigned long)base[i], (unsigned long)threshold);
+        drawUtf8(line, 4, y + 17, C_LIGHT, C_BLACK);
+      }
+    }
+    delay(10);
+  }
+}
+#endif
+
 void runDebugConsole() {
   for (;;) {
     std::vector<String> items = splitBar(L3("Система|GPIO и джойстик|Журнал|Назад", "System|GPIO and joystick|Log|Back", "系统|GPIO和摇杆|日志|返回"));
+#if BOARD_S3
+    items.insert(items.end() - 1, "Touch");
+#endif
     int choice = choiceScreen(L3("Консоль", "Console", "控制台"), items);
     if (choice == 0) debugLive(false);
     else if (choice == 1) debugLive(true);
     else if (choice == 2) debugJournal();
+#if BOARD_S3
+    else if (choice == 3) debugTouch();
+#endif
     else return;
   }
 }
