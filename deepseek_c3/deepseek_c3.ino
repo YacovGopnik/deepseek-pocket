@@ -137,7 +137,7 @@ inline void media(uint16_t) {}
 void ftxSendRemote(int slot);
 void ftxReceiveRemote();
 #endif
-#define ENABLE_JOYCAL (!(ENABLE_BLE && !BOARD_S3))    // калибровка джойстика (в C3 с Bluetooth нет места)  // копии прошивки на SD-карту (в C3 с Bluetooth нет места)
+#define ENABLE_JOYCAL 1
 #endif
 #ifndef ENABLE_PCSCREEN
 #define ENABLE_PCSCREEN FULL_EDITION                 // «Экран ПК» (картинки с компьютера по USB)
@@ -1590,6 +1590,23 @@ void holdWatchTask(void*) {
 int joyCx = 2048, joyCy = 2048;
 // Края хода ручки (Настройки -> Джойстик -> Калибровка). -1 - не калибровали: считаем от центра как есть.
 int joyX0 = -1, joyX1 = -1, joyY0 = -1, joyY1 = -1;
+struct JoyCalibration {
+  int16_t cx, cy, x0, x1, y0, y1;
+  uint8_t mapping;
+  bool valid() const {
+    return mapping < 16 && x0 >= 0 && y0 >= 0 && x1 <= 4095 && y1 <= 4095 &&
+           cx-x0 >= 300 && x1-cx >= 300 && cy-y0 >= 300 && y1-cy >= 300;
+  }
+};
+JoyCalibration joySaved{};
+bool joyMapped = false;
+void joyApplyCalibration(const JoyCalibration& c);
+void joyApplyCalibration(const JoyCalibration& c) {
+  joySaved = c;
+  joyMapped = true;
+  joyCx = c.cx; joyCy = c.cy;
+  joyX0 = c.x0; joyX1 = c.x1; joyY0 = c.y0; joyY1 = c.y1;
+}
 bool joyHeldAtBoot = false;                          // при включении ручку держали до упора
 
 // Значение оси: медиана трёх замеров - одиночные выбросы АЦП (дрожащий контакт) не дёргают курсор.
@@ -1630,7 +1647,11 @@ void joyCalibrate() {
   joyX1 = prefs.getInt("jx1", -1);
   joyY0 = prefs.getInt("jy0", -1);
   joyY1 = prefs.getInt("jy1", -1);
+  JoyCalibration saved{};
+  bool mapped = prefs.getBytesLength("joymap") == sizeof(saved) &&
+                prefs.getBytes("joymap", &saved, sizeof(saved)) == sizeof(saved) && saved.valid();
   prefs.end();
+  if (mapped) { scx = saved.cx; scy = saved.cy; }
   // ручку держат до упора при включении - знак «включить трансляцию экрана» (экран разбит, меню не видно)
   int bx = joyCx, by = joyCy;
   joyHeldAtBoot = scx >= 0 ? (abs(bx - scx) > 1000 || abs(by - scy) > 1000)
@@ -1641,6 +1662,7 @@ void joyCalibrate() {
   } else if (joyHeldAtBoot) {
     joyCx = joyCy = 2048;
   }
+  if (mapped) joyApplyCalibration(saved);
 }
 
 // Экран повёрнут на cfgRot шагов по 90°, значит, и гаджет держат повёрнутым: «вверх» для человека -
@@ -2029,14 +2051,24 @@ bool swDown() {
   return digitalRead(PIN_SW) == LOW || wpad::heldBtn();
 }
 
-// Отклонение ручки от центра с учётом настроек осей: примерно -2048..2048.
-void joyAnalog(int& dx, int& dy) {
+void joyMapAxes(int& dx, int& dy, unsigned mapping) {
+  if (mapping & 1) { int t = dx; dx = dy; dy = t; }
+  if (mapping & 2) dx = -dx;
+  if (mapping & 4) dy = -dy;
+  joyRotate(dx, dy);
+}
+void joyPhysical(int& dx, int& dy) {
   dx = JOY_DX();
   dy = JOY_DY();
-  if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
-  if (JOY_INVERT_X) dx = -dx;
-  if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
-  joyRotate(dx, dy);
+  unsigned mapping = joyMapped ? joySaved.mapping : ((JOY_SWAP_XY ? 1 : 0) |
+      (JOY_INVERT_X ? 2 : 0) | (JOY_INVERT_Y ? 4 : 0));
+  if (cfgJoyInvY != (int)((mapping >> 3) & 1)) mapping ^= 4;
+  joyMapAxes(dx, dy, mapping);
+}
+
+// Отклонение ручки от центра с учётом настроек осей: примерно -2048..2048.
+void joyAnalog(int& dx, int& dy) {
+  joyPhysical(dx, dy);
   switch (padDir()) {                                // телефон: до упора в нужную сторону
     case J_UP: dx = 0; dy = -2000; break;
     case J_DOWN: dx = 0; dy = 2000; break;
@@ -2067,12 +2099,8 @@ void joyAnalog(int& dx, int& dy) {
 }
 
 uint8_t joyRawDir() {
-  int dx = JOY_DX();
-  int dy = JOY_DY();
-  if (JOY_SWAP_XY) { int t = dx; dx = dy; dy = t; }
-  if (JOY_INVERT_X) dx = -dx;
-  if (JOY_INVERT_Y != (cfgJoyInvY != 0)) dy = -dy;
-  joyRotate(dx, dy);
+  int dx, dy;
+  joyPhysical(dx, dy);
   int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
   if (ax < joyThr() && ay < joyThr()) {
     vibroService();
@@ -10561,99 +10589,84 @@ void runTilt() {
 
 #if ENABLE_JOYCAL
 // ---------- Калибровка джойстика ----------
-// 1) ручку не трогать - центр и дрожание; 2) покрутить по кругу до упора - края хода; 3) проверка точкой.
+// Пять положений относительно текущей ориентации экрана.
 void joyCalScreen() {
-  // шаг 1: покой
-  showMsg(L3("Калибровка джойстика\n\n1/2. Отпустите ручку и не трогайте 2 секунды...",
-             "Joystick calibration\n\n1/2. Release the stick and do not touch it for 2 seconds...", "摇杆校准\n\n1/2. 请松开摇杆2秒……"), C_WHITE);
-  delay(1200);
-  long sx = 0, sy = 0;
-  int nx0 = 4095, nx1 = 0, ny0 = 4095, ny1 = 0;
-  const int N = 200;
-  for (int i = 0; i < N; i++) {
-    int x = analogRead(PIN_JOY_X), y = analogRead(PIN_JOY_Y);   // сырые замеры: нужно видеть и выбросы
-    sx += x;
-    sy += y;
-    nx0 = min(nx0, x); nx1 = max(nx1, x);
-    ny0 = min(ny0, y); ny1 = max(ny1, y);
-    delay(5);
-  }
-  int cx = (int)(sx / N), cy = (int)(sy / N);
-  int noiseX = (nx1 - nx0) / 2, noiseY = (ny1 - ny0) / 2;
-  // шаг 2: края хода
-  tft.fillScreen(C_BLACK);
-  {
-    SmallFont small;
-    drawUtf8(L3("2/2. Покрутите ручку по кругу", "2/2. Rotate the stick in circles", "2/2. 转动摇杆画圈"), 4, 4, C_WHITE, C_BLACK);
-    drawUtf8(L3("до упора 3-4 раза, потом нажмите.", "to the edge 3-4 times, then press.", "到底3-4圈，然后按下。"), 4, 22, C_WHITE, C_BLACK);
-  }
-  int x0 = cx, x1 = cx, y0 = cy, y1 = cy;
-  uint32_t t0 = millis();
-  while (btnEvent() != EV_NONE) delay(5);            // хвост прошлого нажатия
-  for (;;) {
-    int x = joyRead(PIN_JOY_X), y = joyRead(PIN_JOY_Y);
-    x0 = min(x0, x); x1 = max(x1, x);
-    y0 = min(y0, y); y1 = max(y1, y);
-    static uint32_t tDraw = 0;
-    if (millis() - tDraw > 80) {
-      tDraw = millis();
-      // рамка 200x150: прямоугольник - уже пройденный ход, точка - ручка сейчас
-      const int FX = 20, FY = 60, FW = 200, FH = 150;
-      tft.fillRect(FX, FY, FW, FH, C_BLACK);
-      tft.drawRect(FX, FY, FW, FH, C_GRAY);
-      auto mx = [&](int v) { return FX + (int)((long)v * (FW - 1) / 4095); };
-      auto my = [&](int v) { return FY + (int)((long)v * (FH - 1) / 4095); };
-      tft.drawRect(mx(x0), my(y0), max(1, mx(x1) - mx(x0)), max(1, my(y1) - my(y0)), C_GREEN);
-      tft.fillCircle(mx(x), my(y), 4, C_YELLOW);
-      char b[40];
-      snprintf(b, sizeof(b), "X %4d..%4d  Y %4d..%4d", x0, x1, y0, y1);
-      SmallFont small;
-      drawUtf8(b, 4, 218, C_LIGHT, C_BLACK);
+  KeepAwake awake;
+  const char* prompts[] = {
+    L3("Отпустите ручку", "Release the stick", "松开摇杆"),
+    L3("Влево до упора", "Hold full left", "向左到底"),
+    L3("Вправо до упора", "Hold full right", "向右到底"),
+    L3("Вверх до упора", "Hold full up", "向上到底"),
+    L3("Вниз до упора", "Hold full down", "向下到底")
+  };
+  int xs[5], ys[5];
+  for (int step = 0; step < 5; ++step) {
+    tft.fillScreen(C_BLACK);
+    char title[24];
+    snprintf(title, sizeof(title), "%d / 5", step + 1);
+    drawSmallCentered(title, 24, C_LIGHT);
+    drawSmallCentered(prompts[step], 68, C_WHITE);
+    drawSmallCentered(L3("Держите и нажмите OK", "Hold and press OK", "保持并按确认"), 104, C_WHITE);
+    drawSmallCentered(L3("Удержание: отмена", "Hold: cancel", "长按取消"), 196, C_LIGHT);
+    int x = 0, y = 0;
+    bool captured = false;
+    for (;;) {
+      bool pressed;
+      BtnEvent event = readButtonEvent(&pressed);
+      if (event == EV_LONG) return;
+      if (pressed) {
+        x = 0; y = 0;
+        for (int n = 0; n < 8; ++n) {
+          x += joyRead(PIN_JOY_X); y += joyRead(PIN_JOY_Y);
+          delay(2);
+        }
+        captured = true;
+      }
+      if (event == EV_CLICK && captured) {
+        xs[step] = x / 8; ys[step] = y / 8;
+        break;
+      }
+      delay(5);
     }
-    BtnEvent e = btnEvent();
-    if (e == EV_LONG) return;                        // передумали - ничего не меняем
-    if (e == EV_CLICK || millis() - t0 > 30000) break;
-    delay(5);
   }
-  // проверка и сохранение
-  String rep;
-  char b[96];
-  bool okX = x1 - cx > 500 && cx - x0 > 500, okY = y1 - cy > 500 && cy - y0 > 500;
-  if (!okX || !okY) {
-    rep = L3("Калибровка не сохранена: ", "Calibration not saved: ", "校准未保存：");
-    rep += !okY ? L3("ось Y почти не двигается в одну из сторон. ", "the Y axis barely moves to one side. ", "Y轴几乎不动。")
-                : L3("ось X почти не двигается в одну из сторон. ", "the X axis barely moves to one side. ", "X轴几乎不动。");
-    rep += L3("Крутите до упора; если не помогает - проверьте провод этой оси и питание джойстика (3V3, не 5V).",
-              "Push to the edge; if it does not help, check this axis wire and the joystick power (3V3, not 5V).", "请检查接线。");
-    viewAnswer(rep, C_YELLOW);
+  JoyCalibration c{};
+  c.cx = xs[0]; c.cy = ys[0];
+  c.x0 = c.x1 = c.cx; c.y0 = c.y1 = c.cy;
+  for (int step = 1; step < 5; ++step) {
+    if (xs[step] < c.x0) c.x0 = xs[step];
+    if (xs[step] > c.x1) c.x1 = xs[step];
+    if (ys[step] < c.y0) c.y0 = ys[step];
+    if (ys[step] > c.y1) c.y1 = ys[step];
+  }
+  bool found = false;
+  for (unsigned mapping = 0; mapping < 8; ++mapping) {
+    bool match = true;
+    for (int step = 1; step < 5; ++step) {
+      int x = xs[step] - c.cx, y = ys[step] - c.cy;
+      joyMapAxes(x, y, mapping);
+      int along = step <= 2 ? x : y;
+      int across = step <= 2 ? y : x;
+      if (step == 1 || step == 3) along = -along;
+      if (along < 300 || along <= abs(across)) match = false;
+    }
+    if (match) {
+      c.mapping = mapping | (cfgJoyInvY << 3);
+      found = true;
+      break;
+    }
+  }
+  if (!found || !c.valid()) {
+    viewAnswer(L3("Калибровка не сохранена. Повторите пять шагов до упора.",
+                  "Calibration not saved. Repeat all five steps to the edge.",
+                  "校准未保存。请重试。"), C_YELLOW);
     return;
   }
-  joyCx = cx; joyCy = cy;
-  joyX0 = x0; joyX1 = x1; joyY0 = y0; joyY1 = y1;
   prefs.begin("dsk", false);
-  prefs.putInt("jcx", cx); prefs.putInt("jcy", cy);
-  prefs.putInt("jx0", x0); prefs.putInt("jx1", x1);
-  prefs.putInt("jy0", y0); prefs.putInt("jy1", y1);
+  bool saved = prefs.putBytes("joymap", &c, sizeof(c)) == sizeof(c);
   prefs.end();
-  rep = L3("Готово, калибровка сохранена.\n\n", "Done, calibration saved.\n\n", "完成，已保存。\n\n");
-  snprintf(b, sizeof(b), "X: %d..%d..%d\nY: %d..%d..%d\n", x0, cx, x1, y0, cy, y1);
-  rep += b;
-  snprintf(b, sizeof(b), "%s X ±%d, Y ±%d\n", L3("Дрожание в покое:", "Rest noise:", "静止抖动:"), noiseX, noiseY);
-  rep += b;
-  int thrRaw = joyThr();                             // порог срабатывания в той же шкале (из 2048)
-  int worst = max(noiseX * 2048 / max(1, min(x1 - cx, cx - x0)), noiseY * 2048 / max(1, min(y1 - cy, cy - y0)));
-  if (worst > thrRaw / 2) {
-    rep += L3("\nДжойстик сильно шумит",
-              "\nThe joystick is noisy", "\n摇杆噪声大");
-    rep += noiseY >= noiseX ? L3(" по оси Y", " on the Y axis", "（Y轴）") : L3(" по оси X", " on the X axis", "（X轴）");
-    rep += L3(": это плохой контакт провода или изношенный резистор в ручке. Пропаяйте провод этой оси, "
-              "поставьте конденсатор 0,1 мкФ с вывода оси на GND. Пока помогает чувствительность пониже (Настройки -> Джойстик).",
-              ": a bad wire contact or a worn pot. Resolder that axis wire and add a 0.1 uF capacitor from the axis pin to GND. "
-              "Lower sensitivity helps meanwhile.", "：请检查焊点，并加0.1uF电容。");
-  } else {
-    rep += L3("\nШум в норме.", "\nNoise is fine.", "\n噪声正常。");
-  }
-  viewAnswer(rep, C_GREEN);
+  if (saved) joyApplyCalibration(c);
+  viewAnswer(saved ? L3("Калибровка сохранена. Откройте Проверку.", "Calibration saved. Open Test.", "已保存。请打开测试。")
+                   : L3("Ошибка сохранения", "Save failed", "保存失败"), saved ? C_GREEN : C_RED);
 }
 
 // Проверка ручки: точка ходит за ручкой, рамка - порог срабатывания. Выход - удержание кнопки.
