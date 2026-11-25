@@ -1941,6 +1941,9 @@ struct UiPause {
 // касанием (GPIO1-14). Касание = направление ручки; есть отклик вибромотором.
 // Проверка на S3-Zero: вверх - 4, вниз - 5, влево - 6, вправо - 13 (эти выводы свободны без SD-карты).
 #if BOARD_S3
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+#include "driver/touch_sens.h"
+#endif
 const uint32_t TOUCH_MAX_COUNT = 0x3FFFFF;
 const int TOUCH_PINS[4] = {4, 5, 6, 13};             // вверх, вниз, влево, вправо
 const int PIN_VIBRO = 40;                            // вибромотор через транзистор
@@ -1968,27 +1971,90 @@ void vibroService() {
 #endif
 }
 
+#if BOARD_S3
+int touchScanError = 0;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+static touch_sensor_handle_t touchController = nullptr;
+static touch_channel_handle_t touchChannels[4] = {};
+static bool touchControllerEnabled = false;
+
+bool touchStartController() {
+  if (touchControllerEnabled) return true;
+  touch_sensor_sample_config_t sample = TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(
+      16, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V2);
+  touch_sensor_config_t config = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(1, &sample);
+  config.max_meas_time_us = 1000;
+  esp_err_t err = touch_sensor_new_controller(&config, &touchController);
+  if (err == ESP_OK) {
+    touch_channel_config_t channel{};
+    channel.active_thresh[0] = 2000;
+    channel.charge_speed = TOUCH_CHARGE_SPEED_7;
+    channel.init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT;
+    for (int i = 0; i < 4 && err == ESP_OK; ++i)
+      err = touch_sensor_new_channel(touchController, TOUCH_PINS[i], &channel, &touchChannels[i]);
+    if (err == ESP_OK) err = touch_sensor_enable(touchController);
+  }
+  touchScanError = err;
+  if (err == ESP_OK) {
+    touchControllerEnabled = true;
+    return true;
+  }
+  for (auto& ch : touchChannels) {
+    if (ch) touch_sensor_del_channel(ch);
+    ch = nullptr;
+  }
+  if (touchController) touch_sensor_del_controller(touchController);
+  touchController = nullptr;
+  return false;
+}
+#endif
+
+bool touchScan(uint32_t* values) {
+  memset(values, 0, 4 * sizeof(uint32_t));
+  if (cfgSd) return false;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+  if (!touchStartController()) return false;
+  esp_err_t err = touch_sensor_trigger_oneshot_scanning(touchController, 30);
+  if (err == ESP_OK) {
+    for (int i = 0; i < 4 && err == ESP_OK; ++i)
+      err = touch_channel_read_data(touchChannels[i], TOUCH_CHAN_DATA_TYPE_RAW, &values[i]);
+  }
+  touchScanError = err;
+  return err == ESP_OK;
+#else
+  static bool configured = false;
+  if (!configured) {
+    touchSetCycles(16, 100);
+    configured = true;
+  }
+  for (int i = 0; i < 4; ++i) values[i] = touchRead(TOUCH_PINS[i]);
+  return true;
+#endif
+}
+
+bool touchCalibrateValues(uint32_t* base) {
+  uint64_t sums[4] = {};
+  uint32_t values[4];
+  for (int k = 0; k < 8; ++k) {
+    if (!touchScan(values)) {
+      memset(base, 0, 4 * sizeof(uint32_t));
+      return false;
+    }
+    for (int i = 0; i < 4; ++i) sums[i] += values[i];
+    delay(2);
+  }
+  for (int i = 0; i < 4; ++i) base[i] = sums[i] / 8;
+  return true;
+}
+#endif
+
 void touchInit() {
 #if BOARD_S3
   pinMode(PIN_VIBRO, OUTPUT);
   digitalWrite(PIN_VIBRO, LOW);
-  // Меньше циклов заряда: оставляем запас до насыщения 22-битного счётчика.
-  static bool configured = false;
-  if (!configured) {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-    touchSetConfig(100, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V2);
-#else
-    touchSetCycles(100, 100);
-#endif
-    configured = true;
-  }
-  if (!cfgTouch || cfgSd) return;                    // 4, 5, 6, 13 у SD-карты
-  for (int i = 0; i < 4; i++) {                      // «покой» каждой площадки (в этот момент её не трогают)
-    uint64_t sum = 0;
-    for (int k = 0; k < 8; k++) sum += touchRead(TOUCH_PINS[i]);
-    touchBase[i] = (uint32_t)(sum / 8);
-  }
-  touchReady = true;
+  if (!cfgTouch || cfgSd) return;
+  touchReady = touchCalibrateValues(touchBase);
+  if (!touchReady) debugLog("touch scan error: %d\n", touchScanError);
   debugLog("touch base: %u %u %u %u\n", (unsigned)touchBase[0], (unsigned)touchBase[1], (unsigned)touchBase[2], (unsigned)touchBase[3]);
 #endif
 }
@@ -2003,9 +2069,10 @@ uint8_t touchDir() {
   last = millis();
   static const uint8_t DIRS[4] = {J_UP, J_DOWN, J_LEFT, J_RIGHT};
   uint8_t d = J_NONE;
-  uint32_t best = 0;
+  uint32_t best = 0, values[4];
+  if (!touchScan(values)) { cached = prev = J_NONE; return J_NONE; }
   for (int i = 0; i < 4; i++) {
-    uint32_t v = touchRead(TOUCH_PINS[i]), b = touchBase[i];
+    uint32_t v = values[i], b = touchBase[i];
     if (b == 0 || b + b / 12 >= TOUCH_MAX_COUNT) continue;
     uint32_t over = v > b ? v - b : 0;
     if (over > b / 12 && over > best) {             // касание: больше покоя на ~8%
@@ -15372,14 +15439,10 @@ void debugTouch() {
     if (calibrate) {
       showMsg(L3("Отпустите площадки...", "Release all pads...", "松开触摸板……"), C_YELLOW);
       delay(500);
-      for (int i = 0; i < 4; ++i) {
-        uint64_t sum = 0;
-        for (int k = 0; k < 8; ++k) {
-          sum += touchRead(TOUCH_PINS[i]);
-          delay(2);
-        }
-        base[i] = (uint32_t)(sum / 8);
-        if (cfgTouch && touchReady) touchBase[i] = base[i];
+      bool okay = touchCalibrateValues(base);
+      if (cfgTouch && okay) {
+        memcpy(touchBase, base, sizeof(base));
+        touchReady = true;
       }
       calibrate = false;
       last = 0;
@@ -15393,17 +15456,20 @@ void debugTouch() {
     if (!last || millis() - last >= 120) {
       last = millis();
       SmallFont small;
+      uint32_t values[4];
+      bool okay = touchScan(values);
       for (int i = 0; i < 4; ++i) {
-        uint32_t v = touchRead(TOUCH_PINS[i]);
+        uint32_t v = values[i];
         uint32_t threshold = base[i] + base[i] / 12;
         bool saturated = base[i] == 0 || threshold >= TOUCH_MAX_COUNT;
-        bool active = !saturated && v > threshold;
+        bool active = okay && !saturated && v > threshold;
         char line[48];
-        snprintf(line, sizeof(line), "%s GPIO%d%s", names[i], TOUCH_PINS[i], saturated ? " SAT" : active ? " *" : "");
+        snprintf(line, sizeof(line), "%s GPIO%d%s", names[i], TOUCH_PINS[i], !okay ? " ERR" : saturated ? " SAT" : active ? " *" : "");
         int y = 46 + i * 38;
         tft.fillRect(0, y, 240, 36, C_BLACK);
-        drawUtf8(line, 4, y, saturated ? C_RED : active ? C_GREEN : C_WHITE, C_BLACK);
-        snprintf(line, sizeof(line), "%lu/%lu/%lu", (unsigned long)v,
+        drawUtf8(line, 4, y, !okay || saturated ? C_RED : active ? C_GREEN : C_WHITE, C_BLACK);
+        if (!okay) snprintf(line, sizeof(line), "ERR %d", touchScanError);
+        else snprintf(line, sizeof(line), "%lu/%lu/%lu", (unsigned long)v,
                  (unsigned long)base[i], (unsigned long)threshold);
         drawUtf8(line, 4, y + 17, C_LIGHT, C_BLACK);
       }
