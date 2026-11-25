@@ -25,6 +25,36 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <stdarg.h>
+
+// Диагностический журнал: только системные события, без текста запросов и ключей.
+constexpr int DEBUG_LOG_COUNT = 16;
+constexpr int DEBUG_LOG_LEN = 88;
+struct DebugEntry { uint32_t ms; char text[DEBUG_LOG_LEN]; };
+static DebugEntry debugEntries[DEBUG_LOG_COUNT];
+static uint32_t debugSequence = 0;
+static portMUX_TYPE debugMux = portMUX_INITIALIZER_UNLOCKED;
+
+void debugLog(const char* fmt, ...) {
+  char line[160];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  Serial.print(line);
+  size_t n = strlen(line);
+  while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+  if (n >= DEBUG_LOG_LEN) n = DEBUG_LOG_LEN - 1;
+  line[n] = 0;
+  uint32_t ms = millis();
+  portENTER_CRITICAL(&debugMux);
+  DebugEntry& e = debugEntries[debugSequence % DEBUG_LOG_COUNT];
+  e.ms = ms;
+  memcpy(e.text, line, n + 1);
+  ++debugSequence;
+  portEXIT_CRITICAL(&debugMux);
+}
+
 
 // Плата: ESP32-C3 Super Mini (как раньше) или ESP32-S3 (S3-Zero / S3 Super Mini / DevKitC-1) - выбирается
 // при сборке (плата в Arduino IDE), распиновка подставляется сама.
@@ -1436,7 +1466,7 @@ void audioTask(void*) {
 void audioInit() {
   audioI2s.setPins(I2S_BCLK, I2S_WS, I2S_DOUT);
   audOk = audioI2s.begin(I2S_MODE_STD, AUD_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
-  Serial.printf("I2S audio: %s\n", audOk ? "ok" : "failed");
+  debugLog("I2S audio: %s\n", audOk ? "ok" : "failed");
   if (audOk) xTaskCreate(audioTask, "audio", 4096, nullptr, 3, nullptr);
 }
 #endif
@@ -1826,7 +1856,7 @@ void gyroInit() {
   }
   if (n)
     for (int k = 0; k < 3; k++) gyroBias[k] = sum[k] / n;
-  Serial.printf("gyro: %s at 0x%02X\n", gyroName, gyroAddr);
+  debugLog("gyro: %s at 0x%02X\n", gyroName, gyroAddr);
 }
 
 void accInit() {
@@ -1843,7 +1873,7 @@ void accInit() {
       break;
     }
   }
-  Serial.printf("ADXL345: %s\n", accOk ? "ok" : "not found");
+  debugLog("ADXL345: %s\n", accOk ? "ok" : "not found");
   gyroInit();
   if (!accOk && gyroType == 1) {                     // нет ADXL345 - наклон с акселерометра MPU
     accOk = true;
@@ -1977,7 +2007,7 @@ void touchInit() {
     touchBase[i] = (uint32_t)(sum / 8);
   }
   touchReady = true;
-  Serial.printf("touch base: %u %u %u %u\n", (unsigned)touchBase[0], (unsigned)touchBase[1], (unsigned)touchBase[2], (unsigned)touchBase[3]);
+  debugLog("touch base: %u %u %u %u\n", (unsigned)touchBase[0], (unsigned)touchBase[1], (unsigned)touchBase[2], (unsigned)touchBase[3]);
 #endif
 }
 
@@ -2387,7 +2417,7 @@ bool sdMount() {
     SD.mkdir("/pics");
     SD.mkdir("/fw");
   }
-  Serial.printf("SD card: %s, type %d, %llu MB, %lu ms\n", sdOk ? "ok" : "not found", sdOk ? (int)SD.cardType() : -1,
+  debugLog("SD card: %s, type %d, %llu MB, %lu ms\n", sdOk ? "ok" : "not found", sdOk ? (int)SD.cardType() : -1,
                 sdOk ? (unsigned long long)(SD.cardSize() / (1024 * 1024)) : 0ULL, (unsigned long)(millis() - t0));
   return sdOk;
 }
@@ -2405,7 +2435,7 @@ void sdRetryService() {
     SD.mkdir("/pics");
     SD.mkdir("/fw");
   }
-  Serial.printf("SD card retry: %s\n", sdOk ? "ok" : "not found");
+  debugLog("SD card retry: %s\n", sdOk ? "ok" : "not found");
 }
 
 #if BOARD_S3
@@ -3106,7 +3136,7 @@ void runPortal() {
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
 #endif
   delay(300);
-  Serial.printf("Wi-Fi setup: access point %s %s, IP %s\n", AP_NAME, apOk ? "started" : "FAILED", WiFi.softAPIP().toString().c_str());
+  debugLog("Wi-Fi setup: access point %s %s, IP %s\n", AP_NAME, apOk ? "started" : "FAILED", WiFi.softAPIP().toString().c_str());
   if (!apOk) {
     viewAnswer(L3("Не удалось включить сеть для настройки. Перезапустите гаджет и попробуйте ещё раз.",
                   "Could not start the setup network. Restart the device and try again.", "无法启动设置网络。请重启设备后重试。"),
@@ -3187,7 +3217,7 @@ void wifiStart() {
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   wifiBeginMs = millis();
   wifiStarted = true;
-  Serial.printf("Wi-Fi: trying network %d of %u\n", netIdx + 1, (unsigned)netSsid.size());
+  debugLog("Wi-Fi: trying network %d of %u\n", netIdx + 1, (unsigned)netSsid.size());
 }
 
 bool wifiOk() { return WiFi.status() == WL_CONNECTED; }
@@ -3312,7 +3342,7 @@ void displayReset() {
     digitalWrite(PIN_RST_B, HIGH);
   }
   delay(200);                                        // экрану нужно время после сброса
-  Serial.printf("reset done, GPIO3 with pull-down: %u mV, battery %d\n", (unsigned)mv, (int)bat);
+  debugLog("reset done, GPIO3 with pull-down: %u mV, battery %d\n", (unsigned)mv, (int)bat);
 }
 
 float batVolts = 0;          // сглаженное напряжение
@@ -5670,7 +5700,7 @@ int apiCall(const Attempt& a, const char* system, const std::vector<ChatMsg>& hi
   } else if (code > 0) payload = http.getString();
   else payload = HTTPClient::errorToString(code);
   http.end();
-  Serial.printf("HTTP %d, free heap: %u\n", code, (unsigned)ESP.getFreeHeap());
+  debugLog("HTTP %d, free heap: %u\n", code, (unsigned)ESP.getFreeHeap());
   return code;
 }
 
@@ -5825,7 +5855,7 @@ uint8_t* httpDownloadOnce(const String& url, size_t& n, String& err) {
   }
   int got = http.writeToStream(&sink);
   http.end();
-  Serial.printf("[img] %d of %d bytes, result %d\n", (int)sink.n, len, got);
+  debugLog("[img] %d of %d bytes, result %d\n", (int)sink.n, len, got);
   // файл должен прийти целиком: обрезанную картинку декодер покажет наполовину и выдаст ошибку
   bool whole = got >= 0 && sink.n > 0 && !sink.overflow && (len < 0 || sink.n == (size_t)len);
   if (!whole) {
@@ -5864,7 +5894,7 @@ bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& er
   int code = http.GET();
   String body = code > 0 ? http.getString() : HTTPClient::errorToString(code);
   http.end();
-  Serial.printf("[img] wikimedia HTTP %d, %u bytes\n", code, (unsigned)body.length());
+  debugLog("[img] wikimedia HTTP %d, %u bytes\n", code, (unsigned)body.length());
   if (code != 200) {
     err = "HTTP " + String(code) + (code < 0 ? String(" ") + body : String(""));
     return false;
@@ -5916,7 +5946,7 @@ bool drawJpegFit(const uint8_t* jpg, size_t n) {
   const char* m2 = L3("листайте дальше", "go to the next one", "请看下一张");
   drawUtf8(m1, (240 - textWidth(m1)) / 2 < 0 ? 0 : (240 - textWidth(m1)) / 2, 104, C_YELLOW, C_BLACK);
   drawUtf8(m2, (240 - textWidth(m2)) / 2, 124, C_LIGHT, C_BLACK);
-  Serial.printf("[img] decode error %d (%ux%u)\n", rc, (unsigned)w, (unsigned)h);
+  debugLog("[img] decode error %d (%ux%u)\n", rc, (unsigned)w, (unsigned)h);
   return false;
 }
 
@@ -6254,7 +6284,7 @@ int httpGetText(const String& url, String& body) {
   int code = http.GET();
   body = code > 0 ? http.getString() : HTTPClient::errorToString(code);
   http.end();
-  Serial.printf("[get] %d, %u bytes\n", code, (unsigned)body.length());
+  debugLog("[get] %d, %u bytes\n", code, (unsigned)body.length());
   if (code < 0) {
     Serial.printf("[get] %s failed, heap %u, largest block %u\n", url.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     // Погода (Open-Meteo) отвечает и без шифрования: если защищённое соединение не установилось
@@ -6270,7 +6300,7 @@ int httpGetText(const String& url, String& body) {
         code = h2.GET();
         body = code > 0 ? h2.getString() : HTTPClient::errorToString(code);
         h2.end();
-        Serial.printf("[get] plain http: %d, %u bytes\n", code, (unsigned)body.length());
+        debugLog("[get] plain http: %d, %u bytes\n", code, (unsigned)body.length());
       }
     }
   }
@@ -6758,7 +6788,7 @@ bool wttrGeo(const String& city, tools::Place& pl) {
     bool ok = pass == 0 ? http.begin(sc, String("https://") + path) : http.begin(pc, String("http://") + path);
     if (!ok) continue;
     int code = http.GET();
-    Serial.printf("[wttr geo] pass %d: %d\n", pass, code);
+    debugLog("[wttr geo] pass %d: %d\n", pass, code);
     if (code != 200) {
       http.end();
       continue;
@@ -6870,7 +6900,7 @@ bool wttrForecast(tools::Forecast& f) {
     bool ok = pass == 0 ? http.begin(sc, String("https://") + path) : http.begin(pc, String("http://") + path);
     if (!ok) continue;
     int code = http.GET();
-    Serial.printf("[wttr] pass %d: %d\n", pass, code);
+    debugLog("[wttr] pass %d: %d\n", pass, code);
     if (code != 200) {
       http.end();
       continue;
@@ -7600,7 +7630,7 @@ void mqPoll() {
   // Связь может «зависнуть» молча (сменилась сеть, роутер забыл соединение): плата думает, что подключена,
   // а сообщения никуда не доходят. Раз в 40 секунд мы спрашиваем сервер; если он молчит 100 секунд - переподключаемся.
   if (millis() - mqLastRx > 100000UL) {
-    Serial.println("[room] server is silent - reconnecting");
+    debugLog("[room] server is silent - reconnecting\n");
     mqDrop();
     mqLastTry = millis() - 15000;                    // новая попытка уже через 5 секунд
     return;
@@ -8118,7 +8148,7 @@ int httpGetSink(const String& url, Stream* sink) {
   int code = http.GET();
   if (code == 200 && http.writeToStream(sink) < 0) code = -1000;
   http.end();
-  Serial.printf("[ir] GET %d\n", code);
+  debugLog("[ir] GET %d\n", code);
   return code;
 }
 
@@ -9726,7 +9756,7 @@ void bootGuard() {
     prefs.putUChar("bootfail", 0);
     prefs.putUChar("rolledback", 1);
     prefs.end();
-    Serial.println("3 failed starts in a row - rolling back to the previous firmware");
+    debugLog("3 failed starts in a row - rolling back to the previous firmware\n");
     Update.rollBack();
     ESP.restart();
   }
@@ -9807,7 +9837,7 @@ void bleSetEnabled(bool on) {
   }
   cfgBle = on ? 1 : 0;
   saveScreenSettings();
-  Serial.printf("Bluetooth %s, heap %u, largest block %u\n", on ? "on" : "off", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  debugLog("Bluetooth %s, heap %u, largest block %u\n", on ? "on" : "off", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
 // Уведомления и текст с телефона, пришедшие не в поле ввода. true - экран занят.
@@ -14964,7 +14994,7 @@ String raspDownload() {
     if (f) f.close();
   }
   http.end();
-  Serial.printf("[rasp] %u bytes, %d weeks, %d days\n", (unsigned)got, p.weeks, p.days);
+  debugLog("[rasp] %u bytes, %d weeks, %d days\n", (unsigned)got, p.weeks, p.days);
   PicBus b;
   if (!wrOk) {
     raspFs().remove(tmp.c_str());
@@ -15277,6 +15307,108 @@ void runPhonePad() {
   }
 }
 
+// ========================= КОНСОЛЬ ОТЛАДКИ =========================
+void debugLive(bool pins) {
+  KeepAwake awake;
+  uint32_t last = 0;
+  tft.fillScreen(C_BLACK);
+  for (;;) {
+    if (!last || millis() - last >= 400) {
+      last = millis();
+      SmallFont small;
+      char b[64];
+      tft.fillRect(0, 0, 240, 240, C_BLACK);
+      drawUtf8(pins ? "GPIO / ADC" : "SYSTEM", 4, 4, C_GREEN, C_BLACK);
+      if (pins) {
+        int dx, dy;
+        joyPhysical(dx, dy);
+        snprintf(b, sizeof(b), "X GPIO%d ADC %d", PIN_JOY_X, joyRead(PIN_JOY_X));
+        drawUtf8(b, 4, 34, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "Y GPIO%d ADC %d", PIN_JOY_Y, joyRead(PIN_JOY_Y));
+        drawUtf8(b, 4, 58, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "SW GPIO%d %s", PIN_SW, digitalRead(PIN_SW) == LOW ? "LOW" : "HIGH");
+        drawUtf8(b, 4, 82, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "dx %d  dy %d", dx, dy);
+        drawUtf8(b, 4, 106, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "SCK %d MOSI %d DC %d", PIN_SCK, PIN_MOSI, PIN_DC);
+        drawUtf8(b, 4, 138, C_LIGHT, C_BLACK);
+        snprintf(b, sizeof(b), "BLK %d", PIN_BLK);
+        drawUtf8(b, 4, 162, C_LIGHT, C_BLACK);
+      } else {
+        snprintf(b, sizeof(b), "%s  v%d", BOARD_S3 ? "ESP32-S3" : "ESP32-C3", (int)FW_VERSION);
+        drawUtf8(b, 4, 28, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "Heap: %u B", (unsigned)ESP.getFreeHeap());
+        drawUtf8(b, 4, 50, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "Largest: %u B", (unsigned)ESP.getMaxAllocHeap());
+        drawUtf8(b, 4, 72, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "PSRAM: %u B", (unsigned)ESP.getFreePsram());
+        drawUtf8(b, 4, 94, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "Uptime: %lu s", (unsigned long)(millis() / 1000));
+        drawUtf8(b, 4, 116, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "Reset reason: %d", (int)esp_reset_reason());
+        drawUtf8(b, 4, 138, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "Wi-Fi: %s  SD: %s", WiFi.status() == WL_CONNECTED ? "OK" : "OFF", sdOk ? "OK" : "OFF");
+        drawUtf8(b, 4, 160, C_WHITE, C_BLACK);
+        snprintf(b, sizeof(b), "BLE: %s  ACC: %s", ENABLE_BLE && cfgBle ? "ON" : "OFF", accOk ? "OK" : "OFF");
+        drawUtf8(b, 4, 182, C_LIGHT, C_BLACK);
+      }
+      drawUtf8(L3("Удержание: назад", "Hold: back", "长按返回"), 4, 216, C_LIGHT, C_BLACK);
+    }
+    joyEvent();
+    if (btnEvent() == EV_LONG) return;
+    delay(20);
+  }
+}
+
+void debugJournal() {
+  KeepAwake awake;
+  uint32_t selected = 0;
+  uint32_t seen = UINT32_MAX, shown = UINT32_MAX;
+  bool follow = true;
+  for (;;) {
+    DebugEntry entry{};
+    uint32_t count, first;
+    portENTER_CRITICAL(&debugMux);
+    count = debugSequence;
+    first = count > DEBUG_LOG_COUNT ? count - DEBUG_LOG_COUNT : 0;
+    if (count) {
+      if (follow) selected = count - 1;
+      if (selected < first) selected = first;
+      entry = debugEntries[selected % DEBUG_LOG_COUNT];
+    }
+    portEXIT_CRITICAL(&debugMux);
+    if (seen != count || shown != selected) {
+      seen = count; shown = selected;
+      String page = L3("ЖУРНАЛ\n", "LOG\n", "日志\n");
+      if (count) {
+        page += String(selected + 1) + "/" + String(count) + "  " + String(entry.ms / 1000) + "s\n\n";
+        page += entry.text;
+      } else page += L3("Пока пусто", "No entries yet", "暂无记录");
+      page += L3("\n\nВверх/вниз: листать\nOK: свежие\nДержать: назад",
+                 "\n\nUp/down: browse\nOK: latest\nHold: back", "\n\n上下浏览\n确认最新\n长按返回");
+      showMsg(page, C_GREEN);
+    }
+    uint8_t direction = joyEvent();
+    if (direction == J_UP && selected > first) { --selected; follow = false; }
+    if (direction == J_DOWN && count && selected < count - 1) { ++selected; follow = selected == count - 1; }
+    BtnEvent event = btnEvent();
+    if (event == EV_LONG) return;
+    if (event == EV_CLICK) follow = true;
+    delay(20);
+  }
+}
+
+void runDebugConsole() {
+  for (;;) {
+    std::vector<String> items = splitBar(L3("Система|GPIO и джойстик|Журнал|Назад", "System|GPIO and joystick|Log|Back", "系统|GPIO和摇杆|日志|返回"));
+    int choice = choiceScreen(L3("Консоль", "Debug console", "调试控制台"), items);
+    if (choice == 0) debugLive(false);
+    else if (choice == 1) debugLive(true);
+    else if (choice == 2) debugJournal();
+    else return;
+  }
+}
+
 // ========================= ГЛАВНЫЙ ЭКРАН =========================
 void runChat();
 void runAdmin();
@@ -15284,14 +15416,14 @@ void runAdmin();
 // Ручка - выбор (влево/вправо у края - соседняя страница), нажатие - открыть приложение.
 enum AppId : uint8_t {
   A_CHAT, A_ROOM, A_GAMES, A_RASP, A_CALC, A_REF, A_NOTES, A_SAVED, A_WIKI, A_IMAGES, A_GALLERY,
-  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_PCSCR, A_PHONE, A_SETTINGS, A_ADMIN, A_COUNT
+  A_WEATHER, A_RATES, A_CLOCK, A_TIMER, A_STOPW, A_REMOTE, A_BT, A_PCSCR, A_PHONE, A_SETTINGS, A_ADMIN, A_DEBUG, A_COUNT
 };
 const char* const APP_RU[A_COUNT] = {"DeepSeek", "Комната", "Игры", "Расписание", "Калькул.", "Справочник", "Конспекты", "Сохранено", "Википедия", "Картинки",
-                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Экран ПК", "Телефон", "Настройки", "Админ"};
+                                     "Галерея", "Погода", "Курсы", "Часы", "Таймер", "Секундомер", "Пульт", "Bluetooth", "Экран ПК", "Телефон", "Настройки", "Админ", "Консоль"};
 const char* const APP_EN[A_COUNT] = {"DeepSeek", "Room", "Games", "Schedule", "Calculator", "Reference", "Notes", "Saved", "Wikipedia", "Images",
-                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "PC screen", "Phone", "Settings", "Admin"};
+                                     "Gallery", "Weather", "Rates", "Clock", "Timer", "Stopwatch", "Remote", "Bluetooth", "PC screen", "Phone", "Settings", "Admin", "Console"};
 const uint16_t APP_COLOR[A_COUNT] = {0x2B3E, 0x04B2, 0x8219, 0x1A7B, 0xF460, 0x2D4A, 0xE5E5, 0xD9E7, 0x7BD0, 0x3CBC,
-                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x2A2F, 0x0C87, 0x636F, 0xB0A6};
+                                     0xE2D4, 0x5DBE, 0x13C8, 0x3188, 0xF2C5, 0x5239, 0x424A, 0x041F, 0x2A2F, 0x0C87, 0x636F, 0xB0A6, 0x1326};
 const int HOME_TOP = 22, CELL_W = 80, CELL_H = 70, TILE = 46;
 
 const char* appName(int a) { return cfgLang == LANG_RU ? APP_RU[a] : APP_EN[a]; }
@@ -15424,6 +15556,12 @@ void drawAppIcon(int a, int x, int y) {
       tft.fillCircle(cx, cy, 12, W);
       tft.fillCircle(cx, cy, 5, col);
       break;
+    case A_DEBUG:
+      tft.fillRoundRect(x + 6, y + 9, 34, 28, 3, C_BLACK);
+      tft.drawLine(x + 12, y + 16, x + 18, y + 22, C_GREEN);
+      tft.drawLine(x + 18, y + 22, x + 12, y + 28, C_GREEN);
+      tft.drawFastHLine(x + 23, y + 28, 10, C_GREEN);
+      break;
     case A_ADMIN:                                    // щит с галочкой
       tft.fillRect(x + 12, y + 8, 22, 17, W);
       tft.fillTriangle(x + 12, y + 25, x + 34, y + 25, cx, y + 39, W);
@@ -15445,7 +15583,7 @@ void homeApps(std::vector<uint8_t>& apps) {
     if (a == A_PHONE && !ENABLE_WIFIPAD) continue;
     if (a == A_RASP && !ENABLE_RASP) continue;
     if (a == A_PCSCR && !ENABLE_PCSCREEN) continue;
-    if (GAMES_EDITION && a != A_GAMES && a != A_ROOM && a != A_PHONE && a != A_SETTINGS && a != A_ADMIN) continue;
+    if (GAMES_EDITION && a != A_GAMES && a != A_ROOM && a != A_PHONE && a != A_SETTINGS && a != A_ADMIN && a != A_DEBUG) continue;
     if ((a == A_REMOTE && !ENABLE_IR) || (a == A_IMAGES && !ENABLE_WEBIMG)) continue;
     apps.push_back((uint8_t)a);
   }
@@ -15549,6 +15687,7 @@ void launchApp(int a) {
     case A_PHONE: runPhonePad(); break;
     case A_SETTINGS: runSettings(); break;
     case A_ADMIN: runAdmin(); break;
+    case A_DEBUG: runDebugConsole(); break;
   }
 }
 
@@ -15674,7 +15813,7 @@ void initStep(int n) { initStage = 0x1A170000u | (uint32_t)n; }
 bool initRun(int n) {
   initStep(n);
   if (initSkip == n) {
-    Serial.printf("init step %d (%s) skipped after a crash\n", n, INIT_NAMES[n]);
+    debugLog("init step %d (%s) skipped after a crash\n", n, INIT_NAMES[n]);
     return false;
   }
   return true;
@@ -15686,12 +15825,12 @@ void setup() {
   Serial.setRxBufferSize(4096);      // «Экран ПК» присылает картинки кусками по 2 КБ
   Serial.begin(115200);
   delay(3000);                       // время на USB и питание
-  Serial.println("1: start");
+  debugLog("1: start\n");
   {
     esp_reset_reason_t why = esp_reset_reason();
     bool crashed = why == ESP_RST_PANIC || why == ESP_RST_INT_WDT || why == ESP_RST_TASK_WDT || why == ESP_RST_WDT;
     if (crashed && (initStage >> 16) == 0x1A17 && (initStage & 0xFF) > 0 && (initStage & 0xFF) < 7) initSkip = (int)(initStage & 0xFF);
-    Serial.printf("reset reason %d, last init step %u, skip %d\n", (int)why, (unsigned)(initStage & 0xFF), initSkip);
+    debugLog("reset reason %d, last init step %u, skip %d\n", (int)why, (unsigned)(initStage & 0xFF), initSkip);
     initStep(0);
   }
   bootGuard();
@@ -15707,7 +15846,7 @@ void setup() {
   tft.setRotation((TFT_ROTATION + cfgRot) % 4);   // поворот из настроек
   tft.setSPISpeed(TFT_SPI_HZ);       // быстрее шина - быстрее экран (особенно в гонке)
   drawBoot();                        // заставка «DeepSeek OS»
-  Serial.println("2: display ok");
+  debugLog("2: display ok\n");
   if (initSkip) {
     char b[64];
     snprintf(b, sizeof(b), "Upalo na shage: %s - propuskayu", INIT_NAMES[initSkip]);
@@ -15735,10 +15874,10 @@ void setup() {
   pinMode(PIN_SW, INPUT_PULLUP);
   bool afterHoldReset = holdReset == HOLD_RESET_MAGIC;
   holdReset = 0;
-  if (afterHoldReset) Serial.println("restarted by holding the button");
+  if (afterHoldReset) debugLog("restarted by holding the button\n");
   xTaskCreate(holdWatchTask, "hold", 2048, nullptr, 2, nullptr);
   joyCalibrate();
-  Serial.printf("3: joystick center %d / %d\n", joyCx, joyCy);
+  debugLog("3: joystick center %d / %d\n", joyCx, joyCy);
 #if BOARD_S3
   prefs.begin("dsk", true);
   cfgMirBoot = prefs.getUChar("mirboot", 0) != 0;
@@ -15797,7 +15936,7 @@ void setup() {
     sdMount();
     bootStage(sdOk ? "SD: 3/3 ok" : "SD: 3/3 -");
   }
-  Serial.printf("4: learned words: %u\n", (unsigned)sugg.learnedCount());
+  debugLog("4: learned words: %u\n", (unsigned)sugg.learnedCount());
 
   bootStage("Wi-Fi");
   if (initRun(5)) {
@@ -15806,7 +15945,7 @@ void setup() {
   }
   if (ENABLE_BLE && cfgBle && initRun(6)) {          // Bluetooth включён в настройках
     ble::begin(toStd(roomId));
-    Serial.printf("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
+    debugLog("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
   }
   if (cfgSd) {                                       // запуск с картой прошёл
     SD_STAGE(0);
@@ -15815,7 +15954,7 @@ void setup() {
     prefs.end();
   }
   initStep(0);                                       // запуск прошёл
-  Serial.println("5: ready (Wi-Fi in background)");
+  debugLog("5: ready (Wi-Fi in background)\n");
   prefs.begin("dsk", false);
   bool rolled = prefs.getUChar("rolledback", 0);
   if (rolled) prefs.putUChar("rolledback", 0);
@@ -15841,7 +15980,7 @@ void chatAsk(String q) {
     String result;
     bool ok = askLen(q, maxTokens, result);
     if (ok) {
-      Serial.println("answer ok");
+      debugLog("answer ok\n");
       sndOk();
     } else {
       sndError();
