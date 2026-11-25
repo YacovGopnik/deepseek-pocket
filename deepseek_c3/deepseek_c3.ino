@@ -898,7 +898,8 @@ int cfgSd = 0;            // подключена SD-карта (вместо И
 int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
 int cfgTouch = 0;         // 0 off, 1 four directions, 2 six keys + BOOT
-bool touchSix() { return BOARD_S3 && cfgTouch == 2 && !cfgSd; }
+bool touchSix() { return BOARD_S3 && cfgTouch >= 2 && !cfgSd; }
+bool touchOnly() { return BOARD_S3 && cfgTouch == 3 && !cfgSd; }
 int physicalButtonPin() { return touchSix() ? 0 : PIN_SW; }
 int cfgTilt = 0;          // 1 - наклон гаджета управляет в играх (датчик ADXL345, только S3)
 int cfgJoyInvY = 1;       // 1 - ось Y ручки перевёрнута относительно JOY_INVERT_Y (Настройки -> Ось Y джойстика)
@@ -967,7 +968,7 @@ void loadSettings() {
   cfgJoyInvY = prefs.getUChar("joyiy", 1) ? 1 : 0;
   cfgTilt = prefs.getUChar("tilt", 0) ? 1 : 0;
   cfgTouch = prefs.getUChar("touch", 0);
-  if (cfgTouch > 2) cfgTouch = 0;
+  if (cfgTouch > 3) cfgTouch = 0;
   cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
   cfgSd = prefs.getUChar("sd", 0) ? 1 : 0;
@@ -2177,6 +2178,7 @@ void joyMapAxes(int& dx, int& dy, unsigned mapping) {
   joyRotate(dx, dy);
 }
 void joyPhysical(int& dx, int& dy) {
+  if (touchOnly()) { dx = dy = 0; return; }
   dx = JOY_DX();
   dy = JOY_DY();
   unsigned mapping = joyMapped ? joySaved.mapping : ((JOY_SWAP_XY ? 1 : 0) |
@@ -2188,14 +2190,16 @@ void joyPhysical(int& dx, int& dy) {
 // Отклонение ручки от центра с учётом настроек осей: примерно -2048..2048.
 void joyAnalog(int& dx, int& dy) {
   joyPhysical(dx, dy);
-  switch (padDir()) {                                // телефон: до упора в нужную сторону
+  uint8_t direction = padDir();
+  if (touchOnly() && direction == J_NONE) { vibroService(); direction = touchDir(); }
+  switch (direction) {                                // телефон или сенсорные кнопки
     case J_UP: dx = 0; dy = -2000; break;
     case J_DOWN: dx = 0; dy = 2000; break;
     case J_LEFT: dx = -2000; dy = 0; break;
     case J_RIGHT: dx = 2000; dy = 0; break;
   }
   // наклон гаджета (если включён и ручку не трогают): ~30 градусов - до упора
-  if (BOARD_S3 && g_inGame && cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
+  if (BOARD_S3 && !touchOnly() && g_inGame && cfgTilt && accOk && abs(dx) < joyThr() / 3 && abs(dy) < joyThr() / 3) {
     int tx, ty;
     if (accTilt(tx, ty)) {
       auto conv = [](int t) {
@@ -2225,7 +2229,7 @@ uint8_t joyRawDir() {
     vibroService();
     uint8_t p = padDir();
     if (p == J_NONE) p = touchDir();
-    return p != J_NONE ? p : tiltDir();
+    return p != J_NONE || touchOnly() ? p : tiltDir();
   }
   if (ax > ay) return dx > 0 ? J_RIGHT : J_LEFT;
   return dy > 0 ? J_DOWN : J_UP;
@@ -10881,7 +10885,7 @@ bool runSettings() {
     right[15] = !cfgSd ? (sdDiag != -9 ? String(L3("сбой ", "fail ", "失败 ")) + String(sdDiag) : String(L3("нет", "off", "关"))) : sdOk ? L3("работает", "ok", "正常") : L3("не найдена", "not found", "未找到");
     right[14] = !ENABLE_BLE ? L3("нет", "n/a", "无") : cfgBle ? L3("вкл", "on", "开") : L3("выкл", "off", "关");
     right[16] = !accOk ? L3("нет датчика", "no sensor", "无传感器") : cfgTilt ? L3("в играх", "in games", "游戏中") : L3("выкл", "off", "关");
-    right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch == 2 ? "6 + BOOT" : cfgTouch ? "4" : L3("выкл", "off", "关");
+    right[17] = !BOARD_S3 ? L3("нет", "n/a", "无") : cfgTouch == 3 ? L3("только Touch", "touch only", "仅触摸") : cfgTouch == 2 ? "6 + BOOT" : cfgTouch ? "4" : L3("выкл", "off", "关");
 #if BOARD_S3
     right[18] = mir::on ? L3("идёт", "on", "开") : cfgMirBoot ? L3("при запуске", "on boot", "开机") : L3("выкл", "off", "关");
 #elif ENABLE_MIRVIEW
@@ -11003,7 +11007,7 @@ bool runSettings() {
         break;
       case 15: {
 #if BOARD_S3
-        if (!cfgSd && cfgTouch == 2) {
+        if (!cfgSd && cfgTouch >= 2) {
           viewAnswer(L3("Сначала выключите режим 6 кнопок.", "Disable 6-key mode first.", "先关闭六键模式。"), C_YELLOW);
           break;
         }
@@ -11052,11 +11056,11 @@ bool runSettings() {
           viewAnswer(L3("Сначала отключите SD-карту.", "Disable SD first.", "先关闭SD卡。"), C_YELLOW);
           break;
         }
-        std::vector<String> modes = splitBar(L3("Выключено|4 направления|6 кнопок + BOOT|Назад",
-                                               "Off|4 directions|6 keys + BOOT|Back", "关闭|四方向|六键+BOOT|返回"));
+        std::vector<String> modes = splitBar(L3("Выключено|4 направления|6 кнопок + BOOT|Только сенсоры|Назад",
+                                               "Off|4 directions|6 keys + BOOT|Touch only|Back", "关闭|四方向|六键+BOOT|仅触摸|返回"));
         int mode = choiceScreen(L3("Сенсорные кнопки", "Touch buttons", "触摸按键"), modes);
-        if (mode < 0 || mode > 2 || mode == cfgTouch) break;
-        if (mode == 2) {
+        if (mode < 0 || mode > 3 || mode == cfgTouch) break;
+        if (mode >= 2) {
           std::vector<String> confirm = splitBar(L3("Включить и перезапустить|Назад", "Enable and restart|Back", "开启并重启|返回"));
           if (choiceScreen(L3("GPIO14 OK, GPIO7 ESC, BOOT OK. Отсоедините SW от GPIO7 и звук I2S от GPIO14.",
                               "GPIO14 OK, GPIO7 ESC, BOOT OK. Disconnect SW from GPIO7 and I2S from GPIO14.",
@@ -15827,6 +15831,41 @@ void launchApp(int a) {
   }
 }
 
+#if BOARD_S3
+void bootTouchMenu() {
+  KeepAwake awake;
+  // Отпускаем кнопку, которой открыли меню, чтобы не принять её за ответ.
+  while (digitalRead(0) == LOW) { btnEvent(); delay(10); }
+  btnEvent();
+  if (screenAsleep) wakeScreen();
+  showMsg(L3("Включить сенсорное управление?\n\nBOOT коротко: да\nBOOT долго: нет\n\nДа: GPIO14 OK, GPIO7 ESC. SW и I2S отключить.",
+             "Enable touch controls?\n\nBOOT short: yes\nBOOT hold: no\n\nYes: GPIO14 OK, GPIO7 ESC. Disconnect SW and I2S.",
+             "启用触摸控制？\n短按BOOT：是\n长按：否。"), C_WHITE);
+  for (;;) {
+    while (digitalRead(0) == HIGH) delay(10);
+    delay(25);
+    if (digitalRead(0) == HIGH) continue;
+    uint32_t down = millis();
+    while (digitalRead(0) == LOW) delay(10);
+    bool yes = millis() - down < LONG_PRESS_MS;
+    delay(30);
+    if (yes && cfgSd) {
+      showMsg(L3("Сначала отключите SD-карту.", "Disable SD first.", "先关闭SD卡。"), C_YELLOW);
+      delay(1200);
+      return;
+    }
+    int mode = yes ? 3 : 0;
+    if (cfgTouch == mode) return;
+    cfgTouch = mode;
+    saveScreenSettings();
+    showMsg(L3("Перезапуск...", "Restarting...", "重启……"), C_GREEN);
+    delay(400);
+    esp_restart();
+    return;
+  }
+}
+#endif
+
 void runHome() {
   static int sel = 0;                                // номер приложения в списке (помнится между запусками)
   std::vector<uint8_t> apps;
@@ -15834,6 +15873,10 @@ void runHome() {
   uint32_t nextCheck = 0, nextWifi = 0;
   int shownMin = -1, shownWifi = -1, shownBat = -9, shownUnread = -1;
   bool shownAdm = false;
+#if BOARD_S3
+  uint32_t bootDownAt = 0;
+  bool bootDown = false;
+#endif
   SaverArm arm;                                      // долго не трогали - заставка с часами
   for (;;) {
     if (saverDue) {
@@ -15908,6 +15951,19 @@ void runHome() {
       }
     }
     BtnEvent e = btnEvent();
+#if BOARD_S3
+    if (digitalRead(0) == LOW) {
+      if (!bootDown) { bootDown = true; bootDownAt = millis(); }
+      if (millis() - bootDownAt >= LONG_PRESS_MS) {
+        bootTouchMenu();
+        bootDown = false;
+        redraw = true;
+        continue;
+      }
+    } else {
+      bootDown = false;
+    }
+#endif
     if (e == EV_CLICK && sel < (int)apps.size()) {
       saverArmed = false;
       launchApp(apps[(size_t)sel]);
@@ -16015,7 +16071,7 @@ void setup() {
   holdReset = 0;
   if (afterHoldReset) debugLog("restarted by holding the button\n");
   xTaskCreate(holdWatchTask, "hold", 2048, nullptr, 2, nullptr);
-  joyCalibrate();
+  if (!touchOnly()) joyCalibrate();
   debugLog("3: joystick center %d / %d\n", joyCx, joyCy);
 #if BOARD_S3
   prefs.begin("dsk", true);
