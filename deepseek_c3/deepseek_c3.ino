@@ -15301,7 +15301,8 @@ void debugLive(bool pins) {
                  WiFi.status() == WL_CONNECTED ? "OK" : "OFF", sdOk ? "OK" : "OFF",
                  ENABLE_BLE && cfgBle ? "ON" : "OFF", accOk ? "OK" : "OFF");
       }
-      showMsg(String(b) + L3("\nУдержание: назад", "\nHold: back", "\n长按返回"), C_GREEN);
+      strncat(b, L3("\nУдержание: назад", "\nHold: back", "\n长按返回"), sizeof(b) - strlen(b) - 1);
+      showMsg(b, C_GREEN);
     }
     joyEvent();
     if (btnEvent() == EV_LONG) return;
@@ -15328,13 +15329,12 @@ void debugJournal() {
     portEXIT_CRITICAL(&debugMux);
     if (seen != count || shown != selected) {
       seen = count; shown = selected;
-      String page = L3("ЖУРНАЛ\n", "LOG\n", "日志\n");
-      if (count) {
-        page += String(selected + 1) + "/" + String(count) + "  " + String(entry.ms / 1000) + "s\n\n";
-        page += entry.text;
-      } else page += L3("Пока пусто", "No entries yet", "暂无记录");
-      page += L3("\n\nВверх/вниз: листать\nOK: свежие\nДержать: назад",
-                 "\n\nUp/down: browse\nOK: latest\nHold: back", "\n\n上下浏览\n确认最新\n长按返回");
+      char page[240];
+      snprintf(page, sizeof(page), "%s\n%lu/%lu  %lus\n\n%s\n\n%s",
+               L3("ЖУРНАЛ", "LOG", "日志"), (unsigned long)(count ? selected + 1 : 0),
+               (unsigned long)count, (unsigned long)(entry.ms / 1000),
+               count ? entry.text : "-", L3("Вверх/вниз: листать\nOK: свежие\nДержать: назад",
+               "Up/down: browse\nOK: latest\nHold: back", "上下浏览\n确认最新\n长按返回"));
       showMsg(page, C_GREEN);
     }
     uint8_t direction = joyEvent();
