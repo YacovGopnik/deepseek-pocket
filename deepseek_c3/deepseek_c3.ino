@@ -1941,6 +1941,7 @@ struct UiPause {
 // касанием (GPIO1-14). Касание = направление ручки; есть отклик вибромотором.
 // Проверка на S3-Zero: вверх - 4, вниз - 5, влево - 6, вправо - 13 (эти выводы свободны без SD-карты).
 #if BOARD_S3
+const uint32_t TOUCH_MAX_COUNT = 0x3FFFFF;
 const int TOUCH_PINS[4] = {4, 5, 6, 13};             // вверх, вниз, влево, вправо
 const int PIN_VIBRO = 40;                            // вибромотор через транзистор
 #endif
@@ -1971,6 +1972,16 @@ void touchInit() {
 #if BOARD_S3
   pinMode(PIN_VIBRO, OUTPUT);
   digitalWrite(PIN_VIBRO, LOW);
+  // Меньше циклов заряда: оставляем запас до насыщения 22-битного счётчика.
+  static bool configured = false;
+  if (!configured) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    touchSetConfig(100, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V2);
+#else
+    touchSetCycles(100, 100);
+#endif
+    configured = true;
+  }
   if (!cfgTouch || cfgSd) return;                    // 4, 5, 6, 13 у SD-карты
   for (int i = 0; i < 4; i++) {                      // «покой» каждой площадки (в этот момент её не трогают)
     uint64_t sum = 0;
@@ -1995,6 +2006,7 @@ uint8_t touchDir() {
   uint32_t best = 0;
   for (int i = 0; i < 4; i++) {
     uint32_t v = touchRead(TOUCH_PINS[i]), b = touchBase[i];
+    if (b == 0 || b + b / 12 >= TOUCH_MAX_COUNT) continue;
     uint32_t over = v > b ? v - b : 0;
     if (over > b / 12 && over > best) {             // касание: больше покоя на ~8%
       best = over;
@@ -15384,12 +15396,13 @@ void debugTouch() {
       for (int i = 0; i < 4; ++i) {
         uint32_t v = touchRead(TOUCH_PINS[i]);
         uint32_t threshold = base[i] + base[i] / 12;
-        bool active = v > threshold;
+        bool saturated = base[i] == 0 || threshold >= TOUCH_MAX_COUNT;
+        bool active = !saturated && v > threshold;
         char line[48];
-        snprintf(line, sizeof(line), "%s GPIO%d%s", names[i], TOUCH_PINS[i], active ? " *" : "");
+        snprintf(line, sizeof(line), "%s GPIO%d%s", names[i], TOUCH_PINS[i], saturated ? " SAT" : active ? " *" : "");
         int y = 46 + i * 38;
         tft.fillRect(0, y, 240, 36, C_BLACK);
-        drawUtf8(line, 4, y, active ? C_GREEN : C_WHITE, C_BLACK);
+        drawUtf8(line, 4, y, saturated ? C_RED : active ? C_GREEN : C_WHITE, C_BLACK);
         snprintf(line, sizeof(line), "%lu/%lu/%lu", (unsigned long)v,
                  (unsigned long)base[i], (unsigned long)threshold);
         drawUtf8(line, 4, y + 17, C_LIGHT, C_BLACK);
