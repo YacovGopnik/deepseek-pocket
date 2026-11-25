@@ -897,7 +897,7 @@ int cfgJoy = 2;           // чувствительность ручки: 0 (н�
 int cfgSd = 0;            // подключена SD-карта (вместо ИК-пульта, фонарика и пищалки)
 int cfgBle = 0;           // Bluetooth включён (Настройки -> Bluetooth)
 int cfgRot = 0;           // поворот экрана: 0..3 шага по 90° (Настройки -> Поворот экрана); ручка поворачивается вместе с ним
-int cfgTouch = 0;         // 0 off, 1 four directions, 2 six keys + BOOT
+int cfgTouch = 0;         // 0 off, 1 four directions, 2 six keys + BOOT, 3 touch only
 bool touchSix() { return BOARD_S3 && cfgTouch >= 2 && !cfgSd; }
 bool touchOnly() { return BOARD_S3 && cfgTouch == 3 && !cfgSd; }
 int physicalButtonPin() { return touchSix() ? 0 : PIN_SW; }
@@ -972,11 +972,20 @@ void loadSettings() {
   cfgRot = prefs.getUChar("rot", 0) & 3;
   cfgBle = prefs.getUChar("ble", 0) ? 1 : 0;
   cfgSd = prefs.getUChar("sd", 0) ? 1 : 0;
+  const bool migrateTouchOnly = BOARD_S3 && !cfgSd && !prefs.getBool("touch209", false);
   cfgTz = (int)prefs.getUChar("tz", 3 + 12) - 12;
   cfgCity = prefs.getString("city", "");
   cfgLat = prefs.getString("lat", "0").toFloat();
   cfgLon = prefs.getString("lon", "0").toFloat();
   prefs.end();
+  // Default to touch-only once after upgrading; preserve subsequent explicit BOOT choices.
+  if (migrateTouchOnly) {
+    cfgTouch = 3;
+    if (prefs.begin("dsk", false)) {
+      if (prefs.putUChar("touch", 3) == 1) prefs.putBool("touch209", true);
+      prefs.end();
+    }
+  }
   if (cfgLang >= N_LANGS || (!ENABLE_CJK && cfgLang == LANG_ZH)) cfgLang = LANG_RU;
   if (cfgBright < 0 || cfgBright > 4) cfgBright = 4;
   if (cfgIdle < 0 || cfgIdle > 4) cfgIdle = 2;
@@ -1629,6 +1638,7 @@ bool joyHeldAtBoot = false;                          // при включени�
 
 // Значение оси: медиана трёх замеров - одиночные выбросы АЦП (дрожащий контакт) не дёргают курсор.
 int joyRead(int pin) {
+  if (touchOnly()) return pin == PIN_JOY_X ? joyCx : joyCy;
   int a = analogRead(pin), b = analogRead(pin), c = analogRead(pin);
   if (a > b) { int t = a; a = b; b = t; }
   if (b > c) { int t = b; b = c; c = t; }
@@ -10737,6 +10747,10 @@ void runTilt() {
 // Пять положений относительно текущей ориентации экрана.
 void joyCalScreen() {
   KeepAwake awake;
+  if (touchOnly()) {
+    viewAnswer(L3("Джойстик отключен.", "Joystick disabled.", "摇杆已禁用。"), C_YELLOW);
+    return;
+  }
   const char* prompts[] = {
     L3("Отпустите ручку", "Release the stick", "松开摇杆"),
     L3("Влево до упора", "Hold full left", "向左到底"),
