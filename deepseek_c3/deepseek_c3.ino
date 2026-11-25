@@ -15301,7 +15301,6 @@ void debugLive(bool pins) {
                  WiFi.status() == WL_CONNECTED ? "OK" : "OFF", sdOk ? "OK" : "OFF",
                  ENABLE_BLE && cfgBle ? "ON" : "OFF", accOk ? "OK" : "OFF");
       }
-      strncat(b, L3("\nУдержание: назад", "\nHold: back", "\n长按返回"), sizeof(b) - strlen(b) - 1);
       showMsg(b, C_GREEN);
     }
     joyEvent();
@@ -15312,37 +15311,31 @@ void debugLive(bool pins) {
 
 void debugJournal() {
   KeepAwake awake;
-  uint32_t selected = 0;
-  uint32_t seen = UINT32_MAX, shown = UINT32_MAX;
-  bool follow = true;
+  int offset = 0, shown = -1;
+  uint32_t seen = UINT32_MAX;
   for (;;) {
     DebugEntry entry{};
-    uint32_t count, first;
+    uint32_t count;
     portENTER_CRITICAL(&debugMux);
     count = debugSequence;
-    first = count > DEBUG_LOG_COUNT ? count - DEBUG_LOG_COUNT : 0;
-    if (count) {
-      if (follow) selected = count - 1;
-      if (selected < first) selected = first;
-      entry = debugEntries[selected % DEBUG_LOG_COUNT];
-    }
+    int available = count < DEBUG_LOG_COUNT ? count : DEBUG_LOG_COUNT;
+    if (offset >= available) offset = available ? available - 1 : 0;
+    if (available) entry = debugEntries[(count - 1 - offset) % DEBUG_LOG_COUNT];
     portEXIT_CRITICAL(&debugMux);
-    if (seen != count || shown != selected) {
-      seen = count; shown = selected;
-      char page[240];
-      snprintf(page, sizeof(page), "%s\n%lu/%lu  %lus\n\n%s\n\n%s",
-               L3("ЖУРНАЛ", "LOG", "日志"), (unsigned long)(count ? selected + 1 : 0),
-               (unsigned long)count, (unsigned long)(entry.ms / 1000),
-               count ? entry.text : "-", L3("Вверх/вниз: листать\nOK: свежие\nДержать: назад",
-               "Up/down: browse\nOK: latest\nHold: back", "上下浏览\n确认最新\n长按返回"));
+    if (seen != count || shown != offset) {
+      seen = count;
+      shown = offset;
+      char page[160];
+      snprintf(page, sizeof(page), "LOG %d/%d  %lus\n\n%s", available - offset, available,
+               (unsigned long)(entry.ms / 1000), entry.text);
       showMsg(page, C_GREEN);
     }
     uint8_t direction = joyEvent();
-    if (direction == J_UP && selected > first) { --selected; follow = false; }
-    if (direction == J_DOWN && count && selected < count - 1) { ++selected; follow = selected == count - 1; }
+    if (direction == J_UP && offset < available - 1) ++offset;
+    if (direction == J_DOWN && offset > 0) --offset;
     BtnEvent event = btnEvent();
     if (event == EV_LONG) return;
-    if (event == EV_CLICK) follow = true;
+    if (event == EV_CLICK) offset = 0;
     delay(20);
   }
 }
@@ -15350,7 +15343,7 @@ void debugJournal() {
 void runDebugConsole() {
   for (;;) {
     std::vector<String> items = splitBar(L3("Система|GPIO и джойстик|Журнал|Назад", "System|GPIO and joystick|Log|Back", "系统|GPIO和摇杆|日志|返回"));
-    int choice = choiceScreen(L3("Консоль", "Debug console", "调试控制台"), items);
+    int choice = choiceScreen(L3("Консоль", "Console", "控制台"), items);
     if (choice == 0) debugLive(false);
     else if (choice == 1) debugLive(true);
     else if (choice == 2) debugJournal();
