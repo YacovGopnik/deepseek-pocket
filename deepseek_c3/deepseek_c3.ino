@@ -6075,6 +6075,7 @@ bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& er
   client.setInsecure();
   client.setHandshakeTimeout(15);
   HTTPClient http;
+  http.useHTTP10(true);                             // разбираем поток без chunked-обёртки
   http.setUserAgent(IMG_UA);
   http.setConnectTimeout(15000);
   http.setTimeout(15000);
@@ -6083,14 +6084,62 @@ bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& er
     return false;
   }
   int code = http.GET();
-  String body = code > 0 ? http.getString() : HTTPClient::errorToString(code);
-  http.end();
-  debugLog("[img] wikimedia HTTP %d, %u bytes\n", code, (unsigned)body.length());
+  debugLog("[img] wikimedia HTTP %d, content length %d\n", code, http.getSize());
   if (code != 200) {
-    err = "HTTP " + String(code) + (code < 0 ? String(" ") + body : String(""));
+    err = "HTTP " + String(code);
+    if (code < 0) err += String(" ") + HTTPClient::errorToString(code);
+    http.end();
     return false;
   }
-  hits = wiki::parseHits(toStd(body));
+
+  JsonDocument doc;
+  DeserializationError jsonError;
+  {
+    JsonDocument filter;
+    JsonObject page = filter["query"]["pages"].add<JsonObject>();
+    page["title"] = true;
+    page["index"] = true;
+    JsonObject info = page["imageinfo"].add<JsonObject>();
+    info["thumburl"] = true;
+    info["mime"] = true;
+    info["user"] = true;
+    if (filter.overflowed()) {
+      http.end();
+      err = T().errMem;
+      return false;
+    }
+    jsonError = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+  }
+  if (jsonError) {
+    debugLog("[img] wikimedia JSON: %s\n", jsonError.c_str());
+    err = jsonError == DeserializationError::NoMemory
+        ? String(T().errMem) : String("Wikimedia JSON: ") + jsonError.c_str();
+    return false;
+  }
+
+  std::vector<std::pair<int, JsonObjectConst>> pages;
+  int fallbackIndex = 1000;
+  for (JsonObjectConst page : doc["query"]["pages"].as<JsonArrayConst>()) {
+    pages.emplace_back(page["index"] | fallbackIndex, page);
+    ++fallbackIndex;
+  }
+  // Сохраняем порядок ответа у страниц с одинаковым index.
+  for (size_t i = 1; i < pages.size(); ++i)
+    for (size_t j = i; j > 0 && pages[j - 1].first > pages[j].first; --j)
+      std::swap(pages[j - 1], pages[j]);
+
+  hits.clear();
+  for (const auto& rankedPage : pages) {
+    JsonObjectConst page = rankedPage.second;
+    JsonObjectConst info = page["imageinfo"][0].as<JsonObjectConst>();
+    const char* thumbnail = info["thumburl"] | "";
+    if (!*thumbnail || strcmp(info["mime"] | "", "image/jpeg") != 0) continue;
+    hits.emplace_back();
+    hits.back().url = thumbnail;
+    hits.back().tags = wiki::niceTitle(page["title"] | "");
+    hits.back().user = info["user"] | "";
+  }
   return true;
 }
 
