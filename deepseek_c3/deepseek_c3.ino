@@ -11808,14 +11808,19 @@ void runHiScores() {
 // (небо, земля, мотоцикл), а потом одним махом уходит на экран. Земля не пересчитывается
 // каждый кадр: столбцы просто сдвигаются, считаются только новые справа.
 rider::Game rdr;
-const uint16_t C_RD_SKY = 0x10A3, C_RD_GROUND = 0x19C8;
-const uint16_t C_RD_EDGE = 0x36DB, C_RD_SHOULDER = 0x2310;
+const uint16_t C_RD_SKY = 0x0842, C_RD_EDGE = 0x36DB, C_RD_SHOULDER = 0x2310;
 const int RD_BIKE_X = 64, RD_TOP = 38;
 const int RD_BUF = 1536;
 static uint16_t rdBuf[RD_BUF];
 static int16_t rdCol[240];                               // высота земли в каждом столбце экрана
 static int rdRX, rdRY, rdRW, rdRH;                       // кусок, который сейчас собирается
-static int rdBikeY, rdWx, rdWy, rdUx, rdUy;              // мотоцикл: центр колёс и наклон
+struct RdFeature {
+  rider::Terrain type;
+  int x, y, radius;
+};
+static RdFeature rdFeatures[2];
+static unsigned rdFeatureCount, rdSawFrame;
+static int rdBikeX, rdBikeY, rdWx, rdWy, rdUx, rdUy;              // мотоцикл: центр колёс и наклон
 
 void rdPlot(int x, int y, uint16_t c) {
   x -= rdRX;
@@ -11847,13 +11852,76 @@ void rdLine(int x0, int y0, int x1, int y1, uint16_t c) {
   }
 }
 
-void rdSetBike(int sy, float angle) {
+void rdCollectFeatures(int64_t cam, unsigned frame) {
+  rdFeatureCount = 0;
+  rdSawFrame = frame;
+  for (double p = rider::Section(cam > 60 ? cam - 60 : 0).start(); p <= cam + 290; p += rider::SECTION) {
+    const rider::Section section(p);
+    if (section.type != rider::Terrain::Loop && section.type != rider::Terrain::Saw &&
+        section.type != rider::Terrain::Spikes) continue;
+    const double center = section.featureX();
+    const int x = static_cast<int>(static_cast<int64_t>(center) - cam);
+    if (x < -58 || x > 292) continue;
+    const int radius = section.type == rider::Terrain::Loop ? static_cast<int>(section.radius()) :
+                       section.type == rider::Terrain::Saw ? static_cast<int>(rider::SAW_RADIUS) : 0;
+    const int y = section.type == rider::Terrain::Loop ? static_cast<int>(rider::ROAD_Y) - radius :
+                  section.type == rider::Terrain::Saw ? static_cast<int>(section.sawY()) :
+                  static_cast<int>(rider::ground(center));
+    rdFeatures[rdFeatureCount++] = {section.type, x, y, radius};
+  }
+}
+
+void rdRing(int cx, int cy, int radius, uint16_t color) {
+  int x = radius, y = 0, error = 1 - radius;
+  while (x >= y) {
+    rdPlot(cx+x, cy+y, color); rdPlot(cx+x, cy-y, color);
+    rdPlot(cx-x, cy+y, color); rdPlot(cx-x, cy-y, color);
+    rdPlot(cx+y, cy+x, color); rdPlot(cx+y, cy-x, color);
+    rdPlot(cx-y, cy+x, color); rdPlot(cx-y, cy-x, color);
+    ++y;
+    if (error < 0) error += 2*y + 1;
+    else { --x; error += 2*(y-x) + 1; }
+  }
+}
+
+void rdPaintFeatures() {
+  for (unsigned i = 0; i < rdFeatureCount; ++i) {
+    const auto& f = rdFeatures[i];
+    const int span = f.radius ? f.radius + 2 : static_cast<int>(rider::SPIKE_HALF);
+    const int top = f.radius ? f.y - span : f.y - static_cast<int>(rider::SPIKE_HEIGHT);
+    const int bottom = f.radius ? f.y + span : f.y + 1;
+    if (f.x + span < rdRX || f.x - span >= rdRX + rdRW || bottom < rdRY || top >= rdRY + rdRH) continue;
+    if (f.type == rider::Terrain::Loop) {
+      rdRing(f.x, f.y, f.radius, C_RD_EDGE);
+      rdRing(f.x, f.y, f.radius - 1, C_RD_EDGE);
+    } else if (f.type == rider::Terrain::Saw) {
+      rdDisc(f.x, f.y, f.radius - 2, C_RED);
+      for (int tooth = 0; tooth < 8; ++tooth) {
+        const float angle = static_cast<float>((rdSawFrame + tooth * 4) % 32) * (rider::PI_F / 16);
+        const float c = cosf(angle), s = sinf(angle);
+        rdLine(f.x + int(c * 4), f.y + int(s * 4),
+               f.x + int(c * f.radius), f.y + int(s * f.radius), C_WHITE);
+      }
+      rdDisc(f.x, f.y, 3, C_RD_SKY);
+    } else {
+      for (int tooth = 0; tooth < rider::SPIKE_COUNT; ++tooth) {
+        const int x = f.x - static_cast<int>(rider::SPIKE_HALF) + tooth * rider::SPIKE_WIDTH;
+        const int tip = f.y - static_cast<int>(rider::SPIKE_HEIGHT);
+        rdLine(x, f.y, x + rider::SPIKE_WIDTH / 2, tip, C_YELLOW);
+        rdLine(x + rider::SPIKE_WIDTH / 2, tip, x + rider::SPIKE_WIDTH, f.y, C_YELLOW);
+      }
+    }
+  }
+}
+
+void rdSetBike(int sx, int sy, float angle) {
   float c = cosf(angle), s = sinf(angle);
+  rdBikeX = sx + static_cast<int>(5 * s);
   rdWx = (int)(9 * c);                                   // колёса вдоль наклона
   rdWy = (int)(9 * s);
   rdUx = (int)(9 * s);                                   // «вверх» от мотоцикла
   rdUy = (int)(-9 * c);
-  rdBikeY = sy - 5;                                      // центр колёс чуть выше земли
+  rdBikeY = sy - static_cast<int>(5 * c);               // центр колёс с внутренней стороны трассы
 }
 
 // Собрать кусок экрана в памяти и вывести. Строку счёта не трогает.
@@ -11881,11 +11949,11 @@ void rdRegion(int x0, int y0, int w, int h) {
       uint16_t* p = rdBuf + i;
       for (int row = 0; row < n; ++row, p += w) {
         int depth = row - g;
-        *p = depth < 0 ? C_RD_SKY : depth < 2 ? C_RD_EDGE :
-             depth < 7 ? C_RD_SHOULDER : C_RD_GROUND;
+        *p = depth >= 0 && depth < 2 ? C_RD_EDGE : C_RD_SKY;
       }
     }
-    const int sx = RD_BIKE_X, cy = rdBikeY;
+    rdPaintFeatures();
+    const int sx = rdBikeX, cy = rdBikeY;
     if (x0 <= sx + 14 && x0 + w > sx - 14 && y <= cy + 13 && y + n > cy - 16) {
       rdDisc(sx - rdWx, cy - rdWy, 5, C_WHITE);
       rdDisc(sx + rdWx, cy + rdWy, 5, C_WHITE);
@@ -11928,8 +11996,9 @@ void runRider() {
     rdr.reset();
     int64_t cam = static_cast<int64_t>(rdr.x) - RD_BIKE_X;
     for (int sx = 0; sx < 240; ++sx) rdCol[sx] = (int16_t)rider::ground(cam + sx);
-    rdSetBike((int)rdr.y, rdr.angle);
-    int oldBikeY = rdBikeY;
+    rdCollectFeatures(cam, 0);
+    rdSetBike(static_cast<int>(rdr.bikeX() - cam), (int)rdr.y, rdr.angle);
+    int oldBikeX = rdBikeX, oldBikeY = rdBikeY;
     rdRegion(0, RD_TOP, 240, 240 - RD_TOP);
     drawRiderBar(L3("Стрелка: газ / сальто", "Direction: gas / flip", "方向键：油门／翻转"));
     while (joyRaw() == J_NONE) {
@@ -11965,7 +12034,8 @@ void runRider() {
       int64_t newCam = static_cast<int64_t>(rdr.x) - RD_BIKE_X;
       int shift = (int)(newCam - cam);
       cam = newCam;
-      rdSetBike((int)rdr.y, rdr.angle);
+      rdCollectFeatures(cam, frame);
+      rdSetBike(static_cast<int>(rdr.bikeX() - cam), (int)rdr.y, rdr.angle);
       for (int left = 0; left < 240; left += 8) {
         int top = 240, bottom = 0;
         for (int sx = left; sx < left + 8; ++sx) {
@@ -11976,16 +12046,31 @@ void runRider() {
           int low = ground < prev ? ground : prev;
           int high = ground > prev ? ground : prev;
           if (low < top) top = low;
-          if (high + 7 > bottom) bottom = high + 7;
+          if (high + 2 > bottom) bottom = high + 2;
         }
         if (bottom > top) rdRegion(left, top, 8, bottom - top);
       }
+      for (unsigned i = 0; i < rdFeatureCount; ++i) {
+        const auto& f = rdFeatures[i];
+        if (shift == 0 && f.type != rider::Terrain::Saw) continue;
+        const int span = f.radius ? f.radius + 2 : static_cast<int>(rider::SPIKE_HALF) + 1;
+        const int height = f.radius ? span : static_cast<int>(rider::SPIKE_HEIGHT) + 1;
+        rdRegion(f.x - span, f.y - height, 2 * span + shift + 1, height + span + 1);
+      }
       int top = (oldBikeY < rdBikeY ? oldBikeY : rdBikeY) - 16;
       int bottom = (oldBikeY > rdBikeY ? oldBikeY : rdBikeY) + 16;
-      rdRegion(RD_BIKE_X - 14, top, 29, bottom - top);
+      int left = (oldBikeX < rdBikeX ? oldBikeX : rdBikeX) - 15;
+      int right = (oldBikeX > rdBikeX ? oldBikeX : rdBikeX) + 16;
+      rdRegion(left, top, right - left, bottom - top);
+      oldBikeX = rdBikeX;
       oldBikeY = rdBikeY;
 
-      if (event == rider::Landing && rdr.lastFlips) {
+      if (event == rider::LoopClear) {
+        snprintf(message, sizeof(message), "%s +%lu",
+                 L3("Петля", "Loop", "回环"), (unsigned long)rdr.lastBonus);
+        messageFrames = rider::FPS * 2;
+        drawRiderBar(message);
+      } else if (event == rider::Landing && rdr.lastFlips) {
         snprintf(message, sizeof(message), "%s x%u  +%lu",
                  rdr.clean ? L3("Чисто", "Clean", "完美") : L3("Сальто", "Flip", "翻转"),
                  rdr.lastFlips, (unsigned long)rdr.lastBonus);
@@ -11995,7 +12080,15 @@ void runRider() {
         message[0] = 0;
         drawRiderBar(nullptr);
       } else if (frame % 6 == 0) {
-        drawRiderBar(message);
+        const rider::Section upcoming(rdr.x + 90);
+        const double ahead = upcoming.featureX() - rdr.x;
+        const char* hint = message;
+        if (!messageFrames && ahead > 40 && ahead < 160) {
+          if (upcoming.type == rider::Terrain::Loop) hint = L3("Петля: держи газ", "Loop: hold gas", "回环：保持油门");
+          if (upcoming.type == rider::Terrain::Saw) hint = L3("Впереди пила", "Saw ahead", "前方有锯");
+          if (upcoming.type == rider::Terrain::Spikes) hint = L3("Впереди шипы", "Spikes ahead", "前方有尖刺");
+        }
+        drawRiderBar(hint);
       }
     }
     if (rdr.best > initialBest) saveBestKey("brider", rdr.best);
@@ -12003,7 +12096,11 @@ void runRider() {
     delay(400);
     char line[48];
     snprintf(line, sizeof(line), T().gameScore, (unsigned)rdr.score());
-    if (!resultBox(L3("Авария!", "Crash!", "摔车！"), line, C_RED)) return;
+    const char* reason = L3("Падение", "Bad landing", "摔车");
+    if (rdr.crashCause == rider::CrashCause::Loop) reason = L3("Мало скорости", "Too slow in loop", "回环速度不足");
+    if (rdr.crashCause == rider::CrashCause::Saw) reason = L3("Пила", "Saw hit", "碰到锯片");
+    if (rdr.crashCause == rider::CrashCause::Spikes) reason = L3("Шипы", "Spike hit", "碰到尖刺");
+    if (!resultBox(reason, line, C_RED)) return;
   }
 }
 
