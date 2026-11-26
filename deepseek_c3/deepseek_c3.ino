@@ -5278,7 +5278,7 @@ const uint16_t C_SUG_BG = 0x2124;   // тёмно-серый фон подска
 
 int startLayer() { return cfgLang == LANG_RU ? 0 : 2; }   // английский и китайский - с латиницы (пиньинь)
 
-void buildLayer(int layer, std::vector<Key>& keys) {
+void buildLayer(int layer, std::vector<Key>& keys, bool multiline) {
   keys.clear();
   std::vector<uint16_t> cps;
   utf8ToCps(LAYERS[layer], cps);
@@ -5286,6 +5286,7 @@ void buildLayer(int layer, std::vector<Key>& keys) {
   keys.push_back({' ', K_CHAR, "_"});
   keys.push_back({0, K_DEL, "<-"});
   keys.push_back({0, K_LAYER, "Aa"});
+  if (multiline) keys.push_back({'\n', K_CHAR, "NL"});
   keys.push_back({0, K_SEND, "OK"});
 }
 
@@ -5370,9 +5371,37 @@ void drawInput(const std::vector<uint16_t>& text) {
 // Курсор: row = -1 - строка подсказок, 0.. - ряды клавиатуры.
 String pendingInput;           // вопрос, который не удалось отправить (вернётся в поле ввода)
 
-String inputText() {
+// В редакторе заметок под заголовком видны последние две строки текста.
+void drawNoteInput(const std::vector<uint16_t>& text, const char* prompt) {
+  std::vector<uint16_t> preview(text);
+  preview.push_back('_');
+  size_t starts[2] = {}, lengths[2] = {};
+  size_t row = 0;
+  for (size_t i = 0; i < preview.size(); ++i) {
+    if (preview[i] == '\n' || lengths[row % 2] == COLS) {
+      ++row;
+      starts[row % 2] = preview[i] == '\n' ? i + 1 : i;
+      lengths[row % 2] = 0;
+    }
+    if (preview[i] != '\n') ++lengths[row % 2];
+  }
+
+  tft.fillRect(0, 0, 240, INPUT_LINES * GH, C_BLACK);
+  {
+    SmallFont small;
+    drawUtf8(prompt, 3, 2, C_YELLOW, C_BLACK);
+  }
+  const size_t first = row > 0 ? row - 1 : 0;
+  for (size_t line = first; line <= row; ++line) {
+    if (lengths[line % 2])
+      drawLine(preview.data() + starts[line % 2], lengths[line % 2],
+               GH + (line - first) * GH, C_WHITE, C_BLACK);
+  }
+}
+
+String editText(const char* prompt, bool multiline, size_t limit, const String& initial, bool* confirmed) {
   UiPause uiPause;
-  bool chatMode = g_kbChat;                          // в чате удержание открывает меню чата, в остальных местах - «назад»
+  bool chatMode = !prompt && g_kbChat;                          // в чате удержание открывает меню чата, в остальных местах - «назад»
   g_kbChat = false;
   SaverArm arm;
   int layer = startLayer();
@@ -5380,10 +5409,22 @@ String inputText() {
   int kbRow = 0, kbCol = 0;    // куда вернуться из строки подсказок
   std::vector<Key> keys;
   std::vector<uint16_t> text;
-  if (pendingInput.length()) {
+  if (prompt) {
+    utf8ToCps(initial.c_str(), text);
+    if (text.size() > limit) text.resize(limit);
+  } else if (pendingInput.length()) {
     utf8ToCps(pendingInput.c_str(), text);
     pendingInput = "";
   }
+
+  auto finish = [&](bool submit) {
+    if (confirmed) *confirmed = submit;
+    return (submit || confirmed) && !text.empty() ? fromStd(cpsToUtf8(text.data(), text.size())) : String();
+  };
+  auto paintInput = [&]() {
+    if (prompt) drawNoteInput(text, prompt);
+    else drawInput(text);
+  };
   std::vector<std::vector<uint16_t>> sg;
   bool redraw = true;
 
@@ -5428,12 +5469,12 @@ String inputText() {
       redraw = true;
     }
     if (redraw) {
-      buildLayer(layer, keys);
+      buildLayer(layer, keys, multiline);
       if (row >= kbRows(keys)) row = kbRows(keys) - 1;
       if (row >= 0 && col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
       tft.fillScreen(C_BLACK);
       tft.fillRect(0, INPUT_LINES * GH + 4, 240, 1, C_GRAY);   // линия под полем ввода (y=76)
-      drawInput(text);
+      paintInput();
       drawKeyboard(keys, kbIndex());
       refreshSuggestions();
       updateBattery();
@@ -5453,12 +5494,18 @@ String inputText() {
         if (insertOnly || line.compare(0, 2, "S:") == 0) line = line.substr(2);
         std::vector<uint16_t> cps;
         utf8ToCps(line.c_str(), cps);
+        if (prompt) {
+          size_t remaining = limit - text.size();
+          if (cps.size() > remaining) cps.resize(remaining);
+          if (!multiline)
+            for (auto& cp : cps) if (cp == '\n' || cp == '\r') cp = ' ';
+        }
         text.insert(text.end(), cps.begin(), cps.end());
         submit = !insertOnly;
       }
-      if (submit && text.size()) return String(cpsToUtf8(text.data(), text.size()).c_str());
+      if (submit && text.size()) return finish(true);
       if (line.size()) {
-        drawInput(text);
+        paintInput();
         refreshSuggestions();
       }
     }
@@ -5524,7 +5571,7 @@ String inputText() {
 
     BtnEvent e = btnEvent();
     if (e == EV_LONG) {                      // долгое нажатие: в чате - меню, в остальных местах - назад
-      if (!chatMode) return String("");
+      if (!chatMode) return finish(false);
       saverArmed = false;
       bool menuChanged = runMenu();
       if (g_goHome) return String("");
@@ -5544,29 +5591,29 @@ String inputText() {
       if (row < 0) {                         // вставить подсказку вместо недописанного слова
         size_t pl = partialWordLen(text);
         text.erase(text.end() - (long)pl, text.end());
-        for (uint16_t c : sg[(size_t)col]) if ((int)text.size() < MAX_IN) text.push_back(c);
-        if ((int)text.size() < MAX_IN) text.push_back(' ');
+        for (uint16_t c : sg[(size_t)col]) if (text.size() < limit) text.push_back(c);
+        if (text.size() < limit) text.push_back(' ');
         if (layer == 1 || layer == 3) {      // заглавные - обратно на строчные
           layer--;
-          buildLayer(layer, keys);
+          buildLayer(layer, keys, multiline);
         }
         row = kbRow;
         col = kbCol;
         if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
         drawKeyboard(keys, kbIndex());
-        drawInput(text);
+        paintInput();
         refreshSuggestions();
       } else {
         Key k = keys[(size_t)kbIndex()];
         switch (k.kind) {
           case K_CHAR:
-            if ((int)text.size() < MAX_IN) {
+            if (text.size() < limit) {
               text.push_back(k.cp);
-              drawInput(text);
+              paintInput();
             }
             if (layer == 1 || layer == 3) {    // после заглавной - снова строчные
               layer--;
-              buildLayer(layer, keys);
+              buildLayer(layer, keys, multiline);
               if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
               drawKeyboard(keys, kbIndex());
             }
@@ -5575,24 +5622,28 @@ String inputText() {
           case K_DEL:
             if (!text.empty()) {
               text.pop_back();
-              drawInput(text);
+              paintInput();
               refreshSuggestions();
             }
             break;
           case K_LAYER:
             layer = (layer + 1) % N_LAYERS;
-            buildLayer(layer, keys);
+            buildLayer(layer, keys, multiline);
             if (row >= kbRows(keys)) row = kbRows(keys) - 1;
             if (col >= kbRowLen(keys, row)) col = kbRowLen(keys, row) - 1;
             drawKeyboard(keys, kbIndex());
             break;
           case K_SEND:
-            return String(cpsToUtf8(text.data(), text.size()).c_str());
+            return finish(true);
         }
       }
     }
     delay(2);
   }
+}
+
+String inputText() {
+  return editText(nullptr, false, MAX_IN, String(), nullptr);
 }
 
 // ========================= СОХРАНЁННЫЕ ОТВЕТЫ =========================
@@ -7396,16 +7447,20 @@ int noteCount() {
 // Файл конспекта: первая строка - название, дальше текст.
 bool addNote(const String& title, const String& text) {
   for (int i = 0; i < MAX_NOTES; i++) {
-    if (LittleFS.exists(notePath(i).c_str())) continue;
-    File f = LittleFS.open(notePath(i).c_str(), "w");
+    const String path = notePath(i);
+    if (LittleFS.exists(path.c_str())) continue;
+    const char* temp = "/note.tmp";
+    File f = LittleFS.open(temp, "w");
     if (!f) return false;
     std::string t = toStd(title);
     for (char& c : t)
       if (c == '\n' || c == '\r') c = ' ';
     std::string d = t + "\n" + toStd(text);
-    f.write((const uint8_t*)d.data(), d.size());
+    const size_t written = f.write((const uint8_t*)d.data(), d.size());
     f.close();
-    return true;
+    if (written == d.size() && LittleFS.rename(temp, path.c_str())) return true;
+    LittleFS.remove(temp);
+    return false;
   }
   return false;
 }
@@ -7421,6 +7476,43 @@ bool readNote(int i, String& title, String& text) {
   return true;
 }
 
+void newDeviceNote() {
+  if (noteCount() >= MAX_NOTES) {
+    viewAnswer(L3("Достигнут лимит заметок. Удалите одну из списка.", "Note limit reached. Delete one from the list.", "笔记已满，请删除一条。"), C_YELLOW);
+    return;
+  }
+
+  bool confirmed = false;
+  String title = editText(L3("Название. OK — дальше", "Title. OK to continue", "标题。确认后继续"), false, 40, String(), &confirmed);
+  if (!confirmed) return;
+  title.trim();
+  if (!title.length()) title = L3("Без названия", "Untitled", "无标题");
+
+  String draft;
+  for (;;) {
+    draft = editText(L3("Текст. OK — сохранить", "Text. OK to save", "正文。确认后保存"), true, 600, draft, &confirmed);
+    String body = draft;
+    body.trim();
+    if (!confirmed) {
+      if (!body.length()) return;
+      auto options = splitBar(L3("Продолжить|Удалить черновик", "Continue|Discard draft", "继续|丢弃草稿"));
+      if (choiceScreen(L3("Заметка не сохранена", "Unsaved note", "笔记未保存"), options) == 1) return;
+      continue;
+    }
+    if (!body.length()) {
+      viewAnswer(L3("Введите текст заметки.", "Enter some text.", "请输入正文。"), C_YELLOW);
+      continue;
+    }
+    if (addNote(title, body)) {
+      viewAnswer(L3("Заметка сохранена.", "Note saved.", "笔记已保存。"), C_GREEN);
+      return;
+    }
+
+    auto options = splitBar(L3("Вернуться к тексту|Удалить черновик", "Return to text|Discard draft", "返回正文|丢弃草稿"));
+    if (choiceScreen(L3("Ошибка записи заметки", "Could not save note", "保存笔记失败"), options) == 1) return;
+  }
+}
+
 void runNotes() {
   int sel = 0;
   for (;;) {
@@ -7432,13 +7524,18 @@ void runNotes() {
       items.push_back(t);
       ids.push_back(i);
     }
+    items.insert(items.begin(), L3("+ Новая заметка", "+ New note", "+ 新建笔记"));
     items.push_back(L3("+ С телефона", "+ From phone", "+ 从手机上传"));
     items.push_back(T().menuBack);
     char title[48];
     snprintf(title, sizeof(title), "%s %u/%d", L3("Конспекты", "Notes", "笔记"), (unsigned)ids.size(), MAX_NOTES);
     sel = listScreen(title, items, std::vector<String>(), sel);
     if (sel < 0 || sel == (int)items.size() - 1) return;
-    if (sel == (int)ids.size()) {                    // страница на телефоне: там же, где настройка Wi-Fi
+    if (sel == 0) {
+      newDeviceNote();
+      continue;
+    }
+    if (sel == (int)ids.size() + 1) {                 // страница на телефоне: там же, где настройка Wi-Fi
       viewAnswer(L3("Сейчас плата создаст сеть Wi-Fi. Подключитесь к ней с телефона, внизу страницы будет форма «Конспект». "
                     "Когда закончите - нажмите кнопку на устройстве.",
                     "The device will now create a Wi-Fi network. Join it from your phone; the Note form is at the bottom of the page. "
@@ -7450,11 +7547,11 @@ void runNotes() {
       continue;
     }
     String t, x;
-    if (!readNote(ids[(size_t)sel], t, x)) continue;
+    if (!readNote(ids[(size_t)sel - 1], t, x)) continue;
     if (viewText(t + "\n\n" + x, C_WHITE) == EV_LONG) {
       std::vector<String> yn = splitBar(L3("Удалить|Оставить", "Delete|Keep", "删除|保留"));
       if (choiceScreen(L3("Удалить этот конспект?", "Delete this note?", "删除这条笔记？"), yn) == 0) {
-        LittleFS.remove(notePath(ids[(size_t)sel]).c_str());
+        LittleFS.remove(notePath(ids[(size_t)sel - 1]).c_str());
         if (sel > 0) sel--;
       }
     }
