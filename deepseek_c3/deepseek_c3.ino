@@ -6118,20 +6118,27 @@ bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& er
     return false;
   }
 
-  std::vector<std::pair<int, JsonObjectConst>> pages;
-  int fallbackIndex = 1000;
+  // Wikimedia возвращает до 20 страниц (gsrlimit).
+  struct RankedPage {
+    int index;
+    JsonObjectConst page;
+  };
+  RankedPage pages[20];
+  size_t count = 0;
   for (JsonObjectConst page : doc["query"]["pages"].as<JsonArrayConst>()) {
-    pages.emplace_back(page["index"] | fallbackIndex, page);
-    ++fallbackIndex;
+    if (count == sizeof(pages) / sizeof(pages[0])) break;
+    int index = page["index"] | (1000 + static_cast<int>(count));
+    size_t j = count++;
+    while (j > 0 && pages[j - 1].index > index) {
+      pages[j] = pages[j - 1];
+      --j;
+    }
+    pages[j] = {index, page};
   }
-  // Сохраняем порядок ответа у страниц с одинаковым index.
-  for (size_t i = 1; i < pages.size(); ++i)
-    for (size_t j = i; j > 0 && pages[j - 1].first > pages[j].first; --j)
-      std::swap(pages[j - 1], pages[j]);
 
   hits.clear();
-  for (const auto& rankedPage : pages) {
-    JsonObjectConst page = rankedPage.second;
+  for (size_t i = 0; i < count; ++i) {
+    JsonObjectConst page = pages[i].page;
     JsonObjectConst info = page["imageinfo"][0].as<JsonObjectConst>();
     const char* thumbnail = info["thumburl"] | "";
     if (!*thumbnail || strcmp(info["mime"] | "", "image/jpeg") != 0) continue;
