@@ -11808,15 +11808,14 @@ void runHiScores() {
 // (небо, земля, мотоцикл), а потом одним махом уходит на экран. Земля не пересчитывается
 // каждый кадр: столбцы просто сдвигаются, считаются только новые справа.
 rider::Game rdr;
-const uint16_t C_RD_SKY = 0x1926, C_RD_GROUND = 0x3D03;
-const int RD_BIKE_X = 70, RD_TOP = 18;
+const uint16_t C_RD_SKY = 0x10A3, C_RD_GROUND = 0x19C8;
+const uint16_t C_RD_EDGE = 0x36DB, C_RD_SHOULDER = 0x2310;
+const int RD_BIKE_X = 64, RD_TOP = 38;
 const int RD_BUF = 1536;
 static uint16_t rdBuf[RD_BUF];
 static int16_t rdCol[240];                               // высота земли в каждом столбце экрана
 static int rdRX, rdRY, rdRW, rdRH;                       // кусок, который сейчас собирается
 static int rdBikeY, rdWx, rdWy, rdUx, rdUy;              // мотоцикл: центр колёс и наклон
-static long rdBarScore = -1;
-static int rdBarSec = -1, rdBarW = 0;
 
 void rdPlot(int x, int y, uint16_t c) {
   x -= rdRX;
@@ -11850,11 +11849,11 @@ void rdLine(int x0, int y0, int x1, int y1, uint16_t c) {
 
 void rdSetBike(int sy, float angle) {
   float c = cosf(angle), s = sinf(angle);
-  rdWx = (int)(7 * c);                                   // колёса вдоль наклона
-  rdWy = (int)(7 * s);
+  rdWx = (int)(9 * c);                                   // колёса вдоль наклона
+  rdWy = (int)(9 * s);
   rdUx = (int)(9 * s);                                   // «вверх» от мотоцикла
   rdUy = (int)(-9 * c);
-  rdBikeY = sy - 4;                                      // центр колёс чуть выше земли
+  rdBikeY = sy - 5;                                      // центр колёс чуть выше земли
 }
 
 // Собрать кусок экрана в памяти и вывести. Строку счёта не трогает.
@@ -11880,18 +11879,23 @@ void rdRegion(int x0, int y0, int w, int h) {
     for (int i = 0; i < w; i++) {
       int g = rdCol[x0 + i] - y;                         // с какой строки куска начинается земля
       uint16_t* p = rdBuf + i;
-      for (int r = 0; r < n; r++, p += w) *p = r >= g ? C_RD_GROUND : C_RD_SKY;
+      for (int row = 0; row < n; ++row, p += w) {
+        int depth = row - g;
+        *p = depth < 0 ? C_RD_SKY : depth < 2 ? C_RD_EDGE :
+             depth < 7 ? C_RD_SHOULDER : C_RD_GROUND;
+      }
     }
     const int sx = RD_BIKE_X, cy = rdBikeY;
     if (x0 <= sx + 14 && x0 + w > sx - 14 && y <= cy + 13 && y + n > cy - 16) {
-      rdDisc(sx - rdWx, cy - rdWy, 4, C_WHITE);
-      rdDisc(sx + rdWx, cy + rdWy, 4, C_WHITE);
+      rdDisc(sx - rdWx, cy - rdWy, 5, C_WHITE);
+      rdDisc(sx + rdWx, cy + rdWy, 5, C_WHITE);
       rdDisc(sx - rdWx, cy - rdWy, 2, C_BLACK);
       rdDisc(sx + rdWx, cy + rdWy, 2, C_BLACK);
       rdLine(sx - rdWx, cy - rdWy, sx + rdWx, cy + rdWy, C_YELLOW);
       rdLine(sx - rdWx, cy - rdWy, sx + rdUx / 2, cy + rdUy / 2, C_YELLOW);
       rdLine(sx + rdWx, cy + rdWy, sx + rdUx / 2, cy + rdUy / 2, C_YELLOW);
-      rdDisc(sx + rdUx, cy + rdUy, 3, C_RED);
+      rdLine(sx + rdUx / 2, cy + rdUy / 2, sx + rdUx, cy + rdUy, C_WHITE);
+      rdDisc(sx + rdUx, cy + rdUy, 3, C_RD_EDGE);
     }
     tft.startWrite();
     tft.setAddrWindow(x0, y, w, n);
@@ -11900,32 +11904,17 @@ void rdRegion(int x0, int y0, int w, int h) {
   }
 }
 
-// Строка счёта: перерисовывается только то, что изменилось (full - целиком).
-void drawRiderBar(bool full) {
+// Счёт и дистанция живут отдельно от области, где движется трасса.
+void drawRiderBar(const char* message) {
   SmallFont small;
-  if (full) {
-    tft.fillRect(0, 0, 240, RD_TOP, C_BLACK);
-    rdBarScore = -1;
-    rdBarSec = -1;
-    rdBarW = 0;
-  }
-  char b[48];
-  long sc = (long)rdr.score();
-  if (sc != rdBarScore) {
-    rdBarScore = sc;
-    snprintf(b, sizeof(b), T().gameScore, (unsigned)sc);
-    drawUtf8(b, 2, 1, C_WHITE, C_BLACK);
-  }
-  int sec = (rdr.timeLeft + rider::FPS - 1) / rider::FPS;
-  bool red = rdr.timeLeft < 10 * rider::FPS;
-  if (sec * 2 + (red ? 1 : 0) != rdBarSec) {
-    rdBarSec = sec * 2 + (red ? 1 : 0);
-    snprintf(b, sizeof(b), "%d %s", sec, L3("с", "s", "秒"));
-    int w = textWidth(b);
-    if (w < rdBarW) tft.fillRect(238 - rdBarW, 0, rdBarW - w, RD_TOP, C_BLACK);   // число стало короче
-    rdBarW = w;
-    drawUtf8(b, 238 - w, 1, red ? C_RED : C_YELLOW, C_BLACK);
-  }
+  char line[48];
+  tft.fillRect(0, 0, 240, RD_TOP, C_BLACK);
+  snprintf(line, sizeof(line), T().gameScore, (unsigned)rdr.score());
+  drawUtf8(line, 3, 2, C_WHITE, C_BLACK);
+  snprintf(line, sizeof(line), "%lu %s", (unsigned long)rdr.distance(), L3("м", "m", "米"));
+  drawUtf8(line, 237 - textWidth(line), 2, C_RD_EDGE, C_BLACK);
+  if (message && *message) drawSmallCenteredBg(message, 20, C_YELLOW, C_BLACK);
+  tft.drawFastHLine(0, RD_TOP - 1, 240, C_RD_SHOULDER);
 }
 
 void runRider() {
@@ -11933,32 +11922,30 @@ void runRider() {
     notInEdition();
     return;
   }
+  KeepAwake awake;
   rdr.best = loadBestKey("brider");
   for (;;) {
     rdr.reset();
-    tft.fillScreen(C_RD_SKY);
-    int cam = (int)rdr.x - RD_BIKE_X;                    // камера двигается целыми точками
-    for (int sx = 0; sx < 240; sx++) {
-      int gy = (int)rider::ground((float)(cam + sx));
-      rdCol[sx] = (int16_t)gy;
-      tft.fillRect(sx, gy, 1, 240 - gy, C_RD_GROUND);
-    }
-    drawRiderBar(true);
-    drawSmallCenteredBg(L3("Ручку в сторону - газ", "Push the stick - gas", "推摇杆：油门"), 26, C_WHITE, C_RD_SKY);
-    drawSmallCenteredBg(L3("В воздухе газ = сальто", "In the air gas = flip", "空中油门=翻转"), 44, C_WHITE, C_RD_SKY);
+    int64_t cam = static_cast<int64_t>(rdr.x) - RD_BIKE_X;
+    for (int sx = 0; sx < 240; ++sx) rdCol[sx] = (int16_t)rider::ground(cam + sx);
     rdSetBike((int)rdr.y, rdr.angle);
-    int oby = rdBikeY;
-    rdRegion(RD_BIKE_X - 14, oby - 16, 29, 30);
-    while (joyRaw() == J_NONE) {                        // старт по первому движению ручки
+    int oldBikeY = rdBikeY;
+    rdRegion(0, RD_TOP, 240, 240 - RD_TOP);
+    drawRiderBar(L3("Стрелка: газ / сальто", "Direction: gas / flip", "方向键：油门／翻转"));
+    while (joyRaw() == J_NONE) {
       if (btnEvent() == EV_LONG) return;
       delay(5);
     }
-    tft.fillRect(0, 26, 240, 36, C_RD_SKY);
+    const auto initialBest = rdr.best;
     uint32_t next = millis();
-    int frame = 0, msgFrames = 0;
+    unsigned frame = 0;
+    int messageFrames = 0;
+    char message[48] = {};
+    drawRiderBar(nullptr);
+
     while (!rdr.over) {
       if (btnEvent() == EV_LONG) {
-        saveBestKey("brider", rdr.best);
+        if (rdr.best > initialBest) saveBestKey("brider", rdr.best);
         return;
       }
       int32_t late = (int32_t)(millis() - next);
@@ -11966,55 +11953,57 @@ void runRider() {
         delay(1);
         continue;
       }
-      if (late > 100) next = millis();                  // сильно отстали - не догоняем рывком
-      next += 1000 / rider::FPS;
-      int dx, dy;
-      joyAnalog(dx, dy);
-      int gt = joyThr() * 4 / 5;
-      bool gas = dx > gt || dx < -gt || dy > gt || dy < -gt;
-      int res = rdr.step(gas);
-      if (res == 1) beep(1, 1000, 6);
-      if (res == 2) beep(1, rdr.lastFlips ? 1700 : 500, rdr.lastFlips ? 40 : 8);
-      // земля: сдвигаем столбцы, считаем только новые справа, перерисовываем узкие полоски, где что-то изменилось
-      int ncam = (int)rdr.x - RD_BIKE_X;
-      int shift = ncam - cam;
-      cam = ncam;
+      if (late > 100) next = millis();
+      ++frame;
+      // 33 + 33 + 34 ms даёт ровно 30 шагов физики в секунду.
+      next += 1000 / rider::FPS + (frame % 3 == 0);
+      const bool gas = joyRaw() != J_NONE;
+      const rider::Event event = rdr.step(gas);
+      if (event == rider::Takeoff) beep(1, 1000, 6);
+      if (event == rider::Landing) beep(1, rdr.lastFlips ? 1700 : 500, rdr.lastFlips ? 30 : 8);
+
+      int64_t newCam = static_cast<int64_t>(rdr.x) - RD_BIKE_X;
+      int shift = (int)(newCam - cam);
+      cam = newCam;
       rdSetBike((int)rdr.y, rdr.angle);
-      if (shift < 0 || shift > 240) shift = 240;
-      for (int cx = 0; cx < 240; cx += 8) {
-        int lo = 999, hi = -1;
-        for (int sx = cx; sx < cx + 8; sx++) {
-          int py = rdCol[sx];
-          int gy = sx + shift < 240 ? rdCol[sx + shift] : (int)rider::ground((float)(cam + sx));
-          if (gy != py) {
-            int a = gy < py ? gy : py, b2 = gy < py ? py : gy;
-            if (a < lo) lo = a;
-            if (b2 > hi) hi = b2;
-            rdCol[sx] = (int16_t)gy;
-          }
+      for (int left = 0; left < 240; left += 8) {
+        int top = 240, bottom = 0;
+        for (int sx = left; sx < left + 8; ++sx) {
+          int prev = rdCol[sx];
+          int ground = sx + shift < 240 ? rdCol[sx + shift] : (int)rider::ground(cam + sx);
+          if (ground == prev) continue;
+          rdCol[sx] = (int16_t)ground;
+          int low = ground < prev ? ground : prev;
+          int high = ground > prev ? ground : prev;
+          if (low < top) top = low;
+          if (high + 7 > bottom) bottom = high + 7;
         }
-        if (hi > lo) rdRegion(cx, lo, 8, hi - lo);
+        if (bottom > top) rdRegion(left, top, 8, bottom - top);
       }
-      // мотоцикл: один кусок, накрывающий и старое место, и новое
-      int top = (oby < rdBikeY ? oby : rdBikeY) - 16, bot = (oby > rdBikeY ? oby : rdBikeY) + 14;
-      rdRegion(RD_BIKE_X - 14, top, 29, bot - top);
-      oby = rdBikeY;
-      if (res == 2 && rdr.lastFlips) {
-        char b[32];
-        snprintf(b, sizeof(b), "%s x%d  +2 %s", L3("Сальто", "Flip", "翻转"), rdr.lastFlips, L3("с", "s", "秒"));
-        drawSmallCenteredBg(b, 26, C_YELLOW, C_RD_SKY);
-        msgFrames = rider::FPS;
-      } else if (msgFrames && --msgFrames == 0) {
-        tft.fillRect(0, 26, 240, 16, C_RD_SKY);
+      int top = (oldBikeY < rdBikeY ? oldBikeY : rdBikeY) - 16;
+      int bottom = (oldBikeY > rdBikeY ? oldBikeY : rdBikeY) + 16;
+      rdRegion(RD_BIKE_X - 14, top, 29, bottom - top);
+      oldBikeY = rdBikeY;
+
+      if (event == rider::Landing && rdr.lastFlips) {
+        snprintf(message, sizeof(message), "%s x%u  +%lu",
+                 rdr.clean ? L3("Чисто", "Clean", "完美") : L3("Сальто", "Flip", "翻转"),
+                 rdr.lastFlips, (unsigned long)rdr.lastBonus);
+        messageFrames = rider::FPS * 2;
+        drawRiderBar(message);
+      } else if (messageFrames && --messageFrames == 0) {
+        message[0] = 0;
+        drawRiderBar(nullptr);
+      } else if (frame % 6 == 0) {
+        drawRiderBar(message);
       }
-      if (++frame % 6 == 0) drawRiderBar(false);
     }
-    saveBestKey("brider", rdr.best);
-    drawRiderBar(false);
-    delay(500);
-    char b[48];
-    snprintf(b, sizeof(b), T().gameScore, (unsigned)rdr.score());
-    if (!resultBox(rdr.crashed ? L3("Авария!", "Crash!", "摔车！") : L3("Время вышло", "Time is up", "时间到"), b, rdr.crashed ? C_RED : C_YELLOW)) return;
+    if (rdr.best > initialBest) saveBestKey("brider", rdr.best);
+    drawRiderBar(nullptr);
+    delay(400);
+    char line[48];
+    snprintf(line, sizeof(line), T().gameScore, (unsigned)rdr.score());
+    if (!resultBox(L3("Авария!", "Crash!", "摔车！"), line, C_RED)) return;
   }
 }
 

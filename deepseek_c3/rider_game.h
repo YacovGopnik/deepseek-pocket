@@ -1,57 +1,62 @@
-// «Райдер»: мотоцикл едет по холмам. Кнопка - газ; в воздухе газ крутит мотоцикл назад (сальто).
-// Заезд длится минуту (каждое сальто добавляет 2 секунды): кто дальше уедет и больше накрутит.
-// Приземлиться надо на колёса. Трасса у всех одинаковая, поэтому рекорды разных игроков можно сравнивать.
-// Чистая логика без экрана - тестируется на компьютере.
+// Бесконечная трасса для «Райдера». Логика не зависит от дисплея и Arduino.
 #pragma once
 #include <math.h>
 #include <stdint.h>
 
 namespace rider {
 
-const float G = 0.22f;            // тяжесть, точек на кадр^2
-const float V_MIN = 1.6f;         // мотоцикл не останавливается совсем
-const float V_MAX = 6.5f;
-const float ACCEL = 0.09f;        // газ
-const float DRAG = 0.012f;        // накат без газа
-const float SPIN = 0.19f;         // вращение в воздухе при газе, радиан за кадр
-const float LAND_OK = 1.05f;      // допустимый угол к склону при посадке (~60 градусов)
-const float LEVEL = 0.05f;        // как быстро мотоцикл сам выравнивается в воздухе без газа
-const float PI_F = 3.14159265f;
-const int FPS = 30;
-const int RUN_FRAMES = 60 * FPS;  // длина заезда
-const int FLIP_BONUS = 2 * FPS;   // прибавка времени за сальто
+constexpr int FPS = 30;
+constexpr int SECTION = 448;
+constexpr float PI_F = 3.14159265f;
+constexpr float GRAVITY = 0.29f;
 
-// Трамплин: каждые 520 точек дорога плавно поднимается на 30 точек и обрывается.
-const float RAMP_FROM = 420, RAMP_EVERY = 520, RAMP_LEN = 90, RAMP_H = 30;
-inline float ramp(float x) {
-  if (x < RAMP_FROM) return 0;
-  float u = fmodf(x - RAMP_FROM, RAMP_EVERY);
-  if (u >= RAMP_LEN) return 0;
-  float t = u / RAMP_LEN;
-  return RAMP_H * t * t;                               // всё круче к краю
+inline float clamp(float value, float low, float high) {
+  return value < low ? low : value > high ? high : value;
 }
 
-// Высота земли в точке x (экранная: больше - ниже). Холмы растут с расстоянием.
-inline float ground(float x) {
-  if (x < 0) x = 0;
-  float grow = x / 3000.0f;
-  if (grow > 1.0f) grow = 1.0f;
-  float a = 1.0f + grow;
-  float start = x < 220 ? x / 220.0f : 1.0f;          // первые метры - ровная дорога
-  return 150.0f - ramp(x) - start * a * (13.0f * sinf(x / 62.0f) + 6.0f * sinf(x / 23.0f + 1.3f) + 5.0f * sinf(x / 131.0f + 0.7f));
+inline float smooth(float t) { return t * t * (3.0f - 2.0f * t); }
+
+inline uint32_t mix(uint32_t n) {
+  n ^= n >> 16;
+  n *= 0x7feb352du;
+  n ^= n >> 15;
+  n *= 0x846ca68bu;
+  return n ^ (n >> 16);
 }
 
-// Угол склона (вниз по экрану - плюс). У самого края трамплина берём наклон перед обрывом.
-inline float slopeAt(float x) {
-  float a = x - 3, b = x + 3;
-  if (x >= RAMP_FROM) {
-    float u = fmodf(x - RAMP_FROM, RAMP_EVERY);
-    if (u < RAMP_LEN && u + 3 >= RAMP_LEN) b = x + (RAMP_LEN - u) - 0.01f;      // не заглядываем за край
-    if (u >= RAMP_LEN && u - 3 < RAMP_LEN) a = x - (u - RAMP_LEN);              // и не оглядываемся на него
+struct Surface {
+  float y;
+  float grade;
+};
+
+// Аналитический наклон не пересекает край трамплина. Секции сходятся без ступеньки.
+inline Surface surface(double x) {
+  if (x <= 0) return {151, 0};
+  const auto section = static_cast<uint64_t>(x / SECTION);
+  const float u = static_cast<float>(x - static_cast<double>(section) * SECTION);
+  const uint32_t pattern = mix(static_cast<uint32_t>(section) ^ 0x51f15e5du);
+  const float difficulty = section < 24 ? static_cast<float>(section) / 24 : 1;
+  const float lip = 225 + (pattern & 63);
+  const float approach = 87 + ((pattern >> 6) & 31);
+  const float height = 26 + ((pattern >> 11) & 7) + difficulty * 12;
+  const float dip = 16 + ((pattern >> 14) & 15) + difficulty * 8;
+  if (u < lip - approach) {
+    const float length = lip - approach;
+    const float t = u / length;
+    const float wave = 4 * t * (1 - t);
+    const float roller = section == 0 ? 0 : static_cast<int>((pattern >> 18) & 31) - 15;
+    return {151 + roller * wave * wave, roller * 8 * wave * (1 - 2 * t) / length};
   }
-  if (b - a < 0.5f) a = b - 0.5f;
-  return atan2f(ground(b) - ground(a), b - a);
+  if (u < lip) {
+    const float t = (u - lip + approach) / approach;
+    return {151 - height * t * t, -2 * height * t / approach};
+  }
+  const float length = SECTION - lip;
+  const float t = (u - lip) / length;
+  return {151 + dip * (1 - smooth(t)), -dip * 6 * t * (1 - t) / length};
 }
+
+inline float ground(double x) { return surface(x).y; }
 
 inline float wrapAngle(float a) {
   while (a > PI_F) a -= 2 * PI_F;
@@ -59,100 +64,111 @@ inline float wrapAngle(float a) {
   return a;
 }
 
+enum Event { Riding, Takeoff, Landing, Crash };
+
 class Game {
  public:
-  float x = 0, y = 0;              // точка касания (середина между колёсами)
-  float v = 3.0f;                  // скорость вдоль склона (на земле)
-  float vx = 0, vy = 0;            // скорость в воздухе
-  float angle = 0;                 // наклон мотоцикла (0 - ровно; минус - нос вверх)
-  float spun = 0;                  // сколько накручено в этом прыжке
+  double x = 30;
+  float y = 151;
+  float v = 3.1f;
+  float vx = 0, vy = 0;
+  float angle = 0;
   bool air = false, over = false;
-  bool crashed = false;            // заезд кончился аварией (а не по времени)
-  int timeLeft = RUN_FRAMES;       // осталось кадров
-  int flips = 0;                   // всего сальто
-  int lastFlips = 0;               // сальто в последнем прыжке (для надписи)
   uint32_t best = 0;
+  uint32_t lastBonus = 0;
+  unsigned lastFlips = 0, combo = 0;
+  bool clean = false;
 
   void reset() {
-    x = 30;
-    y = ground(x);
-    v = 3.0f;
-    vx = vy = 0;
-    angle = slopeAt(x);
-    spun = 0;
-    air = over = crashed = false;
-    flips = lastFlips = 0;
-    timeLeft = RUN_FRAMES;
+    const uint32_t record = best;
+    *this = Game{};
+    best = record;
   }
 
-  uint32_t score() const { return (uint32_t)(x / 10.0f) + (uint32_t)flips * 25u; }
+  uint32_t distance() const {
+    const double meters = (x - 30) / 10;
+    return meters >= UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(meters);
+  }
 
-  // Один кадр. gas - кнопка нажата. Возвращает: 0 - едем, 1 - прыжок начался, 2 - приземлились, 3 - авария, 4 - время вышло.
-  int step(bool gas) {
-    if (over) return 0;
-    lastFlips = 0;
-    if (--timeLeft <= 0) {
-      timeLeft = 0;
-      over = true;
-      if (score() > best) best = score();
-      return 4;
-    }
+  uint32_t score() const {
+    const uint64_t total = static_cast<uint64_t>(distance()) + trickPoints;
+    return total >= UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(total);
+  }
+
+  Event step(bool gas) {
+    if (over) return Crash;
+    lastFlips = lastBonus = 0;
+    const float topSpeed = 7.0f + clamp(static_cast<float>((x - 30) / 10000), 0, 1) * 1.5f;
+    Event event = Riding;
+
     if (!air) {
-      float s = slopeAt(x);
-      v += (gas ? ACCEL : -DRAG) + G * sinf(s) * 0.55f;        // под гору разгоняет, в гору тормозит
-      if (v < V_MIN) v = V_MIN;
-      if (v > V_MAX) v = V_MAX;
-      float nx = x + v * cosf(s);
-      float fy = y + v * sinf(s) + G * 0.5f;                    // куда ушли бы по прямой
-      float gy = ground(nx);
-      if (fy < gy - 0.15f) {                                    // земля уходит из-под колёс быстрее, чем падает мотоцикл - летим
+      const Surface here = surface(x);
+      const float slope = atanf(here.grade);
+      v = clamp(v + (gas ? 0.15f : -0.04f) + GRAVITY * sinf(slope) * 0.50f,
+                2.6f, topSpeed + (boostFrames ? 0.85f : 0.0f));
+      if (boostFrames) --boostFrames;
+      vx = v * cosf(slope);
+      vy = v * sinf(slope);
+      x += vx;
+      const Surface next = surface(x);
+      const float tangent = y + vy + GRAVITY * 0.5f;
+      if (tangent < next.y - 0.45f) {
         air = true;
-        vx = v * cosf(s);
-        vy = v * sinf(s);
-        x = nx;
-        y = fy;
-        angle = s;
-        spun = 0;
-        return 1;
+        angle = slope;
+        y = tangent;
+        vy += GRAVITY * 0.5f;
+        spin = rotation = 0;
+        event = Takeoff;
+      } else {
+        y = next.y;
+        angle = atanf(next.grade);
       }
-      x = nx;
-      y = gy;
-      angle = slopeAt(x);
-      return 0;
+    } else {
+      vy += GRAVITY;
+      x += vx;
+      y += vy;
+      spin = gas ? clamp(spin - 0.055f, -0.30f, 0) : spin * 0.44f;
+      rotation += spin;
+      angle = wrapAngle(angle + spin);
+      const Surface below = surface(x);
+      const float slope = atanf(below.grade);
+      if (!gas) angle = wrapAngle(angle + clamp(wrapAngle(slope - angle), -0.065f, 0.065f));
+
+      if (y >= below.y) {
+        y = below.y;
+        const float impactAngle = fabsf(wrapAngle(angle - slope));
+        if (impactAngle > 0.95f) {
+          over = true;
+          event = Crash;
+        } else {
+          clean = impactAngle <= 0.42f;
+          lastFlips = static_cast<unsigned>(-rotation / (2 * PI_F));
+          if (lastFlips && clean) {
+            if (combo < 5) ++combo;
+            boostFrames = 40;
+          } else {
+            combo = lastFlips ? 1 : 0;
+          }
+          lastBonus = lastFlips * 25u * combo;
+          trickPoints += lastBonus;
+          air = false;
+          angle = slope;
+          v = clamp((vx * cosf(slope) + vy * sinf(slope)) * (clean ? 0.98f : 0.78f)
+                    + (boostFrames ? 0.85f : 0), 2.6f, topSpeed + 0.85f);
+          event = Landing;
+        }
+      }
     }
-    vy += G;
-    x += vx;
-    y += vy;
-    if (gas) {                                                  // газ в воздухе - сальто назад
-      angle -= SPIN;
-      spun += SPIN;
-    } else {                                                    // без газа нос сам понемногу опускается к земле
-      float want = slopeAt(x + vx * 6);
-      float d = wrapAngle(want - angle);
-      angle += d > LEVEL ? LEVEL : d < -LEVEL ? -LEVEL : d;
-    }
-    float gy = ground(x);
-    if (y < gy) return 0;
-    y = gy;
-    float s = slopeAt(x);
-    float diff = wrapAngle(angle - s);
-    if (diff > LAND_OK || diff < -LAND_OK) {                    // упали не на колёса
-      over = true;
-      crashed = true;
-      if (score() > best) best = score();
-      return 3;
-    }
-    lastFlips = (int)((spun + 0.9f) / (2 * PI_F));
-    flips += lastFlips;
-    timeLeft += lastFlips * FLIP_BONUS;
-    air = false;
-    v = vx * cosf(s) + vy * sinf(s);                            // скорость вдоль склона
-    if (v < V_MIN) v = V_MIN;
-    if (v > V_MAX) v = V_MAX;
-    angle = s;
-    if (score() > best) best = score();
-    return 2;
+
+    const uint32_t current = score();
+    if (current > best) best = current;
+    return event;
   }
+
+ private:
+  float spin = 0, rotation = 0;
+  uint64_t trickPoints = 0;
+  unsigned boostFrames = 0;
 };
 
 }  // namespace rider
