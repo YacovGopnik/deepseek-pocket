@@ -6084,7 +6084,6 @@ bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& er
     return false;
   }
   int code = http.GET();
-  debugLog("[img] wikimedia HTTP %d, content length %d\n", code, http.getSize());
   if (code != 200) {
     err = "HTTP " + String(code);
     if (code < 0) err += String(" ") + HTTPClient::errorToString(code);
@@ -6112,9 +6111,7 @@ bool wikiSearch(const String& query, std::vector<pixabay::Hit>& hits, String& er
     http.end();
   }
   if (jsonError) {
-    debugLog("[img] wikimedia JSON: %s\n", jsonError.c_str());
-    err = jsonError == DeserializationError::NoMemory
-        ? String(T().errMem) : String("Wikimedia JSON: ") + jsonError.c_str();
+    err = jsonError == DeserializationError::NoMemory ? T().errMem : T().errBadReply;
     return false;
   }
 
