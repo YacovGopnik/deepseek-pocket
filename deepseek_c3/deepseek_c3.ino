@@ -26,6 +26,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "debug_log.h"
+#include "boot_report.h"
 
 // Плата: ESP32-C3 Super Mini (как раньше) или ESP32-S3 (S3-Zero / S3 Super Mini / DevKitC-1) - выбирается
 // при сборке (плата в Arduino IDE), распиновка подставляется сама.
@@ -9992,6 +9993,7 @@ void bootGuard() {
     prefs.putUChar("bootfail", 0);
     prefs.putUChar("rolledback", 1);
     prefs.end();
+    boottrace::mark(boottrace::Rollback);
     debugLog("3 failed starts in a row - rolling back to the previous firmware\n");
     Update.rollBack();
     ESP.restart();
@@ -15813,13 +15815,95 @@ void debugTouch() {
 }
 #endif
 
+const char* bootReportStage(uint8_t stage) {
+  switch (stage) {
+    case boottrace::Start: return L3("Старт", "Start", "开始");
+    case boottrace::Settings: return L3("Настройки", "Settings", "设置");
+    case boottrace::Display: return L3("Дисплей", "Display", "屏幕");
+    case boottrace::Sound: return L3("Звук", "Sound", "声音");
+    case boottrace::Accel: return L3("Датчик наклона", "Tilt sensor", "倾斜");
+    case boottrace::Touch: return L3("Сенсорные кнопки", "Touch buttons", "触摸按键");
+    case boottrace::Input: return L3("Кнопки и джойстик", "Buttons and joystick", "按键和摇杆");
+    case boottrace::Mirror: return L3("Трансляция", "Screen mirroring", "屏幕共享");
+    case boottrace::Files: return L3("Файлы", "Files", "文件");
+    case boottrace::Sd: return L3("SD-карта", "SD card", "SD卡");
+    case boottrace::Wifi: return "Wi-Fi";
+    case boottrace::Bluetooth: return "Bluetooth";
+    case boottrace::Ready: return L3("Запуск завершён", "Startup completed", "启动完成");
+    case boottrace::Rollback: return L3("Запрошен откат", "Rollback requested", "已请求回退");
+    default: return "?";
+  }
+}
+
+const char* bootReportReset(uint8_t reset) {
+  switch (reset) {
+    case ESP_RST_POWERON: return L3("Включение питания", "Power on", "上电");
+    case ESP_RST_SW: return L3("Программный сброс", "Software reset", "软件复位");
+    case ESP_RST_PANIC: return L3("Сбой программы", "Panic", "程序异常");
+    case ESP_RST_BROWNOUT: return L3("Просадка питания", "Brownout", "电压过低");
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: return "Watchdog";
+    case ESP_RST_DEEPSLEEP: return L3("Выход из сна", "Wake from sleep", "唤醒");
+    default: return L3("Другая причина", "Other reason", "其他原因");
+  }
+}
+
+void showBootReports() {
+  boottrace::Entry entries[boottrace::Capacity];
+  const unsigned count = boottrace::history(entries);
+  if (!count) {
+    viewAnswer(L3("Отчётов пока нет.", "No reports yet.", "暂无报告。"), C_YELLOW);
+    return;
+  }
+
+  std::vector<String> items;
+  for (unsigned i = 0; i < count; ++i) {
+    const auto& e = entries[i];
+    items.push_back(String("v") + String(e.version) + "  " + bootReportStage(e.stage));
+  }
+  items.push_back(L3("Выгрузить по USB", "Export over USB", "通过USB导出"));
+  items.push_back(T().menuBack);
+  const char* label = L3("Отчёты о запуске", "Boot reports", "启动报告");
+  int sel = 0;
+  for (;;) {
+    sel = listScreen(label, items, std::vector<String>(), sel);
+    if (sel < 0 || sel > (int)count) return;
+    if (sel == (int)count) {
+      Serial.printf("=== Boot reports %s ===\n", BOARD_S3 ? "ESP32-S3" : "ESP32-C3");
+      for (unsigned i = 0; i < count; ++i) {
+        const auto& e = entries[i];
+        Serial.printf("#%lu v%u reset=%u stage=%u t=%lu ms | %s | %s\n",
+                      (unsigned long)e.sequence, (unsigned)e.version, (unsigned)e.reset, (unsigned)e.stage,
+                      (unsigned long)e.elapsed, bootReportReset(e.reset), bootReportStage(e.stage));
+      }
+      viewAnswer(L3("Отчёты отправлены в USB Serial (115200).",
+                    "Reports sent to USB Serial (115200).", "报告已发送到USB串口（115200）。"), C_GREEN);
+      continue;
+    }
+    const auto& e = entries[sel];
+    String message = String("#") + String(e.sequence) + "  v" + String(e.version) + "\n";
+    message += String(L3("Предыдущий сброс: ", "Previous reset: ", "上次复位：")) +
+               bootReportReset(e.reset) + " (" + String(e.reset) + ")\n";
+    message += String(L3("Отметка запуска: ", "Boot checkpoint: ", "启动阶段：")) +
+               bootReportStage(e.stage) + "\n" + String(e.elapsed) + " ms";
+    viewAnswer(message, e.stage == boottrace::Ready ? C_GREEN : C_YELLOW);
+  }
+}
+
 void runDebugConsole() {
   for (;;) {
     std::vector<String> items = splitBar(L3("Система|GPIO и джойстик|Журнал|Назад", "System|GPIO and joystick|Log|Back", "系统|GPIO和摇杆|日志|返回"));
 #if BOARD_S3
     items.insert(items.end() - 1, "Touch");
 #endif
+    const int reportIndex = (int)items.size() - 1;
+    items.insert(items.end() - 1, L3("Отчёты о запуске", "Boot reports", "启动报告"));
     int choice = choiceScreen(L3("Консоль", "Console", "控制台"), items);
+    if (choice == reportIndex) {
+      showBootReports();
+      continue;
+    }
     if (choice == 0) debugLive(false);
     else if (choice == 1) debugLive(true);
     else if (choice == 2) debugJournal();
@@ -16293,6 +16377,7 @@ bool initRun(int n) {
 }
 
 void setup() {
+  boottrace::begin(FW_VERSION, static_cast<uint8_t>(esp_reset_reason()));
   pinMode(PIN_LED, OUTPUT);          // первым делом гасим фонарик (с SD-картой здесь MOSI карты - тоже безопасно)
   digitalWrite(PIN_LED, LOW);
   Serial.setRxBufferSize(4096);      // «Экран ПК» присылает картинки кусками по 2 КБ
@@ -16307,7 +16392,9 @@ void setup() {
     initStep(0);
   }
   bootGuard();
+  boottrace::mark(boottrace::Settings);
   loadSettings();
+  boottrace::mark(boottrace::Display);
   pinMode(PIN_BLK, OUTPUT);
   applyBrightness();                 // подсветка с выбранной яркостью
   g_bgTick = roomTick;               // комната принимает сообщения в фоне, пока вы на экране ввода
@@ -16336,12 +16423,16 @@ void setup() {
       delay(2500);
     }
   }
+  boottrace::mark(boottrace::Sound);
   bootStage("Zvuk");
   if (initRun(1)) soundInit();       // после подсветки: у пищалки свой канал
+  boottrace::mark(boottrace::Accel);
   bootStage("Datchiki");
   if (initRun(2)) accInit();         // датчик наклона (S3)
+  boottrace::mark(boottrace::Touch);
   touchInit();                       // сенсорные кнопки и вибромотор (S3)
 
+  boottrace::mark(boottrace::Input);
   analogReadResolution(12);
   if (BATTERY_ENABLED) analogSetPinAttenuation(PIN_BAT, ADC_11db);
   pinMode(physicalButtonPin(), INPUT_PULLUP);
@@ -16359,6 +16450,7 @@ void setup() {
   cfgMirBoot = prefs.getUChar("mirboot", 0) != 0;
   prefs.end();
   if (joyHeldAtBoot || cfgMirBoot) {                 // ручку держали при включении - экран, видимо, не виден
+    boottrace::mark(boottrace::Mirror);
     mirStart();
     if (mir::on) {
       for (int i = 0; i < 3; i++) {
@@ -16370,6 +16462,7 @@ void setup() {
   }
 #endif
 
+  boottrace::mark(boottrace::Files);
   sugg.addDict(DICT_RU);
   sugg.addDict(DICT_EN);
   bootStage("Fajly");
@@ -16380,6 +16473,7 @@ void setup() {
   // SD-карта (если включена в настройках). Защита: если прошлый запуск с картой не дошёл до конца
   // или при включении зажата кнопка джойстика - карта выключается, чтобы гаджет точно загрузился.
   if (cfgSd) {
+    boottrace::mark(boottrace::Sd);
     pinMode(physicalButtonPin(), INPUT_PULLUP);
     delay(5);
     prefs.begin("dsk", false);
@@ -16414,12 +16508,14 @@ void setup() {
   }
   debugLog("4: learned words: %u\n", (unsigned)sugg.learnedCount());
 
+  boottrace::mark(boottrace::Wifi);
   bootStage("Wi-Fi");
   if (initRun(5)) {
     if (netSsid.empty()) runPortal();               // первый запуск: настроить сеть (можно отменить кнопкой)
     wifiStart();                                     // дальше Wi-Fi подключается в фоне
   }
   if (ENABLE_BLE && cfgBle && initRun(6)) {          // Bluetooth включён в настройках
+    boottrace::mark(boottrace::Bluetooth);
     ble::begin(toStd(roomId));
     debugLog("Bluetooth on, heap %u\n", (unsigned)ESP.getFreeHeap());
   }
@@ -16430,6 +16526,7 @@ void setup() {
     prefs.end();
   }
   initStep(0);                                       // запуск прошёл
+  boottrace::mark(boottrace::Ready);
   debugLog("5: ready (Wi-Fi in background)\n");
   prefs.begin("dsk", false);
   bool rolled = prefs.getUChar("rolledback", 0);
